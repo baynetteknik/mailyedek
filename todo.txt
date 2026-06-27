@@ -1,0 +1,6 @@
+1- Sync Selected ten sonra gelen pencere düzenlensin renkleri yüzünden sayfa okunamyor ve rapor çok anlaşılır değil anlaşılır olmasını sağlayalım gerekir ise pencereyi büyütelim 
+2- Email Synchronization Ekranında Select Accounts kalsın Select Folders Gelişmiş Arşivleme filtreleri popup pencereye taşınsın 
+3- Butonlar Current Account gibi bilgilerin hemen altına yerleşsin ve mümkün ise ikonlar ile de gösterilsin 
+4- Select Accounts için daha geniş bir alan kaldığı için her seçilen hesap için yukarda yine anlık bilgi gösterilsin aynı işlemler devam etsin ancak her hesabın ilerleme çubuğu kendi satırında gösterilsin ve her birinin satırında durdur başla devam et rapor göster butonu olsun
+5- Programdan çıkmak isterse kullanıcı işlemlerin arka planda çalışması konusunda soru sorarak programdan çıkış yapmadan minimize yaparak bildirim seviyesinde programın arka planda çalışmasını sağlamak için gerekli hazırlıkları yap 
+6- Alt taraftaki sync log da gizlenip gösterilsin daha fazla yer kazanılsın 

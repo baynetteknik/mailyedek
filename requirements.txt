@@ -1,0 +1,28 @@
+# Mail Archive System — Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Core
+cryptography>=41.0.0           # AES encryption (Fernet), hashing
+
+# Cloud Storage
+boto3>=1.28.0                  # Amazon S3 SDK
+google-api-python-client>=2.100.0  # Google Drive API
+google-auth-oauthlib>=1.1.0    # Google OAuth 2.0
+
+# Scheduling
+apscheduler>=3.10.0            # Task scheduling (cron/interval)
+
+# GUI
+PySide6>=6.6.0                 # Qt6 bindings (LGPL — free for commercial use)
+
+# CLI
+rich>=13.5.0                   # Beautiful terminal UI
+
+# Email / Parsing
+beautifulsoup4>=4.12.0         # HTML email body cleaning
+
+# Optional: Keyring integration
+# keyring>=24.0.0               # OS keyring for encryption keys
+
+# Optional: Progress bars for tqdm
+# tqdm>=4.65.0                  # Progress bars for long operations
