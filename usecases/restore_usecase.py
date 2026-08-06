@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 from core.crypto_utils import CryptoManager
 from core.database import DatabaseManager
 from core.event_bus import EventBus, Event, Events
+from core.folder_translator import translate_folder_name
+from core.settings import AppSettings
 from domain.entities import BackupReport, MailMessage, MailMetadata
 from domain.interfaces import CloudStorageProvider, MailProvider
 from domain.repositories import (
@@ -42,6 +44,7 @@ class RestoreUseCase:
         event_bus: EventBus,
         crypto: CryptoManager,
         provider_registry: Optional[ProviderRegistry] = None,
+        settings: Optional[AppSettings] = None,
     ):
         self._db = db
         self._account_repo = account_repo
@@ -50,6 +53,7 @@ class RestoreUseCase:
         self._event_bus = event_bus
         self._crypto = crypto
         self._provider_registry = provider_registry or ProviderRegistry()
+        self._settings = settings or AppSettings()
 
     # ------------------------------------------------------------------
     # Public API
@@ -65,19 +69,9 @@ class RestoreUseCase:
         dry_run: bool = False,
         access_key_id: Optional[str] = None,
         secret_access_key: Optional[str] = None,
+        folder_lang: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Restore mails from an S3 backup archive.
-
-        Args:
-            remote_key: S3 key of the backup archive
-            bucket_name: S3 bucket name
-            target_account_id: If set, import mails to this account in local DB
-            target_imap: If True, push restored mails directly to an IMAP server
-            dry_run: If True, only list what would be restored
-
-        Returns:
-            Dict with restoration stats (mails_restored, errors, hash_verified, etc.)
-        """
+        """Restore mails from an S3 backup archive."""
         result = {
             "source": f"s3://{bucket_name}/{remote_key}",
             "mails_restored": 0,
@@ -105,7 +99,7 @@ class RestoreUseCase:
                 return result
 
             restore_result = self._process_archive(
-                local_path, target_account_id, target_imap, dry_run
+                local_path, target_account_id, target_imap, dry_run, folder_lang=folder_lang
             )
             result.update(restore_result)
 
@@ -126,6 +120,7 @@ class RestoreUseCase:
         target_imap: bool = False,
         dry_run: bool = False,
         credentials_path: Optional[Path] = None,
+        folder_lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Restore mails from a Google Drive backup archive."""
         result = {
@@ -155,7 +150,7 @@ class RestoreUseCase:
                 return result
 
             restore_result = self._process_archive(
-                local_path, target_account_id, target_imap, dry_run
+                local_path, target_account_id, target_imap, dry_run, folder_lang=folder_lang
             )
             result.update(restore_result)
 
@@ -179,9 +174,12 @@ class RestoreUseCase:
         target_account_id: Optional[int],
         target_imap: bool,
         dry_run: bool,
+        folder_lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Process a tar.gz archive and restore mails."""
         import tarfile
+
+        lang = folder_lang if folder_lang is not None else self._settings.folder_translation_restore()
 
         result = {"mails_restored": 0, "errors": 0,
                   "hash_verified": 0, "hash_failed": 0}
@@ -259,9 +257,12 @@ class RestoreUseCase:
                                 result["hash_failed"] += 1
                                 logger.warning("Hash mismatch for mail %s", mail_id)
 
+                        # Determine target folder name based on translation setting
+                        raw_folder = meta_data.get("folder", "INBOX")
+                        target_folder = translate_folder_name(raw_folder, lang)
+
                         # Push to IMAP server
                         if imap_provider and raw_email:
-                            target_folder = meta_data.get("folder", "INBOX")
                             if imap_provider.append_message(target_folder, raw_email):
                                 result["mails_restored"] += 1
                             else:
@@ -269,7 +270,7 @@ class RestoreUseCase:
 
                         # Store in local database
                         if target_account_id and not target_imap:
-                            folder = meta_data.get("folder", "INBOX")
+                            folder = target_folder
                             uid = meta_data.get("uid", 0)
                             subject = meta_data.get("subject", "")
                             sender = meta_data.get("sender", "")

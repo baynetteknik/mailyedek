@@ -93,6 +93,9 @@ class StatCard(QFrame):
 
 class ExportConfigDialog(QDialog):
     """Popup configuration dialog to handle profiles, target formats, filters, and target IMAP credentials."""
+    
+    match_completed = Signal(list)
+    match_failed = Signal(str)
 
     def __init__(self, engine: MailEngine, settings: AppSettings, parent=None):
         super().__init__(parent)
@@ -101,7 +104,11 @@ class ExportConfigDialog(QDialog):
         self._is_loading = True
         
         self.setWindowTitle("Configure Export Target & Filters")
-        self.resize(740, 580)
+        self.resize(1000, 650)
+        
+        # Connect background thread signals to main thread slots
+        self.match_completed.connect(self._on_match_completed)
+        self.match_failed.connect(self._on_match_failed)
         
         self.setStyleSheet("""
             QDialog {
@@ -171,8 +178,15 @@ class ExportConfigDialog(QDialog):
         
         scroll_content = QWidget()
         scroll_content.setStyleSheet("background: transparent;")
-        form_layout = QVBoxLayout(scroll_content)
-        form_layout.setSpacing(10)
+        
+        # Main two-column layout
+        main_columns_layout = QHBoxLayout(scroll_content)
+        main_columns_layout.setSpacing(16)
+        main_columns_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Left Column: Profile/Definition and Target / Server settings
+        left_col = QVBoxLayout()
+        left_col.setSpacing(10)
 
         # Profile/Definition Management Group
         prof_group = QGroupBox("Saved Profiles / Definitions")
@@ -197,7 +211,8 @@ class ExportConfigDialog(QDialog):
         prof_btns.addWidget(self.btn_save_profile)
         prof_btns.addWidget(self.btn_delete_profile)
         prof_form.addRow("", prof_btns)
-        form_layout.addWidget(prof_group)
+        
+        left_col.addWidget(prof_group)
 
         # Configuration Form
         config_group = QGroupBox("Target & Formatting Settings")
@@ -265,8 +280,23 @@ class ExportConfigDialog(QDialog):
         self.lbl_target_test_status.setStyleSheet("font-size:11px; font-weight:bold;")
         server_form.addRow("", self.lbl_target_test_status)
         opts_form.addRow("", self.server_group)
+        
+        left_col.addWidget(config_group)
+        left_col.addStretch()
 
-        # Date Filters
+        # Right Column: Date Filters and Folders Selection
+        right_col = QVBoxLayout()
+        right_col.setSpacing(10)
+
+        filters_group = QGroupBox("Filters & Folder Selection")
+        filters_layout = QVBoxLayout(filters_group)
+        filters_layout.setSpacing(10)
+        filters_layout.setContentsMargins(12, 18, 12, 12)
+
+        # Date Filters Form
+        dates_form = QFormLayout()
+        dates_form.setSpacing(6)
+
         dates_layout = QHBoxLayout()
         self.chk_since = QCheckBox("Since:")
         self.chk_since.setStyleSheet("color:#1e293b; font-weight:bold;")
@@ -286,13 +316,14 @@ class ExportConfigDialog(QDialog):
         dates_layout.addWidget(self.date_since)
         dates_layout.addWidget(self.chk_before)
         dates_layout.addWidget(self.date_before)
-        opts_form.addRow("Date Range:", dates_layout)
+        dates_form.addRow("Date Range:", dates_layout)
 
-        # Folders checklist selection mode changed to SingleSelection to allow checkbox click toggle
+        filters_layout.addLayout(dates_form)
+
+        # Folders Checklist
         self.folder_list = QListWidget()
         self.folder_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.folder_list.setMinimumHeight(110)
-        self.folder_list.setMaximumHeight(150)
+        self.folder_list.setMinimumHeight(320)
         self.folder_list.setStyleSheet("""
             QListWidget {
                 background-color: #ffffff;
@@ -300,7 +331,6 @@ class ExportConfigDialog(QDialog):
                 border-radius: 6px;
             }
             QListWidget::item {
-                color: #64748b;
                 background-color: #ffffff;
                 padding: 6px 8px;
                 border-bottom: 1px solid #f1f5f9;
@@ -318,7 +348,7 @@ class ExportConfigDialog(QDialog):
             QListWidget::indicator:checked {
                 background-color: #10b981;
                 border-color: #10b981;
-                image: url(data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>);
+                image: url("data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-width%3D%224%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpolyline%20points%3D%2220%206%209%2017%204%2012%22%3E%3C%2Fpolyline%3E%3C%2Fsvg%3E");
             }
             QListWidget::indicator:unchecked {
                 background-color: #ffffff;
@@ -333,20 +363,43 @@ class ExportConfigDialog(QDialog):
         btn_none = QPushButton("None")
         btn_none.setStyleSheet("padding:2px 8px; font-size:11px;")
         btn_none.clicked.connect(self._select_none_folders)
+        self.btn_fetch_server_folders = QPushButton("🔍 Sunucudan Oku ve Eşleştir")
+        self.btn_fetch_server_folders.setStyleSheet("padding:2px 8px; font-size:11px; background:#4361ee; color:white; font-weight:bold;")
+        self.btn_fetch_server_folders.clicked.connect(self._fetch_server_folders_and_recommend)
+
         folder_ctrls.addWidget(btn_all)
         folder_ctrls.addWidget(btn_none)
+        folder_ctrls.addWidget(self.btn_fetch_server_folders)
         folder_ctrls.addStretch()
 
         self.lbl_folder_summary = QLabel("Selected Folders: 0 / 0")
         self.lbl_folder_summary.setStyleSheet("color:#10b981; font-weight:bold; font-size:11px;")
         folder_ctrls.addWidget(self.lbl_folder_summary)
 
-        f_layout = QVBoxLayout()
-        f_layout.addWidget(self.folder_list)
-        f_layout.addLayout(folder_ctrls)
-        opts_form.addRow("Filter Folders:", f_layout)
+        warning_label = QLabel("⚠️ Sunucuda olması gereken standart klasörler otomatik olarak seçilmiştir. Sadece bu önerilen klasörlerin gönderilmesi önerilir.")
+        warning_label.setWordWrap(True)
+        warning_label.setStyleSheet("""
+            QLabel {
+                background-color: #fffbeb;
+                color: #b45309;
+                border: 1px solid #fef3c7;
+                border-radius: 6px;
+                padding: 8px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        filters_layout.addWidget(warning_label)
+        filters_layout.addWidget(QLabel("Filter Folders:"))
+        filters_layout.addWidget(self.folder_list)
+        filters_layout.addLayout(folder_ctrls)
 
-        form_layout.addWidget(config_group)
+        right_col.addWidget(filters_group)
+
+        # Add columns to main layout
+        main_columns_layout.addLayout(left_col, 1)
+        main_columns_layout.addLayout(right_col, 1)
+
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
 
@@ -375,10 +428,70 @@ class ExportConfigDialog(QDialog):
         try:
             with self.engine.db.get_conn() as conn:
                 rows = conn.execute("SELECT DISTINCT folder FROM mail_metadata WHERE is_deleted=0 ORDER BY folder").fetchall()
+            
+            STANDARD_FOLDER_MAP = {
+                "inbox": "Gelen Kutusu (INBOX)",
+                "sent": "Gönderilen Kutusu (Sent)",
+                "drafts": "Taslaklar (Drafts)",
+                "spam": "İstenmeyen (Spam)",
+                "junk": "İstenmeyen (Junk)",
+                "trash": "Çöp Kutusu (Trash)",
+                "archive": "Arşiv (Archive)",
+                "отправленные": "Gönderilenler (Отправленные / Sent)",
+                "черновики": "Taslaklar (Черновики / Drafts)",
+                "спам": "İstenmeyen (Спам / Spam)",
+                "архив": "Arşiv (Архив / Archive)",
+                "входящие": "Gelen Kutusu (Входящие / Inbox)",
+                "корзина": "Çöp Kutusu (Корзина / Trash)",
+            }
+            
+            from infrastructure.imap_client import decode_imap_utf7
             for r in rows:
-                item = QListWidgetItem(r["folder"])
+                orig_folder = r["folder"]
+                decoded = orig_folder
+                try:
+                    if orig_folder.startswith("_") and orig_folder.endswith("-"):
+                        # Try to decode Russian/encoded folder (replace _ with / for base64 decoding)
+                        temp = "&" + orig_folder[1:].replace("_", "/")
+                        decoded = decode_imap_utf7(temp)
+                    elif orig_folder.startswith("&"):
+                        decoded = decode_imap_utf7(orig_folder)
+                except Exception:
+                    pass
+                
+                decoded_lower = decoded.lower()
+                is_rec = False
+                display_name = decoded
+                
+                # Check in standard map
+                if decoded_lower in STANDARD_FOLDER_MAP:
+                    is_rec = True
+                    display_name = f"{STANDARD_FOLDER_MAP[decoded_lower]} — Önerilen"
+                else:
+                    # Generic check for standard keywords
+                    standard_words = ["inbox", "sent", "draft", "spam", "junk", "trash", "archive", 
+                                      "gelen", "giden", "gönderilen", "taslak", "çöp", "arşiv", "istenmeyen"]
+                    if any(w in decoded_lower for w in standard_words):
+                        is_rec = True
+                        display_name = f"{decoded} — Önerilen"
+                    else:
+                        if decoded != orig_folder:
+                            display_name = f"{decoded} ({orig_folder})"
+                
+                item = QListWidgetItem(display_name)
+                item.setData(Qt.UserRole, orig_folder)
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Checked)
+                
+                if is_rec:
+                    item.setCheckState(Qt.Checked)
+                    item.setForeground(QColor("#2d6a4f"))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                else:
+                    item.setCheckState(Qt.Unchecked)
+                    item.setForeground(QColor("#64748b"))
+                
                 self.folder_list.addItem(item)
         except Exception as exc:
             logger.error("Failed to load folder list: %s", exc)
@@ -413,7 +526,8 @@ class ExportConfigDialog(QDialog):
         for i in range(self.folder_list.count()):
             item = self.folder_list.item(i)
             if item.checkState() == Qt.Checked:
-                folders.append(item.text())
+                orig = item.data(Qt.UserRole)
+                folders.append(orig if orig is not None else item.text())
         return folders if len(folders) < self.folder_list.count() else None
 
     @Slot(QListWidgetItem)
@@ -513,7 +627,9 @@ class ExportConfigDialog(QDialog):
             self._select_none_folders()
             for i in range(self.folder_list.count()):
                 item = self.folder_list.item(i)
-                if item.text() in p_folders:
+                orig = item.data(Qt.UserRole)
+                orig = orig if orig is not None else item.text()
+                if orig in p_folders:
                     item.setCheckState(Qt.Checked)
         else:
             self._select_all_folders()
@@ -625,6 +741,302 @@ class ExportConfigDialog(QDialog):
 
         threading.Thread(target=test, daemon=True).start()
 
+    def _fetch_server_folders_and_recommend(self):
+        host = self.input_host.text().strip()
+        port_str = self.input_port.text().strip()
+        ssl = self.chk_ssl.isChecked()
+        user = self.input_username.text().strip()
+        pwd = self.input_password.text()
+
+        if not host or not user or not pwd:
+            QMessageBox.warning(self, "Bilgi Eksik", "Lütfen önce sol taraftaki sunucu adresi, kullanıcı adı ve şifre bilgilerini doldurun.")
+            return
+
+        self.btn_fetch_server_folders.setEnabled(False)
+        self.btn_fetch_server_folders.setText("⏳ Sunucudan Okunuyor...")
+        
+        def task():
+            try:
+                port = int(port_str) if port_str else (993 if ssl else 143)
+                if ssl:
+                    client = imaplib.IMAP4_SSL(host, port, timeout=15)
+                else:
+                    client = imaplib.IMAP4(host, port, timeout=15)
+                
+                client.login(user, pwd)
+                
+                # Fetch folders from target server
+                from infrastructure.imap_client import decode_imap_utf7
+                import re
+
+                list_re = re.compile(
+                    r'\((?P<flags>[^)]*)\)\s+"(?P<delim>[^"]*)"\s+(?:"(?P<name_quoted>[^"]*)"|(?P<name_unquoted>[^\s]+))'
+                )
+                
+                server_folders = []
+                status, list_data = client.list()
+                if status == "OK" and list_data:
+                    for item in list_data:
+                        if not item:
+                            continue
+                        decoded = item.decode('utf-8', errors='replace')
+                        m = list_re.search(decoded)
+                        if m:
+                            flags = m.group("flags") or ""
+                            raw_name = m.group("name_quoted") if m.group("name_quoted") is not None else m.group("name_unquoted")
+                            if raw_name:
+                                try:
+                                    folder_decoded = decode_imap_utf7(raw_name)
+                                except Exception:
+                                    folder_decoded = raw_name
+                                server_folders.append({
+                                    "name": folder_decoded.lower(),
+                                    "flags": flags.lower()
+                                })
+                client.logout()
+
+                # Determine standard types existing on the target server
+                target_types = set()
+                for sf in server_folders:
+                    name_lower = sf["name"]
+                    flags_lower = sf["flags"]
+                    
+                    if '\\inbox' in flags_lower or 'inbox' in name_lower or 'gelen' in name_lower:
+                        target_types.add('inbox')
+                    elif '\\sent' in flags_lower or any(p in name_lower for p in ('sent', 'gönderilen', 'gönderilmiş', 'giden')):
+                        target_types.add('sent')
+                    elif '\\drafts' in flags_lower or any(p in name_lower for p in ('draft', 'taslak', 'черновики')):
+                        target_types.add('drafts')
+                    elif '\\junk' in flags_lower or '\\spam' in flags_lower or any(p in name_lower for p in ('spam', 'junk', 'istenmeyen', 'önemsiz')):
+                        target_types.add('spam')
+                    elif '\\trash' in flags_lower or any(p in name_lower for p in ('trash', 'çöp', 'silinmiş', 'корзина')):
+                        target_types.add('trash')
+                    elif '\\archive' in flags_lower or any(p in name_lower for p in ('archive', 'arşiv', 'архив')):
+                        target_types.add('archive')
+
+                self.match_completed.emit(list(target_types))
+            except Exception as e:
+                self.match_failed.emit(str(e))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    @Slot(list)
+    def _on_match_completed(self, target_types):
+        from infrastructure.imap_client import decode_imap_utf7
+        self.folder_list.blockSignals(True)
+        
+        matched_count = 0
+        for i in range(self.folder_list.count()):
+            item = self.folder_list.item(i)
+            orig_folder = item.data(Qt.UserRole)
+            orig_folder_lower = orig_folder.lower()
+            
+            # Try to decode the folder name
+            decoded = orig_folder
+            try:
+                if orig_folder.startswith("_") and orig_folder.endswith("-"):
+                    temp = "&" + orig_folder[1:].replace("_", "/")
+                    decoded = decode_imap_utf7(temp)
+                elif orig_folder.startswith("&"):
+                    decoded = decode_imap_utf7(orig_folder)
+            except Exception:
+                pass
+            
+            decoded_lower = decoded.lower()
+            
+            # Resolve to folder type
+            folder_type = decoded_lower
+            if 'sent' in decoded_lower or '_bb4eqgq' in decoded_lower or 'giden' in decoded_lower:
+                folder_type = 'sent'
+            elif 'draft' in decoded_lower or '_bccenq' in decoded_lower or 'taslak' in decoded_lower:
+                folder_type = 'drafts'
+            elif 'spam' in decoded_lower or 'junk' in decoded_lower or '_bceepw' in decoded_lower or 'istenmeyen' in decoded_lower:
+                folder_type = 'spam'
+            elif 'trash' in decoded_lower or 'çöp' in decoded_lower or 'silinmiş' in decoded_lower or 'корзина' in decoded_lower:
+                folder_type = 'trash'
+            elif 'archive' in decoded_lower or 'arşiv' in decoded_lower or '_bbaeq' in decoded_lower:
+                folder_type = 'archive'
+            elif 'inbox' in decoded_lower or 'gelen' in decoded_lower:
+                folder_type = 'inbox'
+
+            # If this type exists on the server, we select it
+            if folder_type in target_types:
+                item.setCheckState(Qt.Checked)
+                item.setForeground(QColor("#2d6a4f"))
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+                matched_count += 1
+            else:
+                item.setCheckState(Qt.Unchecked)
+                item.setForeground(QColor("#64748b"))
+                f = item.font()
+                f.setBold(False)
+                item.setFont(f)
+
+        self.folder_list.blockSignals(False)
+        
+        # Force summary update
+        total = self.folder_list.count()
+        self.lbl_folder_summary.setText(f"Selected Folders: {matched_count} / {total}")
+        
+        self.btn_fetch_server_folders.setEnabled(True)
+        self.btn_fetch_server_folders.setText("🔍 Sunucudan Oku ve Eşleştir")
+        
+        QMessageBox.information(
+            self, 
+            "Eşleştirme Tamamlandı", 
+            f"Sunucuya bağlanıldı ve klasörler okundu.\n\n"
+            f"Hedef sunucuda mevcut olan standart klasörlerle eşleşen {matched_count} adet yerel klasör otomatik olarak seçildi."
+        )
+
+    @Slot(str)
+    def _on_match_failed(self, err_msg):
+        self.btn_fetch_server_folders.setEnabled(True)
+        self.btn_fetch_server_folders.setText("🔍 Sunucudan Oku ve Eşleştir")
+        QMessageBox.critical(self, "Bağlantı Hatası", f"Sunucu klasörleri okunurken hata oluştu:\n{err_msg}")
+
+
+class ExportConfirmDialog(QDialog):
+    def __init__(self, account_previews: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Dışa Aktarım Planını Onayla")
+        self.resize(950, 500)
+        self.setMinimumSize(800, 400)
+        self.setStyleSheet("QDialog { background-color: #f8fafc; }")
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        # Header Info
+        header_layout = QHBoxLayout()
+        header_icon = QLabel("📊")
+        header_icon.setStyleSheet("font-size: 24px;")
+        header_layout.addWidget(header_icon)
+        
+        header_title = QLabel(f"<b>Dışa Aktarım Planı Detayları</b><br/>{len(account_previews)} adet hesabın verileri sırayla aktarılacaktır:")
+        header_title.setStyleSheet("font-size: 13px; color: #1e293b;")
+        header_layout.addWidget(header_title, 1)
+        layout.addLayout(header_layout)
+
+        # Table
+        table = QTableWidget()
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels([
+            "Hesap Adı / E-Posta", 
+            "Format", 
+            "Hedef Dosya / Dizin", 
+            "Aktarılacak Klasörler", 
+            "Aktarılacak Mail Sayısı"
+        ])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.setStyleSheet("""
+            QTableWidget {
+                background-color: #ffffff;
+                alternate-background-color: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 6px;
+                color: #1e293b;
+                font-size: 11px;
+            }
+            QHeaderView::section {
+                background-color: #f1f5f9;
+                color: #475569;
+                font-weight: bold;
+                border: none;
+                border-bottom: 2px solid #cbd5e1;
+                padding: 4px;
+            }
+        """)
+        table.setRowCount(len(account_previews))
+        for i, p in enumerate(account_previews):
+            # Account Name
+            table.setItem(i, 0, QTableWidgetItem(p.get("label", "?")))
+            
+            # Format
+            table.setItem(i, 1, QTableWidgetItem(p.get("format", "ZIP")))
+            
+            # Resolved Target Path
+            dest_item = QTableWidgetItem(p.get("resolved_target", ""))
+            dest_item.setToolTip(p.get("resolved_target", ""))
+            table.setItem(i, 2, dest_item)
+            
+            # Folders details
+            folders_list = p.get("folders_list")
+            folders_text = ", ".join(folders_list) if folders_list else "Tüm Klasörler"
+            folders_item = QTableWidgetItem(folders_text)
+            folders_item.setToolTip(folders_text)
+            table.setItem(i, 3, folders_item)
+            
+            # Mail Count Estimate
+            mails_count = p.get("mails", 0)
+            mails_item = QTableWidgetItem(str(mails_count))
+            if mails_count > 0:
+                mails_item.setForeground(QColor("#10b981"))
+                mails_item.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            table.setItem(i, 4, mails_item)
+            
+        layout.addWidget(table)
+
+        # Summary box
+        total_mails = sum(p.get("mails", 0) for p in account_previews)
+        summary_frame = QFrame()
+        summary_frame.setStyleSheet("""
+            QFrame {
+                background-color: #f0fdf4;
+                border: 1px dashed #bbf7d0;
+                border-radius: 6px;
+                padding: 10px;
+            }
+        """)
+        summary_frame_layout = QHBoxLayout(summary_frame)
+        summary_frame_layout.setContentsMargins(12, 8, 12, 8)
+        
+        summary_lbl = QLabel("<b>Aktarılacak Toplam E-Posta Sayısı:</b>")
+        summary_lbl.setStyleSheet("color: #166534; font-size: 13px;")
+        total_val = QLabel(str(total_mails))
+        total_val.setStyleSheet("color: #15803d; font-size: 16px; font-weight: bold;")
+        
+        summary_frame_layout.addWidget(summary_lbl)
+        summary_frame_layout.addStretch()
+        summary_frame_layout.addWidget(total_val)
+        layout.addWidget(summary_frame)
+
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Evet, Başlat")
+        btns.button(QDialogButtonBox.Cancel).setText("İptal")
+        btns.setStyleSheet("""
+            QPushButton {
+                background: #4361ee;
+                color: white;
+                font-weight: 600;
+                padding: 8px 20px;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background: #3a56d4;
+            }
+            QPushButton[text="İptal"] {
+                background: #64748b;
+            }
+            QPushButton[text="İptal"]:hover {
+                background: #475569;
+            }
+        """)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
 
 # ---------------------------------------------------------------------------
 # Main ExportPanel
@@ -634,7 +1046,7 @@ class ExportPanel(QWidget):
     """Full-page panel for configuring export Definitions, running migrations, and checking server inodes."""
 
     _log_signal = Signal(str)
-    _progress_signal = Signal(int, str, int, int)
+    _progress_signal = Signal(int, str, int, int, object)
     _export_done_signal = Signal(int, object)
     _export_error_signal = Signal(int, str)
 
@@ -1139,11 +1551,122 @@ class ExportPanel(QWidget):
         prof = next((p for p in profiles if p.get("name") == profile_name), None)
         return prof or {"format": "ZIP", "target_path": str(Path("data/exports"))}
 
+    def _get_export_stats_for_checked(self) -> list:
+        checked_ids = self._get_checked_account_ids()
+        stats = []
+        for idx, acc_id in enumerate(checked_ids):
+            row_idx = -1
+            for r_i in range(self.account_table.rowCount()):
+                widget = self.account_table.cellWidget(r_i, 3)
+                if widget:
+                    chk = widget.findChild(QCheckBox)
+                    if chk and chk.property("account_id") == acc_id:
+                        row_idx = r_i
+                        break
+            if row_idx == -1:
+                continue
+
+            c = self._get_profile_for_row(row_idx)
+            folders = c.get("folders")
+            since_date = c.get("since_date")
+            before_date = c.get("before_date")
+
+            conditions = ["account_id = ?", "is_deleted = 0"]
+            params = [acc_id]
+            
+            if folders:
+                placeholders = ", ".join("?" for _ in folders)
+                conditions.append(f"folder IN ({placeholders})")
+                params.extend(folders)
+                
+            if since_date:
+                conditions.append("date >= ?")
+                params.append(since_date)
+                
+            if before_date:
+                conditions.append("date <= ?")
+                params.append(before_date)
+
+            where_clause = " AND ".join(conditions)
+            
+            try:
+                with self.engine.db.get_conn() as conn:
+                    row_cnt = conn.execute(
+                        f"SELECT COUNT(*) as cnt FROM mail_metadata WHERE {where_clause}",
+                        params
+                    ).fetchone()
+                    total_mails = row_cnt["cnt"] if row_cnt else 0
+                    
+                    row_fold = conn.execute(
+                        f"SELECT COUNT(DISTINCT folder) as cnt FROM mail_metadata WHERE {where_clause}",
+                        params
+                    ).fetchone()
+                    total_folders = row_fold["cnt"] if row_fold else 0
+            except Exception:
+                total_mails = 0
+                total_folders = 0
+
+            account_label = ""
+            widget_lbl = self.account_table.cellWidget(row_idx, 0)
+            if widget_lbl:
+                lbl = widget_lbl.findChild(QLabel)
+                if lbl:
+                    account_label = lbl.text().replace("<b>", "").replace("</b>", "").split("  |")[0]
+
+            # Resolve actual destination path applying subfolder setting
+            fmt = c.get("format") or "ZIP"
+            raw_path = c.get("target_path") or "data/exports"
+            
+            acc = self.engine.accounts.get(acc_id)
+            raw_sub = acc.get("export_subfolder") or "" if acc else ""
+            subfolder = re.sub(r'[\/:*?"<>|]', '_', raw_sub).strip()
+            
+            if fmt == "IMAP_SERVER":
+                target_host = c.get("imap_host") or "Target IMAP"
+                if subfolder:
+                    resolved_target = f"IMAP Server: {target_host} (Alt klasör: {subfolder})"
+                else:
+                    resolved_target = f"IMAP Server: {target_host}"
+            else:
+                path = Path(raw_path)
+                if fmt == "DIRECTORY":
+                    if subfolder:
+                        resolved_target = str(path / subfolder)
+                    else:
+                        resolved_target = str(path)
+                else:
+                    if path.suffix == "":
+                        ext_map = {"ZIP": ".zip", "JSON": ".json", "MBOX": ".mbox"}
+                        filename = f"mails_{acc_id}{ext_map.get(fmt, '.zip')}"
+                        path = path / filename
+                    if subfolder:
+                        resolved_target = str(path.parent / subfolder / path.name)
+                    else:
+                        resolved_target = str(path)
+
+            stats.append({
+                "account_id": acc_id,
+                "label": account_label or f"Hesap #{acc_id}",
+                "folders": total_folders,
+                "folders_list": folders,
+                "mails": total_mails,
+                "format": fmt,
+                "resolved_target": resolved_target
+            })
+        return stats
+
     @Slot()
     def _run_export_on_checked(self):
         checked_ids = self._get_checked_account_ids()
         if not checked_ids:
             QMessageBox.warning(self, "No Accounts Selected", "Please check at least one account in the table.")
+            return
+
+        # Gather stats and confirm
+        stats = self._get_export_stats_for_checked()
+        
+        dialog = ExportConfirmDialog(stats, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
         self.btn_export_selected.setEnabled(False)
@@ -1153,6 +1676,19 @@ class ExportPanel(QWidget):
         self.overall_progress.setValue(0)
 
         self.log_output.append(f"=== Starting export run for {len(checked_ids)} accounts ===")
+
+        # Reconfigure report table for mail details
+        self.report_table.setColumnCount(6)
+        self.report_table.setHorizontalHeaderLabels([
+            "Hesap", "Klasör", "Gönderen", "Konu", "Tarih", "Durum"
+        ])
+        self.report_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.report_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.report_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.report_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.report_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.report_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.report_table.setRowCount(0)
 
         def run_all():
             for idx, acc_id in enumerate(checked_ids):
@@ -1216,10 +1752,14 @@ class ExportPanel(QWidget):
                 ui["lbl_status"].setText("Running...")
                 ui["progress_bar"].setRange(0, 0)
 
-                def cb(curr, tot, aid=acc_id):
-                    self._progress_signal.emit(aid, "Exporting", curr, tot)
+                def cb(curr, tot, email_meta=None, aid=acc_id):
+                    self._progress_signal.emit(aid, "Exporting", curr, tot, email_meta)
 
                 try:
+                    acc = self.engine.accounts.get(acc_id)
+                    acc_label = acc.get("label", f"Hesap #{acc_id}") if acc else f"Hesap #{acc_id}"
+                    start_time_str = datetime.utcnow().isoformat()
+                    
                     report = self.engine.export_mails(
                         account_id=acc_id,
                         format_type=fmt,
@@ -1234,6 +1774,12 @@ class ExportPanel(QWidget):
                         imap_username=imap_username,
                         imap_password=imap_password
                     )
+                    report["started_at"] = start_time_str
+                    report["finished_at"] = datetime.utcnow().isoformat()
+                    report["format_type"] = fmt
+                    report["output_path"] = str(target_path)
+                    report["account_label"] = acc_label
+                    
                     self._export_done_signal.emit(acc_id, report)
                 except Exception as exc:
                     self._export_error_signal.emit(acc_id, str(exc))
@@ -1255,14 +1801,56 @@ class ExportPanel(QWidget):
     # Signals/Slots for UI updates
     # ------------------------------------------------------------------
 
-    @Slot(int, str, int, int)
-    def _on_export_progress(self, account_id: int, status_text: str, current: int, total: int):
+    @Slot(int, str, int, int, object)
+    def _on_export_progress(self, account_id: int, status_text: str, current: int, total: int, email_meta: object):
         ui = self._accounts_ui.get(account_id)
         if ui:
             ui["lbl_status"].setText(f"{status_text} ({current}/{total})")
             ui["progress_bar"].setRange(0, total)
             ui["progress_bar"].setValue(current)
+            left = total - current
+            ui["progress_bar"].setFormat(f"{current} / {left}")
         self.card_exported_count.set_value(str(current))
+
+        if email_meta and isinstance(email_meta, dict):
+            # Resolve account label
+            account_label = ""
+            row_idx = -1
+            for r_i in range(self.account_table.rowCount()):
+                widget = self.account_table.cellWidget(r_i, 3)
+                if widget:
+                    chk = widget.findChild(QCheckBox)
+                    if chk and chk.property("account_id") == account_id:
+                        row_idx = r_i
+                        break
+            if row_idx != -1:
+                widget_lbl = self.account_table.cellWidget(row_idx, 0)
+                if widget_lbl:
+                    lbl = widget_lbl.findChild(QLabel)
+                    if lbl:
+                        account_label = lbl.text().replace("<b>", "").replace("</b>", "").split("  |")[0]
+
+            row = self.report_table.rowCount()
+            self.report_table.insertRow(row)
+            self.report_table.setItem(row, 0, QTableWidgetItem(account_label or f"Hesap #{account_id}"))
+            self.report_table.setItem(row, 1, QTableWidgetItem(email_meta.get("folder", "")))
+            self.report_table.setItem(row, 2, QTableWidgetItem(email_meta.get("sender", "")))
+            self.report_table.setItem(row, 3, QTableWidgetItem(email_meta.get("subject", "")))
+            self.report_table.setItem(row, 4, QTableWidgetItem(email_meta.get("date", "")))
+            
+            st = email_meta.get("status", "Gönderildi")
+            st_item = QTableWidgetItem(st)
+            if "Mevcut" in st or "Duplicate" in st:
+                st_item.setForeground(QColor("#f59e0b"))
+                st_item.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            elif "Gönderildi" in st or "Exported" in st:
+                st_item.setForeground(QColor("#10b981"))
+            elif "Hata" in st or "Error" in st:
+                st_item.setForeground(QColor("#ef4444"))
+                st_item.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            self.report_table.setItem(row, 5, st_item)
+            
+            self.report_table.scrollToBottom()
 
     @Slot(int, object)
     def _on_export_done(self, account_id: int, report: dict):
@@ -1272,8 +1860,46 @@ class ExportPanel(QWidget):
             ui["lbl_status"].setText("Done")
             ui["progress_bar"].setRange(0, 100)
             ui["progress_bar"].setValue(100)
+            ui["progress_bar"].setFormat("Done")
         self._active_exports.pop(account_id, None)
         self.log_output.append(f"Account ID {account_id} export complete: {report.get('exported', 0)} exported, {report.get('errors', 0)} errors.")
+        try:
+            self.engine.reporter.generate_export_report(report, "both")
+        except Exception as e:
+            logger.error("Failed to generate export report: %s", e)
+
+        # Show final duplicate prevention info
+        if not self._active_exports:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Aktarım Tamamlandı")
+            msg.setText("Seçilen hesapların dışa aktarım işlemi tamamlandı.\n\n"
+                        "Hedef sunucu üzerindeki mükerrerlik (Message-ID) kontrolü sayesinde, "
+                        "zaten mevcut olan mailler elenerek mükerrer gönderim önlenmiştir.")
+            msg.setIcon(QMessageBox.Information)
+            msg.setStyleSheet("""
+                QMessageBox {
+                    background-color: #121212;
+                    color: #ffffff;
+                }
+                QLabel {
+                    color: #ffffff;
+                    font-size: 13px;
+                }
+                QPushButton {
+                    background-color: #1a1a2e;
+                    color: #ffffff;
+                    border: 1px solid #4361ee;
+                    padding: 6px 16px;
+                    font-size: 12px;
+                    border-radius: 4px;
+                    font-weight: bold;
+                    min-width: 80px;
+                }
+                QPushButton:hover {
+                    background-color: #4361ee;
+                }
+            """)
+            msg.exec()
 
     @Slot(int, str)
     def _on_export_error(self, account_id: int, err_msg: str):
@@ -1440,6 +2066,8 @@ class ExportPanel(QWidget):
                 progress_bar = QProgressBar()
                 progress_bar.setRange(0, 100)
                 progress_bar.setValue(0)
+                progress_bar.setTextVisible(True)
+                progress_bar.setFormat("0 / 0")
                 progress_bar.setStyleSheet("""
                     QProgressBar {
                         background: #e2e8f0;
@@ -1478,7 +2106,7 @@ class ExportPanel(QWidget):
                     QCheckBox::indicator:checked {
                         background-color: #10b981;
                         border-color: #10b981;
-                        image: url(data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>);
+                        image: url("data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-width%3D%224%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpolyline%20points%3D%2220%206%209%2017%204%2012%22%3E%3C%2Fpolyline%3E%3C%2Fsvg%3E");
                     }
                     QCheckBox::indicator:unchecked {
                         background-color: #ffffff;

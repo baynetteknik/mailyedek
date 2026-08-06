@@ -328,6 +328,15 @@ class ImapClient(MailProvider):
     # UID-based fetch operations
     # ------------------------------------------------------------------
 
+    def _format_imap_date(self, date_str: str) -> str:
+        """Convert ISO date 'YYYY-MM-DD' to IMAP search date 'DD-MMM-YYYY'."""
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+            return f"{dt.day:02d}-{months[dt.month - 1]}-{dt.year}"
+        except Exception:
+            return date_str
+
     def fetch_uids(self, folder: str, since_uid: int = 0,
                    since_date: Optional[str] = None,
                    before_date: Optional[str] = None,
@@ -346,9 +355,9 @@ class ImapClient(MailProvider):
             if since_uid > 0:
                 criteria.extend(["UID", f"{since_uid + 1}:*"])
             if since_date:
-                criteria.extend(["SINCE", since_date])
+                criteria.extend(["SINCE", self._format_imap_date(since_date)])
             if before_date:
-                criteria.extend(["BEFORE", before_date])
+                criteria.extend(["BEFORE", self._format_imap_date(before_date)])
             if not archive_unread:
                 criteria.append("SEEN")
 
@@ -356,7 +365,7 @@ class ImapClient(MailProvider):
                 criteria = ["ALL"]
 
             logger.debug("UID SEARCH criteria: %s", criteria)
-            status, data = self._run_with_retry("uid", "search", None, *criteria)
+            status, data = self._run_with_retry("uid", "search", *criteria)
             logger.debug("UID SEARCH status=%s data_len=%d", status, len(data) if data else 0)
 
             if status != "OK":
@@ -517,7 +526,7 @@ class ImapClient(MailProvider):
             # Split criteria string into separate args to prevent imaplib
             # from double-quoting the entire criteria
             criteria_parts = criteria.split()
-            status, data = self._run_with_retry("uid", "search", None, *criteria_parts)
+            status, data = self._run_with_retry("uid", "search", *criteria_parts)
             if status != "OK" or not data or data[0] is None:
                 return []
             return [int(x) for x in data[0].split() if x]

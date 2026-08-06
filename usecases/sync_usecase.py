@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional
 from core.crypto_utils import CryptoManager
 from core.database import DatabaseManager
 from core.event_bus import EventBus, Event, Events
+from core.folder_translator import translate_folder_name
 from domain.entities import MailMessage, SyncReport
 from domain.interfaces import MailProvider
 from domain.repositories import (
@@ -25,6 +26,7 @@ from domain.repositories import (
 )
 from infrastructure.imap_client import ImapClient
 from plugins.provider_registry import ProviderRegistry
+
 
 logger = logging.getLogger(__name__)
 
@@ -176,21 +178,22 @@ class SyncUseCase:
                 folder_filter: Optional[List[str]] = None,
                 since_date: Optional[str] = None,
                 before_date: Optional[str] = None,
-                archive_unread: bool = True) -> Dict[str, Any]:
+                archive_unread: bool = True,
+                timeout: int = 15) -> Dict[str, Any]:
         """Simulate a sync without storing anything."""
         acc = self._account_repo.get(account_id)
         if not acc:
             raise ValueError(f"Account {account_id} not found")
 
         _log(f"Dry-run for account '{acc.get('label','?')}'...", log_callback)
-        provider = self._get_provider(acc, log_callback)
+        provider = self._get_provider(acc, log_callback, timeout=timeout)
         try:
             username = self._crypto.decrypt(acc["username_enc"])
             password = self._crypto.decrypt(acc["password_enc"])
 
             _log(f"Connecting to {acc['imap_host']}:{acc['imap_port']}...", log_callback)
             if not provider.connect(acc["imap_host"], acc["imap_port"],
-                                    bool(acc["use_ssl"]), username, password):
+                                    bool(acc["use_ssl"]), username, password, timeout=timeout):
                 _log("CONNECTION FAILED", log_callback)
                 return {"error": "Connection failed"}
 
@@ -198,8 +201,37 @@ class SyncUseCase:
             folders = provider.list_folders()
             _log(f"Found {len(folders)} folder(s)", log_callback)
 
+            # Resolve target path for reporting
+            import re
+            from core.settings import AppSettings
+            settings = AppSettings()
+            base_path = settings.data_path()
+            # Fallback: if data_path returned default (data/), use DB parent
+            if base_path == Path("data") and self._db._db_path.parent != Path("data"):
+                base_path = self._db._db_path.parent
+            stor_name = settings.account_storage(account_id)
+            if stor_name:
+                for loc in settings.storage_locations():
+                    if loc.name == stor_name:
+                        base_path = Path(loc.path)
+                        break
+            
+            # Resolve group/domain
+            group_val = acc.get("account_group", "").strip()
+            if not group_val and "@" in acc.get("email", ""):
+                group_val = acc["email"].split("@")[-1]
+            group_clean = re.sub(r'[\/:*?"<>|]', '_', group_val).strip()
+
+            raw_sub = acc.get("export_subfolder") or ""
+            subfolder = re.sub(r'[\/:*?"<>|]', '_', raw_sub).strip()
+            
+            from core.settings import get_account_mailbox_dir
+            target_dir = get_account_mailbox_dir(base_path, acc.get("email", ""), subfolder, "_").parent
+
             result: Dict[str, Any] = {
                 "account": acc["label"],
+                "email": acc.get("email", ""),
+                "target_dir": str(target_dir),
                 "folders": [],
                 "total_estimated": 0,
             }
@@ -212,7 +244,8 @@ class SyncUseCase:
                 _log(f"  Checking folder '{folder_name}'...", log_callback)
                 state = self._sync_state_repo.get(acc["id"], folder_name)
                 since_uid = state["last_uid"] if state else 0
-                uids = provider.fetch_uids(folder_name, since_uid, since_date=since_date, before_date=before_date, archive_unread=archive_unread)
+                search_since_uid = 0 if (since_date or before_date) else since_uid
+                uids = provider.fetch_uids(folder_name, search_since_uid, since_date=since_date, before_date=before_date, archive_unread=archive_unread)
                 
                 # Fetch archived UIDs from local DB to filter
                 try:
@@ -387,15 +420,19 @@ class SyncUseCase:
                      archive_unread: bool = True,
                      progress_callback: Optional[Callable[[int, str, int, int], None]] = None
                      ) -> Dict[str, int]:
-        """Synchronize a single folder. Returns a dict of counts."""
         result = {"fetched": 0, "updated": 0, "duplicates": 0, "errors": 0, "bytes": 0, "already_archived": 0}
+        acc = self._account_repo.get(account_id) or {}
+
+        from core.settings import AppSettings
+        folder_lang = AppSettings().folder_translation_sync()
+        display_folder = translate_folder_name(folder_name, folder_lang)
 
         # Count existing archived UIDs and get the list
         try:
             with self._db.get_conn() as conn:
                 existing_rows = conn.execute(
-                    "SELECT uid FROM mail_metadata WHERE account_id=? AND folder=? AND is_deleted=0",
-                    (account_id, folder_name)
+                    "SELECT uid FROM mail_metadata WHERE account_id=? AND (folder=? OR folder=?) AND is_deleted=0",
+                    (account_id, folder_name, display_folder)
                 ).fetchall()
                 archived_uids = {r["uid"] for r in existing_rows}
         except Exception:
@@ -421,9 +458,10 @@ class SyncUseCase:
         if state:
             _log(f"    [{folder_name}] Previous sync: last_uid={state['last_uid']}, "
                  f"uid_validity={state['uid_validity']}", log_callback)
-            if state["uid_validity"] != 0 and state["uid_validity"] != uid_validity:
-                _log(f"    [{folder_name}] UIDVALIDITY CHANGED {state['uid_validity']} → "
-                     f"{uid_validity}. Re-fetching all messages.", log_callback)
+            if state["uid_validity"] and state["uid_validity"] != uid_validity:
+                _log(f"    [{folder_name}] WARNING: UIDVALIDITY changed "
+                     f"({state['uid_validity']} -> {uid_validity})! Re-syncing folder.",
+                     log_callback)
                 since_uid = 0
             else:
                 since_uid = state["last_uid"]
@@ -431,36 +469,27 @@ class SyncUseCase:
             _log(f"    [{folder_name}] First sync (no previous state)", log_callback)
             since_uid = 0
 
-        _log(f"    [{folder_name}] {len(archived_uids)} mail(s) already archived locally. Using delta sync (since UID {since_uid}) to avoid re-downloading.", log_callback)
-
-        # Fetch UIDs
-        _log(f"    [{folder_name}] Fetching UIDs since {since_uid} (SINCE DATE={since_date}, BEFORE DATE={before_date}, ARCHIVE UNREAD={archive_unread})...", log_callback)
-        uids = provider.fetch_uids(folder_name, since_uid, since_date=since_date, before_date=before_date, archive_unread=archive_unread)
-        _log(f"    [{folder_name}] UIDs returned: {len(uids)} total",
+        # Fetch message UIDs
+        search_since_uid = 0 if (since_date or before_date) else since_uid
+        _log(f"    [{folder_name}] Searching for UIDs (since UID {search_since_uid})...",
              log_callback)
+        uids = provider.fetch_uids(folder_name, search_since_uid, since_date=since_date, before_date=before_date, archive_unread=archive_unread)
 
-        if not uids:
-            _log(f"    [{folder_name}] No UIDs returned from server", log_callback)
-            return result
-
-        # Filter to new UIDs (excluding already archived ones)
-        new_uids = [uid for uid in uids if uid > since_uid and uid not in archived_uids]
-        _log(f"    [{folder_name}] New UIDs (>{since_uid}): {len(new_uids)} — "
-             f"range=[{min(new_uids) if new_uids else 'N/A'}.."
-             f"{max(new_uids) if new_uids else 'N/A'}]",
+        new_uids = [u for u in uids if u > since_uid and u not in archived_uids]
+        _log(f"    [{folder_name}] Total server messages: {len(uids)}, new to fetch: {len(new_uids)}",
              log_callback)
 
         if not new_uids:
-            _log(f"    [{folder_name}] No new messages to fetch.", log_callback)
+            self._sync_state_repo.upsert(account_id, folder_name, max(uids, default=since_uid), uid_validity)
             return result
 
         last_uid = since_uid
         max_uid_on_server = max(uids) if uids else since_uid
-        
+
         try:
             for i, uid in enumerate(new_uids):
                 if cancel_event and cancel_event.is_set():
-                    _log(f"    [{folder_name}] Sync cancelled by user.", log_callback)
+                    _log(f"    [{folder_name}] Cancelled during message loop", log_callback)
                     break
 
                 # Pause check
@@ -499,10 +528,10 @@ class SyncUseCase:
                         if is_dup:
                             _log(f"    [{folder_name}] UID {uid}: DUPLICATE (hash match)", log_callback)
 
-                    # Store metadata
+                    # Store metadata (use display_folder for folder column)
                     mail_id = self._mail_repo.upsert(
                         account_id=account_id,
-                        folder=folder_name,
+                        folder=display_folder,
                         uid=uid,
                         message_id=message.metadata.message_id,
                         subject=message.metadata.subject,
@@ -522,27 +551,80 @@ class SyncUseCase:
                     # Store raw content
                     if message.raw_content:
                         self._mail_repo.store_raw(mail_id, message.raw_content)
+                        
+                        # Export/write raw email as EML file
+                        try:
+                            import re
+                            from core.settings import AppSettings, get_account_mailbox_dir
+                            settings = AppSettings()
+                            
+                            # Resolve base storage path using account_storage
+                            base_path = settings.data_path()
+                            if base_path == Path("data") and self._db._db_path.parent != Path("data"):
+                                base_path = self._db._db_path.parent
+                            stor_name = settings.account_storage(account_id)
+                            if stor_name:
+                                for loc in settings.storage_locations():
+                                    if loc.name == stor_name:
+                                        base_path = Path(loc.path)
+                                        break
+                                        
+                            # Check group/domain
+                            group_val = acc.get("account_group", "").strip()
+                            if not group_val and "@" in acc.get("email", ""):
+                                group_val = acc["email"].split("@")[-1]
+                            group_clean = re.sub(r'[\/:*?"<>|]', '_', group_val).strip()
+
+                            # Check subfolder
+                            raw_sub = acc.get("export_subfolder") or ""
+                            subfolder = re.sub(r'[\/:*?"<>|]', '_', raw_sub).strip()
+                            
+                            mailbox_dir = get_account_mailbox_dir(base_path, acc.get("email", ""), subfolder, display_folder)
+                            mailbox_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Format filename: {date}_{uid}_{subject}.eml
+                            date_str = ""
+                            if message.metadata.date:
+                                try:
+                                    dt = datetime.fromisoformat(message.metadata.date.replace('Z', '+00:00'))
+                                    date_str = dt.strftime("%Y%m%d_%H%M%S")
+                                except Exception:
+                                    date_str = re.sub(r'[\/:*?"<>|]', '_', message.metadata.date).strip()
+                            
+                            if not date_str:
+                                date_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                                
+                            subj_clean = re.sub(r'[\/:*?"<>|]', '_', message.metadata.subject or "NoSubject").strip()[:60]
+                            eml_filename = f"{date_str}_{uid}_{subj_clean}.eml"
+                            eml_path = mailbox_dir / eml_filename
+                            
+                            eml_path.write_bytes(message.raw_content)
+                        except Exception as eml_exc:
+                            logger.exception("Failed to save EML file for mail %d: %s", mail_id, eml_exc)
 
                     # Store attachments
                     if message.attachments:
+                        attachments_dir = mailbox_dir / "Attachments" if 'mailbox_dir' in locals() else Path("data") / "Attachments"
+                        attachments_dir.mkdir(parents=True, exist_ok=True)
+                        
                         for att in message.attachments:
                             if not att.sha256_hash or not att.data:
                                 continue
                             
-                            attachments_dir = self._db._db_path.parent / "attachments"
-                            attachments_dir.mkdir(parents=True, exist_ok=True)
-                            storage_path = attachments_dir / att.sha256_hash
+                            att_filename = re.sub(r'[\/:*?"<>|]', '_', att.filename or "unknown").strip()
+                            d_str = date_str if 'date_str' in locals() else ""
+                            storage_path = attachments_dir / f"{d_str}_{uid}_{att_filename}"
                             
                             try:
                                 if not storage_path.exists():
                                     storage_path.write_bytes(att.data)
                                 
                                 att_id = self._attachment_repo.register(
-                                    sha256_hash=att.sha256_hash,
-                                    filename=att.filename or "unknown",
-                                    mime_type=att.mime_type or "application/octet-stream",
-                                    size_bytes=att.size_bytes,
-                                    storage_path=str(storage_path),
+                                     sha256_hash=att.sha256_hash,
+                                     filename=att.filename or "unknown",
+                                     mime_type=att.mime_type or "application/octet-stream",
+                                     size_bytes=att.size_bytes,
+                                     storage_path=str(storage_path),
                                 )
                                 
                                 self._attachment_repo.link(mail_id, att_id)
@@ -566,7 +648,7 @@ class SyncUseCase:
                         "account_id": account_id,
                         "mail_id": mail_id,
                         "uid": uid,
-                        "folder": folder_name,
+                        "folder": display_folder,
                         "sha256": sha256,
                         "is_duplicate": is_dup,
                     }))
@@ -579,7 +661,7 @@ class SyncUseCase:
                 last_uid = max(max_uid_on_server, last_uid)
         finally:
             # Update sync state to the last successfully processed UID
-            self._sync_state_repo.update(account_id, folder_name, last_uid, uid_validity, exists)
+            self._sync_state_repo.upsert(account_id, folder_name, last_uid, uid_validity)
             _log(f"    [{folder_name}] Sync state updated: last_uid={last_uid}", log_callback)
 
         _log(f"    [{folder_name}] === Folder done: {result['fetched']} new, "
@@ -593,10 +675,13 @@ class SyncUseCase:
     # ------------------------------------------------------------------
 
     def _get_provider(self, acc: Dict,
-                      log_callback: Optional[Callable] = None) -> MailProvider:
+                      log_callback: Optional[Callable] = None,
+                      timeout: int = 300) -> MailProvider:
         provider = self._provider_registry.get_mail_provider(acc.get("provider_type", "imap"))
         if provider:
             if hasattr(provider, '_log_callback'):
                 provider._log_callback = log_callback  # type: ignore
+            if hasattr(provider, '_timeout'):
+                provider._timeout = timeout
             return provider
-        return ImapClient(log_callback=log_callback)
+        return ImapClient(log_callback=log_callback, timeout=timeout)

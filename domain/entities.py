@@ -23,6 +23,7 @@ class EmailAccount:
     username_enc: str = ""
     password_enc: str = ""
     is_active: bool = True
+    export_subfolder: str = ""
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 

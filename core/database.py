@@ -91,6 +91,8 @@ class DatabaseManager:
                     username_enc    TEXT NOT NULL,
                     password_enc    TEXT NOT NULL,
                     is_active       INTEGER NOT NULL DEFAULT 1,
+                    export_subfolder TEXT DEFAULT '',
+                    account_group   TEXT DEFAULT '',
                     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
                     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
                 );
@@ -198,6 +200,17 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS idx_sync_state_lookup
                     ON sync_state(account_id, folder);
             """)
+            # Self-healing column addition for existing databases
+            try:
+                conn.execute("ALTER TABLE accounts ADD COLUMN export_subfolder TEXT DEFAULT ''")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    logger.warning("Failed to add export_subfolder column to accounts: %s", exc)
+            try:
+                conn.execute("ALTER TABLE accounts ADD COLUMN account_group TEXT DEFAULT ''")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    logger.warning("Failed to add account_group column to accounts: %s", exc)
             logger.info("Database schema initialized at %s", self._db_path)
 
     # ------------------------------------------------------------------
@@ -205,13 +218,14 @@ class DatabaseManager:
     # ------------------------------------------------------------------
 
     def add_account(self, label: str, email: str, imap_host: str, imap_port: int,
-                    use_ssl: bool, username_enc: str, password_enc: str) -> int:
+                    use_ssl: bool, username_enc: str, password_enc: str, export_subfolder: str = "",
+                    account_group: str = "") -> int:
         with self.transaction() as conn:
             cur = conn.execute(
                 """INSERT INTO accounts (label, email, imap_host, imap_port, use_ssl,
-                                        username_enc, password_enc)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (label, email, imap_host, imap_port, int(use_ssl), username_enc, password_enc)
+                                        username_enc, password_enc, export_subfolder, account_group)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (label, email, imap_host, imap_port, int(use_ssl), username_enc, password_enc, export_subfolder, account_group)
             )
             return cur.lastrowid
 
@@ -231,7 +245,7 @@ class DatabaseManager:
     def update_account(self, account_id: int, **kwargs) -> None:
         fields = {k: v for k, v in kwargs.items() if k in (
             "label", "email", "imap_host", "imap_port", "use_ssl",
-            "username_enc", "password_enc", "is_active"
+            "username_enc", "password_enc", "is_active", "export_subfolder", "account_group"
         )}
         if not fields:
             return
@@ -428,20 +442,52 @@ class DatabaseManager:
             logger.info("FTS index rebuilt")
 
     def search_mails(self, query: str, limit: int = 50,
-                     offset: int = 0) -> List[Dict[str, Any]]:
-        """Full-text search across subject, sender, recipients.
-
-        Returns matching mail_metadata rows.
-        """
+                     offset: int = 0,
+                     account_id: Optional[int] = None,
+                     folder: Optional[str] = None,
+                     since_date: Optional[str] = None,
+                     before_date: Optional[str] = None,
+                     has_attachments: Optional[bool] = None,
+                     unread_only: Optional[bool] = None) -> List[Dict[str, Any]]:
+        """Search archived emails with metadata filtering and optional FTS5 matching."""
         with self.get_conn() as conn:
-            rows = conn.execute(
-                """SELECT m.* FROM mail_fts f
-                   JOIN mail_metadata m ON m.id = f.rowid
-                   WHERE mail_fts MATCH ?
-                   ORDER BY m.date DESC
-                   LIMIT ? OFFSET ?""",
-                (query, limit, offset)
-            ).fetchall()
+            sql = "SELECT * FROM mail_metadata WHERE is_deleted = 0"
+            params = []
+
+            if query and query.strip():
+                sql += " AND id IN (SELECT rowid FROM mail_fts WHERE mail_fts MATCH ?)"
+                params.append(query.strip())
+
+            if account_id is not None:
+                sql += " AND account_id = ?"
+                params.append(account_id)
+
+            if folder:
+                sql += " AND folder = ?"
+                params.append(folder)
+
+            if since_date:
+                sql += " AND date >= ?"
+                params.append(since_date)
+
+            if before_date:
+                sql += " AND date <= ?"
+                params.append(before_date)
+
+            if has_attachments is not None:
+                sql += " AND has_attachments = ?"
+                params.append(1 if has_attachments else 0)
+
+            if unread_only is not None:
+                if unread_only:
+                    sql += " AND flags NOT LIKE '%\\Seen%'"
+                else:
+                    sql += " AND flags LIKE '%\\Seen%'"
+
+            sql += " ORDER BY date DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+
+            rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
@@ -560,6 +606,70 @@ class DatabaseManager:
                 "attachments": conn.execute("SELECT COUNT(*) FROM attachments").fetchone()[0],
                 "audit_entries": conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0],
                 "db_size_bytes": self._db_path.stat().st_size,
+            }
+
+    def get_custom_report_stats(self, account_id: Optional[int] = None,
+                                account_group: Optional[str] = None,
+                                domain: Optional[str] = None,
+                                since_date: Optional[str] = None,
+                                before_date: Optional[str] = None,
+                                single_email: Optional[str] = None) -> Dict[str, Any]:
+        """Aggregate custom metadata statistics based on account, group, domain, email, and dates."""
+        with self.get_conn() as conn:
+            # 1. Resolve accounts matching group/domain
+            account_ids = []
+            if account_id is not None:
+                account_ids = [account_id]
+            elif account_group:
+                rows = conn.execute("SELECT id FROM accounts WHERE account_group = ?", (account_group,)).fetchall()
+                account_ids = [r["id"] for r in rows]
+            elif domain:
+                rows = conn.execute("SELECT id FROM accounts WHERE email LIKE ?", (f"%@{domain}",)).fetchall()
+                account_ids = [r["id"] for r in rows]
+            else:
+                rows = conn.execute("SELECT id FROM accounts").fetchall()
+                account_ids = [r["id"] for r in rows]
+
+            if not account_ids:
+                return {}
+
+            # 2. Build metadata query conditions
+            placeholders = ",".join("?" for _ in account_ids)
+            conditions = [f"account_id IN ({placeholders})", "is_deleted = 0"]
+            params = list(account_ids)
+
+            if since_date:
+                conditions.append("date >= ?")
+                params.append(since_date)
+            if before_date:
+                conditions.append("date <= ?")
+                params.append(before_date)
+            if single_email:
+                conditions.append("(sender LIKE ? OR recipients LIKE ? OR cc LIKE ? OR bcc LIKE ?)")
+                params.extend([f"%{single_email}%", f"%{single_email}%", f"%{single_email}%", f"%{single_email}%"])
+
+            where_clause = " AND ".join(conditions)
+
+            # Query aggregates
+            total_mails = conn.execute(f"SELECT COUNT(*) FROM mail_metadata WHERE {where_clause}", params).fetchone()[0] or 0
+            total_size = conn.execute(f"SELECT SUM(size_bytes) FROM mail_metadata WHERE {where_clause}", params).fetchone()[0] or 0
+            has_attachments = conn.execute(f"SELECT COUNT(*) FROM mail_metadata WHERE {where_clause} AND has_attachments = 1", params).fetchone()[0] or 0
+
+            # Folder distributions
+            folder_rows = conn.execute(f"SELECT folder, COUNT(*) as cnt FROM mail_metadata WHERE {where_clause} GROUP BY folder", params).fetchall()
+            folders = {r["folder"]: r["cnt"] for r in folder_rows}
+
+            # Top senders
+            sender_rows = conn.execute(f"SELECT sender, COUNT(*) as cnt FROM mail_metadata WHERE {where_clause} GROUP BY sender ORDER BY cnt DESC LIMIT 10", params).fetchall()
+            top_senders = {r["sender"]: r["cnt"] for r in sender_rows}
+
+            return {
+                "total_mails": total_mails,
+                "total_size_bytes": total_size,
+                "has_attachments": has_attachments,
+                "folders": folders,
+                "top_senders": top_senders,
+                "account_ids": account_ids,
             }
 
     def close(self) -> None:

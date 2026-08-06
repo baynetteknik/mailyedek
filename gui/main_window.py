@@ -353,7 +353,7 @@ class MainWindow(QMainWindow):
 
         for key, title, PanelClass in panels_def:
             kwargs = {"engine": self.engine, "parent": self}
-            if PanelClass is AccountPanel:
+            if PanelClass in (AccountPanel, SyncPanel):
                 kwargs["settings"] = self.settings
             panel = PanelClass(**kwargs)
             self.panels[key] = panel
@@ -411,7 +411,7 @@ class MainWindow(QMainWindow):
     def _open_settings(self):
         """Open storage settings dialog with path + locations management."""
         dialog = StorageSettingsDialog(self.settings, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if dialog.exec() == QDialog.Accepted:
             self.label_data_path.setText(f"📁 {self.settings.data_path()}")
 
     @Slot()
@@ -452,8 +452,14 @@ class MainWindow(QMainWindow):
 
     def _load_style(self):
         if STYLE_PATH.exists():
-            with open(STYLE_PATH) as f:
-                self.setStyleSheet(f.read())
+            with open(STYLE_PATH, encoding="utf-8") as f:
+                qss = f.read()
+                app = QApplication.instance()
+                if app:
+                    app.setStyleSheet(qss)
+                else:
+                    self.setStyleSheet(qss)
+
 
     # ------------------------------------------------------------------
     # Events
@@ -481,18 +487,22 @@ class MainWindow(QMainWindow):
                 export_running = True
 
         if not sync_running and not export_running:
-            # Exit directly
             self.exit_completely()
             event.accept()
             return
-            
+
         reply = QMessageBox(self)
-        reply.setWindowTitle("Exit Confirmation")
-        reply.setText("Active sync or export tasks are running in the background. Do you want to minimize to system tray or exit completely?")
+        reply.setWindowTitle("Çıkış Onayı")
         
-        btn_background = reply.addButton("Run in Background", QMessageBox.ButtonRole.AcceptRole)
-        btn_exit = reply.addButton("Exit Completely", QMessageBox.ButtonRole.DestructiveRole)
-        btn_cancel = reply.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        if sync_running or export_running:
+            reply.setText("Arka planda çalışan aktif arşivleme veya dışa aktarım işlemleri mevcut.\n\n"
+                          "Programı tamamen kapatmak mı istiyorsunuz, yoksa arka planda çalışmaya devam etmesini mi istersiniz?")
+        else:
+            reply.setText("Programı kapatmak mı istiyorsunuz, yoksa sistem tepsisinde arka planda çalışmaya devam etmesini mi istersiniz?")
+        
+        btn_background = reply.addButton("Arka Planda Çalıştır", QMessageBox.ButtonRole.AcceptRole)
+        btn_exit = reply.addButton("Tamamen Kapat", QMessageBox.ButtonRole.DestructiveRole)
+        btn_cancel = reply.addButton("İptal", QMessageBox.ButtonRole.RejectRole)
         
         # Style message box buttons slightly for premium look
         reply.setStyleSheet("""
@@ -507,8 +517,8 @@ class MainWindow(QMainWindow):
             self.hide()
             if self.tray_icon.isSystemTrayAvailable():
                 self.tray_icon.showMessage(
-                    "Mail Archive System",
-                    "The application is running in the background. Click the icon to restore.",
+                    "Mail Arşivleme Sistemi",
+                    "Uygulama arka planda çalışmaya devam ediyor. Tekrar açmak için tepsi simgesine tıklayabilirsiniz.",
                     QSystemTrayIcon.MessageIcon.Information,
                     3000
                 )
@@ -587,8 +597,9 @@ class StorageSettingsDialog(QDialog):
     def __init__(self, settings: "AppSettings", parent=None):
         super().__init__(parent)
         self.settings = settings
+        self.engine = getattr(parent, "engine", None)
         self.setWindowTitle("Storage Settings")
-        self.setMinimumSize(520, 400)
+        self.setMinimumSize(620, 400)
         self._build_ui()
         self._populate()
 
@@ -666,6 +677,16 @@ class StorageSettingsDialog(QDialog):
 
         btn_row.addStretch()
 
+        if self.engine:
+            self.btn_reorganize = QPushButton("⚙️ Klasör Yapısını Optimize Et")
+            self.btn_reorganize.setStyleSheet(
+                "QPushButton { background: #f59e0b; color: white; border: none; "
+                "border-radius: 4px; padding: 6px 16px; font-weight: bold; }"
+                "QPushButton:hover { background: #d97706; }"
+            )
+            self.btn_reorganize.clicked.connect(self._on_reorganize_archive)
+            btn_row.addWidget(self.btn_reorganize)
+
         btn_close = QPushButton("Close")
         btn_close.setStyleSheet(
             "QPushButton { background: #6b7280; color: white; border: none; "
@@ -740,3 +761,8 @@ class StorageSettingsDialog(QDialog):
         if reply == QMessageBox.Yes:
             self.settings.remove_storage_location(name)
             self._populate()
+
+    def _on_reorganize_archive(self):
+        from gui.dialogs.archive_optimizer_dialog import ArchiveOptimizerDialog
+        dialog = ArchiveOptimizerDialog(self.engine, self.settings, self)
+        dialog.exec()

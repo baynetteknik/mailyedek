@@ -190,6 +190,10 @@ class BackupPanel(QWidget):
                         f"S3 backup {status}: {report.get('mails_backed_up', 0)} mails, "
                         f"{report.get('total_bytes', 0)} bytes"
                     )
+                    try:
+                        self.engine.reporter.generate_backup_report(report, "both")
+                    except Exception as e:
+                        logger.error("Failed to generate backup report: %s", e)
             except Exception as exc:
                 self.btn_s3_backup.setEnabled(True)
                 self.log_output.append(f"S3 backup ERROR: {exc}")
@@ -231,6 +235,10 @@ class BackupPanel(QWidget):
                     self.log_output.append(
                         f"GDrive backup {status}: {report.get('mails_backed_up', 0)} mails"
                     )
+                    try:
+                        self.engine.reporter.generate_backup_report(report, "both")
+                    except Exception as e:
+                        logger.error("Failed to generate backup report: %s", e)
             except Exception as exc:
                 self.btn_gdrive_backup.setEnabled(True)
                 self.log_output.append(f"GDrive backup ERROR: {exc}")

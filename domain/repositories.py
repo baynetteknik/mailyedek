@@ -17,7 +17,8 @@ from domain.entities import (
 class IAccountRepository(ABC):
     @abstractmethod
     def add(self, label: str, email: str, imap_host: str, imap_port: int,
-            use_ssl: bool, username_enc: str, password_enc: str) -> int: ...
+            use_ssl: bool, username_enc: str, password_enc: str, export_subfolder: str = "",
+            account_group: str = "") -> int: ...
 
     @abstractmethod
     def get(self, account_id: int) -> Optional[Dict]: ...
@@ -56,7 +57,13 @@ class IMailRepository(ABC):
 
     @abstractmethod
     def search(self, query: str, limit: int = 50,
-               offset: int = 0) -> List[Dict]: ...
+               offset: int = 0,
+               account_id: Optional[int] = None,
+               folder: Optional[str] = None,
+               since_date: Optional[str] = None,
+               before_date: Optional[str] = None,
+               has_attachments: Optional[bool] = None,
+               unread_only: Optional[bool] = None) -> List[Dict]: ...
 
 
 class ISyncStateRepository(ABC):

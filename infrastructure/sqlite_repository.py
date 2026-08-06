@@ -25,9 +25,10 @@ class SqliteAccountRepository(IAccountRepository):
         self._db = db
 
     def add(self, label: str, email: str, imap_host: str, imap_port: int,
-            use_ssl: bool, username_enc: str, password_enc: str) -> int:
+            use_ssl: bool, username_enc: str, password_enc: str, export_subfolder: str = "",
+            account_group: str = "") -> int:
         return self._db.add_account(label, email, imap_host, imap_port,
-                                    use_ssl, username_enc, password_enc)
+                                    use_ssl, username_enc, password_enc, export_subfolder, account_group)
 
     def get(self, account_id: int) -> Optional[Dict]:
         return self._db.get_account(account_id)
@@ -68,8 +69,19 @@ class SqliteMailRepository(IMailRepository):
         return self._db.get_raw_mail(mail_id)
 
     def search(self, query: str, limit: int = 50,
-               offset: int = 0) -> List[Dict]:
-        return self._db.search_mails(query, limit, offset)
+               offset: int = 0,
+               account_id: Optional[int] = None,
+               folder: Optional[str] = None,
+               since_date: Optional[str] = None,
+               before_date: Optional[str] = None,
+               has_attachments: Optional[bool] = None,
+               unread_only: Optional[bool] = None) -> List[Dict]:
+        return self._db.search_mails(
+            query=query, limit=limit, offset=offset,
+            account_id=account_id, folder=folder,
+            since_date=since_date, before_date=before_date,
+            has_attachments=has_attachments, unread_only=unread_only
+        )
 
 
 class SqliteSyncStateRepository(ISyncStateRepository):

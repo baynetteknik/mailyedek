@@ -1,0 +1,2 @@
+﻿label,email,imap_host,imap_port,use_ssl,username,password,export_subfolder,storage,account_group
+Baynet Main,info@baynet.com.tr,imap.baynet.com.tr,993,1,info@baynet.com.tr,password123,Baynet,local_storage,Baynet

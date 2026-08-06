@@ -47,9 +47,11 @@ class MailEngine:
                  key_file: Optional[Path] = None,
                  use_keyring: bool = False):
         # Core infrastructure
+        from core.reporter import ReportGenerator
         self.crypto = CryptoManager(key_file=key_file, use_keyring=use_keyring)
         self.db = DatabaseManager(db_path=db_path)
         self.event_bus = get_event_bus()
+        self.reporter = ReportGenerator()
 
         # Repositories
         self.accounts = SqliteAccountRepository(self.db)
@@ -105,7 +107,9 @@ class MailEngine:
 
     def add_account(self, label: str, email: str, imap_host: str,
                     imap_port: int = 993, use_ssl: bool = True,
-                    username: str = None, password: str = None) -> int:
+                    username: str = None, password: str = None,
+                    export_subfolder: str = "",
+                    account_group: str = "") -> int:
         """Add a new email account. Credentials are encrypted before storage."""
         if username is None:
             username = email
@@ -123,6 +127,8 @@ class MailEngine:
             use_ssl=use_ssl,
             username_enc=username_enc,
             password_enc=password_enc,
+            export_subfolder=export_subfolder,
+            account_group=account_group,
         )
 
         self.audit.append("account.added", account_id=account_id)
@@ -209,12 +215,13 @@ class MailEngine:
                      folder_filter: Optional[List[str]] = None,
                      since_date: Optional[str] = None,
                      before_date: Optional[str] = None,
-                     archive_unread: bool = True) -> Dict:
+                     archive_unread: bool = True,
+                     timeout: int = 15) -> Dict:
         """Preview what would be synced."""
         return self.sync_usecase.dry_run(
             account_id, log_callback=log_callback, folder_filter=folder_filter,
             since_date=since_date, before_date=before_date,
-            archive_unread=archive_unread,
+            archive_unread=archive_unread, timeout=timeout,
         )
 
     # ------------------------------------------------------------------
@@ -284,9 +291,20 @@ class MailEngine:
     # ------------------------------------------------------------------
 
     def search(self, query: str, limit: int = 50,
-               offset: int = 0) -> List[Dict]:
+               offset: int = 0,
+               account_id: Optional[int] = None,
+               folder: Optional[str] = None,
+               since_date: Optional[str] = None,
+               before_date: Optional[str] = None,
+               has_attachments: Optional[bool] = None,
+               unread_only: Optional[bool] = None) -> List[Dict]:
         """Full-text search across all archived mails."""
-        return self.mails.search(query, limit, offset)
+        return self.mails.search(
+            query=query, limit=limit, offset=offset,
+            account_id=account_id, folder=folder,
+            since_date=since_date, before_date=before_date,
+            has_attachments=has_attachments, unread_only=unread_only
+        )
 
     # ------------------------------------------------------------------
     # Deduplication
@@ -356,6 +374,52 @@ class MailEngine:
             imap_username=imap_username,
             imap_password=imap_password
         )
+
+    def generate_custom_report(self, account_id: Optional[int] = None,
+                               account_group: Optional[str] = None,
+                               domain: Optional[str] = None,
+                               since_date: Optional[str] = None,
+                               before_date: Optional[str] = None,
+                               single_email: Optional[str] = None) -> Dict[str, Any]:
+        """Query aggregates and write custom JSON/HTML reports to disk."""
+        stats = self.db.get_custom_report_stats(
+            account_id=account_id,
+            account_group=account_group,
+            domain=domain,
+            since_date=since_date,
+            before_date=before_date,
+            single_email=single_email
+        )
+        if not stats or stats.get("total_mails", 0) == 0:
+            return {"total_mails": 0}
+
+        # Build human-readable criteria
+        criteria = {}
+        if account_id is not None:
+            acc = self.accounts.get(account_id)
+            criteria["filtre_tipi"] = f"Hesap: {acc.get('label', account_id) if acc else account_id}"
+            criteria["hesap_adi"] = acc.get("email", "") if acc else ""
+        elif account_group:
+            criteria["filtre_tipi"] = f"Domain Grubu: {account_group}"
+        elif domain:
+            criteria["filtre_tipi"] = f"E-Posta Domaini: @{domain}"
+        elif single_email:
+            criteria["filtre_tipi"] = f"Tek E-Posta Adresi: {single_email}"
+        else:
+            criteria["filtre_tipi"] = "Tüm Veriler"
+
+        if since_date:
+            criteria["baslangic_tarihi"] = since_date[:10]
+        if before_date:
+            criteria["bitis_tarihi"] = before_date[:10]
+
+        report_path = self.reporter.generate_custom_metadata_report(criteria, stats, output_format="both")
+        return {
+            "total_mails": stats["total_mails"],
+            "total_size_bytes": stats["total_size_bytes"],
+            "report_path": str(report_path),
+            "stats": stats
+        }
 
     # ------------------------------------------------------------------
     # Event bus

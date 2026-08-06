@@ -72,8 +72,18 @@ class AppSettings:
         """Return the configured data directory path."""
         raw = self._data.get("data_path")
         if raw:
-            return Path(raw)
+            try:
+                p = Path(raw)
+                # Check if the path exists or is writable (missing drive letter will raise OSError here or on mkdir)
+                if p.exists():
+                    return p
+                else:
+                    p.mkdir(parents=True, exist_ok=True)
+                    return p
+            except OSError as exc:
+                logger.error("Configured data_path '%s' is not accessible, falling back to default: %s", raw, exc)
         return DEFAULT_SETTINGS_DIR
+
 
     def set_data_path(self, path: Path):
         self._data["data_path"] = str(path.resolve())
@@ -123,3 +133,81 @@ class AppSettings:
             mapping[key] = location_name
         self._data["account_storage_map"] = mapping
         self.save()
+
+    def account_sync_filters(self, account_id: int) -> Optional[dict]:
+        """Return the sync filters assigned to an account, or None."""
+        mapping = self._data.get("account_sync_filters_map", {})
+        return mapping.get(str(account_id))
+
+    def set_account_sync_filters(self, account_id: int, filters: Optional[dict]):
+        mapping = self._data.get("account_sync_filters_map", {})
+        key = str(account_id)
+        if filters is None:
+            mapping.pop(key, None)
+        else:
+            mapping[key] = filters
+        self._data["account_sync_filters_map"] = mapping
+        self.save()
+
+    # ------------------------------------------------------------------
+    # Custom IMAP Provider Presets
+    # ------------------------------------------------------------------
+
+    def custom_presets(self) -> List[Dict[str, Any]]:
+        """Return all user-defined custom provider presets."""
+        return self._data.get("custom_provider_presets", [])
+
+    def add_custom_preset(self, name: str, host: str, port: int, use_ssl: bool, domains: Optional[List[str]] = None):
+        """Add or update a custom provider preset."""
+        presets = self._data.get("custom_provider_presets", [])
+        presets = [p for p in presets if p.get("name") != name]
+        presets.append({
+            "id": f"custom_{name.lower().replace(' ', '_')}",
+            "name": name,
+            "host": host,
+            "port": port,
+            "use_ssl": use_ssl,
+            "domains": domains or []
+        })
+        self._data["custom_provider_presets"] = presets
+        self.save()
+
+    def remove_custom_preset(self, name: str):
+        """Remove a custom provider preset by name."""
+        presets = self._data.get("custom_provider_presets", [])
+        self._data["custom_provider_presets"] = [p for p in presets if p.get("name") != name]
+        self.save()
+
+    # ------------------------------------------------------------------
+    # Folder Translation Options
+    # ------------------------------------------------------------------
+
+    def folder_translation_sync(self) -> str:
+        """Mode for incoming server folder names: 'original', 'tr', or 'en'."""
+        return self._data.get("folder_translation_sync", "original")
+
+    def set_folder_translation_sync(self, mode: str):
+        self._data["folder_translation_sync"] = mode
+        self.save()
+
+    def folder_translation_restore(self) -> str:
+        """Mode when pushing folders back to server: 'original', 'tr', or 'en'."""
+        return self._data.get("folder_translation_restore", "original")
+
+    def set_folder_translation_restore(self, mode: str):
+        self._data["folder_translation_restore"] = mode
+        self.save()
+
+
+
+
+def get_account_mailbox_dir(base_path: Path, email: str, subfolder: str, folder_name: str) -> Path:
+    """Calculates the target directory for an email mailbox folder based on base path and account settings."""
+    import re
+    folder_clean = re.sub(r'[\/:*?"<>|]', '_', folder_name).strip()
+    email_clean = re.sub(r'[\/:*?"<>|]', '_', email.replace("@", "_")).strip()
+    if subfolder and subfolder.strip() and subfolder.strip() != ".":
+        sub_clean = re.sub(r'[\/:*?"<>|]', '_', subfolder.strip()).strip()
+        return base_path / sub_clean / email_clean / folder_clean
+    else:
+        return base_path / email_clean / folder_clean

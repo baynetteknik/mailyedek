@@ -25,20 +25,42 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
-from PySide6.QtCore import Qt, Signal, Slot, QSize, QDate
-from PySide6.QtGui import QFont, QIcon, QPixmap, QTextDocument, QTextCursor, QColor
+from PySide6.QtCore import Qt, Signal, Slot, QSize, QDate, QThread
+from PySide6.QtGui import QFont, QIcon, QPixmap, QTextDocument, QTextCursor, QColor, QClipboard
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QPushButton, QLabel, QTreeWidget, QTreeWidgetItem,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTextBrowser, QPlainTextEdit, QGroupBox, QFrame, QAbstractItemView,
     QListWidget, QListWidgetItem, QMessageBox, QToolBar,
-    QComboBox, QStatusBar, QProgressBar, QDialog,
+    QComboBox, QStatusBar, QProgressBar, QDialog, QMenu, QApplication,
 )
 
 from core.mail_engine import MailEngine
 
 logger = logging.getLogger(__name__)
+
+
+class MailBodyLoaderThread(QThread):
+    """Background worker for loading and parsing email raw content without UI lag."""
+    finished_signal = Signal(object)
+
+    def __init__(self, engine: MailEngine, mail_id: int, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.mail_id = mail_id
+
+    def run(self):
+        try:
+            raw_data = self.engine.mails.get_raw(self.mail_id)
+            if raw_data:
+                msg = email.message_from_bytes(raw_data)
+                self.finished_signal.emit(msg)
+            else:
+                self.finished_signal.emit(None)
+        except Exception as e:
+            logger.debug("Failed to load/parse raw mail bytes: %s", e)
+            self.finished_signal.emit(e)
 
 
 class FolderTree(QTreeWidget):
@@ -75,42 +97,62 @@ class FolderTree(QTreeWidget):
         """)
         self.itemClicked.connect(self._on_item_clicked)
 
-    def refresh(self):
+    def refresh(self, selected_group: str = "__ALL__"):
         self.clear()
         try:
-            accounts = self.engine.list_accounts()
+            all_accounts = self.engine.list_accounts()
+            accounts = []
+            for acc in all_accounts:
+                g_val = acc.get("account_group", "").strip()
+                if not g_val and "@" in acc.get("email", ""):
+                    g_val = acc["email"].split("@")[-1].strip()
+                if selected_group == "__ALL__" or g_val == selected_group:
+                    accounts.append(acc)
+
+            if not accounts:
+                return
+
+            acc_ids = tuple(acc["id"] for acc in accounts)
+            acc_id_clause = f"IN ({','.join('?' for _ in acc_ids)})" if len(acc_ids) > 1 else "= ?"
+
+            # Bulk query sync states and folder counts in 2 fast queries
+            synced_dict = {}
+            counts_dict = {}
+            with self.engine.db.get_conn() as conn:
+                state_rows = conn.execute(
+                    f"SELECT account_id, folder FROM sync_state WHERE account_id {acc_id_clause}",
+                    acc_ids
+                ).fetchall()
+                for r in state_rows:
+                    synced_dict.setdefault(r["account_id"], set()).add(r["folder"])
+
+                count_rows = conn.execute(
+                    f"SELECT account_id, folder, COUNT(*) as cnt FROM mail_metadata WHERE is_deleted=0 AND account_id {acc_id_clause} GROUP BY account_id, folder",
+                    acc_ids
+                ).fetchall()
+                for r in count_rows:
+                    counts_dict[(r["account_id"], r["folder"])] = r["cnt"]
+
             for acc in accounts:
+                acc_id = acc["id"]
                 acc_item = QTreeWidgetItem([f"📁  {acc['label']}  ({acc['email']})"])
-                acc_item.setData(0, Qt.UserRole, ("account", acc["id"]))
+                acc_item.setData(0, Qt.UserRole, ("account", acc_id))
                 acc_item.setFlags(acc_item.flags() & ~Qt.ItemIsSelectable)
                 self.addTopLevelItem(acc_item)
 
-                # Get folders and their counts
-                with self.engine.db.get_conn() as conn:
-                    # Query sync states to know all synced folders
-                    state_rows = conn.execute(
-                        "SELECT folder FROM sync_state WHERE account_id=?",
-                        (acc["id"],)
-                    ).fetchall()
-                    synced_folders = {r["folder"] for r in state_rows}
-                    
-                    # Query mail metadata counts
-                    count_rows = conn.execute(
-                        "SELECT folder, COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0 GROUP BY folder",
-                        (acc["id"],)
-                    ).fetchall()
-                    folder_counts = {r["folder"]: r["cnt"] for r in count_rows}
+                synced_folders = synced_dict.get(acc_id, set())
+                acc_counts = {f: cnt for (aid, f), cnt in counts_dict.items() if aid == acc_id}
 
                 seen = {"INBOX"}
-                inbox_cnt = folder_counts.get("INBOX", 0)
-                self._add_folder(acc_item, acc["id"], "INBOX", inbox_cnt)
+                inbox_cnt = acc_counts.get("INBOX", 0)
+                self._add_folder(acc_item, acc_id, "INBOX", inbox_cnt)
 
-                all_folders = sorted(list(synced_folders | set(folder_counts.keys())))
+                all_folders = sorted(list(synced_folders | set(acc_counts.keys())))
                 for folder in all_folders:
                     if folder not in seen:
                         seen.add(folder)
-                        cnt = folder_counts.get(folder, 0)
-                        self._add_folder(acc_item, acc["id"], folder, cnt)
+                        cnt = acc_counts.get(folder, 0)
+                        self._add_folder(acc_item, acc_id, folder, cnt)
 
                 acc_item.setExpanded(True)
         except Exception as exc:
@@ -160,6 +202,8 @@ class MailListTable(QTableWidget):
                 color: #1a1a2e;
             }
         """)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
         self.itemSelectionChanged.connect(self._emit_selection)
         self.doubleClicked.connect(self._on_double_click)
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -167,6 +211,38 @@ class MailListTable(QTableWidget):
         self._mails = []
         self._loading = False
         self._has_more = True
+
+    def _on_context_menu(self, pos):
+        row = self.rowAt(pos.y())
+        if row < 0 or row >= len(self._mails):
+            return
+
+        mail = self._mails[row]
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background-color: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px; }
+            QMenu::item { padding: 8px 20px; font-size: 12px; color: #1e293b; border-radius: 4px; }
+            QMenu::item:selected { background-color: #2563eb; color: #ffffff; }
+        """)
+
+        act_view = menu.addAction("👁️ E-Postayı Pencerede Aç")
+        act_raw = menu.addAction("📄 Ham Kaynağı İncele")
+        act_save = menu.addAction("💾 .EML Olarak Kaydet")
+        menu.addSeparator()
+        act_copy_subj = menu.addAction("📋 Konuyu Kopyala")
+        act_copy_sender = menu.addAction("👤 Gönderen Adresini Kopyala")
+
+        action = menu.exec(self.viewport().mapToGlobal(pos))
+        if action == act_view:
+            self.mail_double_clicked.emit(mail)
+        elif action == act_raw:
+            self.mail_double_clicked.emit(mail)
+        elif action == act_save:
+            self.mail_double_clicked.emit(mail)
+        elif action == act_copy_subj:
+            QApplication.clipboard().setText(mail.get("subject", ""))
+        elif action == act_copy_sender:
+            QApplication.clipboard().setText(mail.get("sender", ""))
 
     def clear_mails(self):
         self.setRowCount(0)
@@ -329,7 +405,7 @@ class MailPreview(QWidget):
         self.btn_raw.clicked.connect(self._show_raw)
 
     def show_mail(self, mail_meta: Dict):
-        """Display a mail from metadata. Fetches raw content from DB."""
+        """Display a mail from metadata asynchronously in background thread."""
         self._current_mail = mail_meta
         mail_id = mail_meta.get("id")
 
@@ -339,19 +415,26 @@ class MailPreview(QWidget):
         self.lbl_date.setText(f"Date:    {mail_meta.get('date', '—')}")
         self.lbl_subject.setText(mail_meta.get('subject', '(No Subject)'))
 
-        # Fetch raw content
-        raw_data = None
-        try:
-            raw_data = self.engine.mails.get_raw(mail_id)
-        except Exception:
-            pass
+        self.body_view.setHtml("<div style='text-align:center;padding:40px;color:#2563eb;'><h3>⏳ E-posta içeriği yükleniyor...</h3></div>")
 
-        if raw_data:
+        if self._loader_thread and self._loader_thread.isRunning():
             try:
-                msg = email.message_from_bytes(raw_data)
-                self._render_message(msg)
-            except Exception as exc:
-                self.body_view.setPlainText(f"Could not parse email: {exc}")
+                self._loader_thread.finished_signal.disconnect()
+            except Exception:
+                pass
+            self._loader_thread.quit()
+
+        self._loader_thread = MailBodyLoaderThread(self.engine, mail_id, parent=self)
+        self._loader_thread.finished_signal.connect(self._on_mail_loaded)
+        self._loader_thread.finished_signal.connect(self._loader_thread.deleteLater)
+        self._loader_thread.start()
+
+    @Slot(object)
+    def _on_mail_loaded(self, result):
+        if isinstance(result, Exception):
+            self.body_view.setPlainText(f"Could not parse email: {result}")
+        elif isinstance(result, email.message.Message):
+            self._render_message(result)
         else:
             self.body_view.setHtml(
                 "<div style='text-align:center;padding:40px;color:#999;'>"
@@ -882,8 +965,15 @@ class MailViewerPanel(QWidget):
 
         # Top toolbar
         toolbar = QHBoxLayout()
+
+        self.combo_group = QComboBox()
+        self.combo_group.setMinimumWidth(180)
+        self.combo_group.setToolTip("Grup / Domain filtresine göre hesapları ve klasörleri süzün")
+        toolbar.addWidget(QLabel("📁 Grup/Domain:"))
+        toolbar.addWidget(self.combo_group)
+
         self.combo_account = QComboBox()
-        self.combo_account.setMinimumWidth(250)
+        self.combo_account.setMinimumWidth(220)
         toolbar.addWidget(QLabel("Account:"))
         toolbar.addWidget(self.combo_account)
 
@@ -978,6 +1068,7 @@ class MailViewerPanel(QWidget):
         layout.addWidget(self.status_bar)
 
     def _connect_signals(self):
+        self.combo_group.currentIndexChanged.connect(self._on_group_changed)
         self.folder_tree.folder_selected.connect(self._on_folder_selected)
         self.mail_list.mail_selected.connect(self._on_mail_selected)
         self.mail_list.mail_double_clicked.connect(self._on_mail_double_clicked)
@@ -1144,24 +1235,67 @@ class MailViewerPanel(QWidget):
 
         threading.Thread(target=task, daemon=True).start()
 
+    @Slot(int)
+    def _on_group_changed(self, idx: int):
+        selected_group = self.combo_group.itemData(idx) if idx >= 0 else "__ALL__"
+        self._populate_accounts_for_group(selected_group or "__ALL__")
+        self.folder_tree.refresh(selected_group or "__ALL__")
+
+    def _populate_accounts_for_group(self, selected_group: str):
+        self.combo_account.blockSignals(True)
+        self.combo_account.clear()
+        try:
+            all_accounts = self.engine.list_accounts()
+            for acc in all_accounts:
+                g_val = acc.get("account_group", "").strip()
+                if not g_val and "@" in acc.get("email", ""):
+                    g_val = acc["email"].split("@")[-1].strip()
+                if selected_group == "__ALL__" or g_val == selected_group:
+                    self.combo_account.addItem(f"{acc['label']} ({acc['email']})", acc)
+        except Exception as exc:
+            logger.error("Error populating accounts for group: %s", exc)
+        finally:
+            self.combo_account.blockSignals(False)
+
     @Slot()
     def _on_account_changed(self, idx: int):
         if idx >= 0:
-            self.refresh()
+            acc_data = self.combo_account.itemData(idx)
+            if isinstance(acc_data, dict):
+                self._current_account_id = acc_data.get("id")
 
     # ------------------------------------------------------------------
     # Refresh
     # ------------------------------------------------------------------
 
     def refresh(self):
-        self.folder_tree.refresh()
-        self.combo_account.blockSignals(True)
-        self.combo_account.clear()
+        current_grp = self.combo_group.currentData() if hasattr(self, "combo_group") else "__ALL__"
+        self.combo_group.blockSignals(True)
+        self.combo_group.clear()
+        self.combo_group.addItem("🌐 Tüm Gruplar / Domainler", "__ALL__")
+
+        groups = set()
         try:
-            accounts = self.engine.list_accounts()
-            for acc in accounts:
-                self.combo_account.addItem(f"{acc['label']} ({acc['email']})", acc)
-        except Exception as exc:
-            logger.error("Refresh error: %s", exc)
-        finally:
-            self.combo_account.blockSignals(False)
+            all_accounts = self.engine.list_accounts()
+            for acc in all_accounts:
+                g_val = acc.get("account_group", "").strip()
+                if not g_val and "@" in acc.get("email", ""):
+                    g_val = acc["email"].split("@")[-1].strip()
+                if g_val:
+                    groups.add(g_val)
+        except Exception:
+            pass
+
+        for g in sorted(groups):
+            self.combo_group.addItem(f"📁 {g}", g)
+
+        idx = self.combo_group.findData(current_grp)
+        if idx >= 0:
+            self.combo_group.setCurrentIndex(idx)
+        else:
+            self.combo_group.setCurrentIndex(0)
+        self.combo_group.blockSignals(False)
+
+        selected_group = self.combo_group.currentData() or "__ALL__"
+        self._populate_accounts_for_group(selected_group)
+        self.folder_tree.refresh(selected_group)

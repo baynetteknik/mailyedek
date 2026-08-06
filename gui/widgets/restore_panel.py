@@ -83,6 +83,16 @@ class RestorePanel(QWidget):
         self.s3_target_imap = QCheckBox("Push restored mails directly to IMAP server")
         form.addRow("", self.s3_target_imap)
 
+        self.s3_folder_lang = QComboBox()
+        self.s3_folder_lang.addItem("Orijinal Dilinde Bırak", "original")
+        self.s3_folder_lang.addItem("Türkçeleştir (TR)", "tr")
+        self.s3_folder_lang.addItem("İngilizceye Çevir (EN)", "en")
+        initial_restore_lang = self.engine.settings.folder_translation_restore() if hasattr(self.engine, "settings") else "original"
+        idx = self.s3_folder_lang.findData(initial_restore_lang)
+        if idx >= 0:
+            self.s3_folder_lang.setCurrentIndex(idx)
+        form.addRow("Sunucuya Gönderirken Klasör İsimleri:", self.s3_folder_lang)
+
         self.s3_dry_run = QCheckBox("Dry Run (preview only)")
         form.addRow("", self.s3_dry_run)
 
@@ -116,6 +126,16 @@ class RestorePanel(QWidget):
         self.gdrive_target_imap = QCheckBox("Push restored mails directly to IMAP server")
         form.addRow("", self.gdrive_target_imap)
 
+        self.gdrive_folder_lang = QComboBox()
+        self.gdrive_folder_lang.addItem("Orijinal Dilinde Bırak", "original")
+        self.gdrive_folder_lang.addItem("Türkçeleştir (TR)", "tr")
+        self.gdrive_folder_lang.addItem("İngilizceye Çevir (EN)", "en")
+        initial_restore_lang = self.engine.settings.folder_translation_restore() if hasattr(self.engine, "settings") else "original"
+        idx = self.gdrive_folder_lang.findData(initial_restore_lang)
+        if idx >= 0:
+            self.gdrive_folder_lang.setCurrentIndex(idx)
+        form.addRow("Sunucuya Gönderirken Klasör İsimleri:", self.gdrive_folder_lang)
+
         self.gdrive_dry_run = QCheckBox("Dry Run (preview only)")
         form.addRow("", self.gdrive_dry_run)
 
@@ -148,6 +168,13 @@ class RestorePanel(QWidget):
         dry = self.s3_dry_run.isChecked()
         self.log_output.append("Starting S3 restore...")
 
+        folder_lang = self.s3_folder_lang.currentData() or "original"
+        if hasattr(self.engine, "settings"):
+            self.engine.settings.set_folder_translation_restore(folder_lang)
+
+        from datetime import datetime
+        start_time_str = datetime.utcnow().isoformat()
+        
         def task():
             try:
                 result = self.engine.restore_from_s3(
@@ -158,13 +185,21 @@ class RestorePanel(QWidget):
                     dry_run=dry,
                     access_key_id=self.s3_access_key.text().strip() or None,
                     secret_access_key=self.s3_secret_key.text().strip() or None,
+                    folder_lang=folder_lang,
                 )
+                result["started_at"] = start_time_str
+                result["finished_at"] = datetime.utcnow().isoformat()
                 self.btn_s3_restore.setEnabled(True)
                 self.log_output.append(
                     f"Restore: {result.get('mails_restored', 0)} mails, "
                     f"{result.get('hash_verified', 0)} hashes verified, "
                     f"{result.get('errors', 0)} errors"
                 )
+                if not dry:
+                    try:
+                        self.engine.reporter.generate_restore_report(result, "both")
+                    except Exception as e:
+                        logger.error("Failed to generate restore report: %s", e)
             except Exception as exc:
                 self.btn_s3_restore.setEnabled(True)
                 self.log_output.append(f"ERROR: {exc}")
@@ -182,18 +217,33 @@ class RestorePanel(QWidget):
         dry = self.gdrive_dry_run.isChecked()
         self.log_output.append("Starting Google Drive restore...")
 
+        folder_lang = self.gdrive_folder_lang.currentData() or "original"
+        if hasattr(self.engine, "settings"):
+            self.engine.settings.set_folder_translation_restore(folder_lang)
+
+        from datetime import datetime
+        start_time_str = datetime.utcnow().isoformat()
+
         def task():
             try:
                 result = self.engine.restore_from_gdrive(
                     remote_name=name,
                     target_imap=self.gdrive_target_imap.isChecked(),
                     dry_run=dry,
+                    folder_lang=folder_lang,
                 )
+                result["started_at"] = start_time_str
+                result["finished_at"] = datetime.utcnow().isoformat()
                 self.btn_gdrive_restore.setEnabled(True)
                 self.log_output.append(
                     f"Restore: {result.get('mails_restored', 0)} mails, "
                     f"{result.get('errors', 0)} errors"
                 )
+                if not dry:
+                    try:
+                        self.engine.reporter.generate_restore_report(result, "both")
+                    except Exception as e:
+                        logger.error("Failed to generate restore report: %s", e)
             except Exception as exc:
                 self.btn_gdrive_restore.setEnabled(True)
                 self.log_output.append(f"ERROR: {exc}")
