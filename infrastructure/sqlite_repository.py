@@ -92,7 +92,12 @@ class SqliteSyncStateRepository(ISyncStateRepository):
         return self._db.get_sync_state(account_id, folder)
 
     def update(self, account_id: int, folder: str,
-               last_uid: int, uid_validity: int, mail_count: int) -> None:
+               last_uid: int, uid_validity: int = 0, mail_count: int = 0) -> None:
+        self._db.update_sync_state(account_id, folder, last_uid,
+                                   uid_validity, mail_count)
+
+    def upsert(self, account_id: int, folder: str,
+               last_uid: int, uid_validity: int = 0, mail_count: int = 0) -> None:
         self._db.update_sync_state(account_id, folder, last_uid,
                                    uid_validity, mail_count)
 

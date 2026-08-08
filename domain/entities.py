@@ -115,6 +115,8 @@ class SyncReport:
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     mails_already_archived: int = 0
+    error_details: List[str] = field(default_factory=list)
+
 
 
 @dataclass

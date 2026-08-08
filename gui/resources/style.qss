@@ -301,11 +301,13 @@ QToolTip {
 
 /* Dialogs & Message Boxes */
 QDialog, QMessageBox, QProgressDialog, QInputDialog, QFileDialog {
-    background-color: #f8fafc;
+    background-color: #ffffff !important;
+    color: #0f172a !important;
 }
 
 QDialog QLabel, QMessageBox QLabel, QProgressDialog QLabel, QInputDialog QLabel, QFileDialog QLabel {
-    color: #0f172a;
+    color: #0f172a !important;
+    background-color: transparent !important;
     font-size: 13px;
     font-weight: 500;
 }

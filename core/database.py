@@ -53,24 +53,38 @@ class DatabaseManager:
     def get_conn(self) -> Generator[sqlite3.Connection, None, None]:
         """Provide a thread-local connection with WAL mode."""
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(str(self._db_path), timeout=30)
+            conn = sqlite3.connect(str(self._db_path), timeout=60.0)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA busy_timeout=60000")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         yield self._local.conn
 
     @contextmanager
     def transaction(self) -> Generator[sqlite3.Connection, None, None]:
-        """Provide a connection with an active transaction."""
+        """Provide a connection with an active transaction and lock retry logic."""
         with self.get_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            max_retries = 8
+            backoff = 0.2
+            for attempt in range(max_retries):
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" in str(exc).lower() and attempt < max_retries - 1:
+                        time.sleep(backoff)
+                        backoff *= 1.5
+                    else:
+                        raise
             try:
                 yield conn
                 conn.commit()
             except Exception:
-                conn.rollback()
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 raise
 
     # ------------------------------------------------------------------
@@ -197,8 +211,20 @@ class DatabaseManager:
                     ON mail_metadata(account_id, folder, uid);
                 CREATE INDEX IF NOT EXISTS idx_mail_message_id
                     ON mail_metadata(message_id);
+                CREATE INDEX IF NOT EXISTS idx_mail_account_deleted
+                    ON mail_metadata(account_id, is_deleted);
+                CREATE INDEX IF NOT EXISTS idx_mail_date
+                    ON mail_metadata(date);
+                CREATE INDEX IF NOT EXISTS idx_mail_sender
+                    ON mail_metadata(sender);
+                CREATE INDEX IF NOT EXISTS idx_mail_has_attachments
+                    ON mail_metadata(has_attachments);
+                CREATE INDEX IF NOT EXISTS idx_mail_duplicate
+                    ON mail_metadata(is_duplicate);
                 CREATE INDEX IF NOT EXISTS idx_sync_state_lookup
                     ON sync_state(account_id, folder);
+                CREATE INDEX IF NOT EXISTS idx_audit_action_ts
+                    ON audit_log(action, timestamp DESC);
             """)
             # Self-healing column addition for existing databases
             try:

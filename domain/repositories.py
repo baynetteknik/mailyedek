@@ -72,7 +72,11 @@ class ISyncStateRepository(ABC):
 
     @abstractmethod
     def update(self, account_id: int, folder: str,
-               last_uid: int, uid_validity: int, mail_count: int) -> None: ...
+               last_uid: int, uid_validity: int = 0, mail_count: int = 0) -> None: ...
+
+    def upsert(self, account_id: int, folder: str,
+               last_uid: int, uid_validity: int = 0, mail_count: int = 0) -> None:
+        self.update(account_id, folder, last_uid, uid_validity, mail_count)
 
 
 class IAttachmentRepository(ABC):

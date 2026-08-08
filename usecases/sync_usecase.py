@@ -355,6 +355,9 @@ class SyncUseCase:
                     report.mails_already_archived += folder_report.get("already_archived", 0)
                     report.folders_synced += 1
 
+                    if folder_report.get("error_details"):
+                        report.error_details.extend(folder_report["error_details"])
+
                     _log(f"[{acc['label']}]  Folder '{folder_name}' summary: "
                          f"{folder_report['fetched']} new, "
                          f"{folder_report.get('already_archived', 0)} already archived, "
@@ -364,9 +367,10 @@ class SyncUseCase:
 
                 except Exception as exc:
                     logger.exception("Error syncing folder '%s': %s", folder_name, exc)
-                    _log(f"[{acc['label']}]  Folder '{folder_name}' ERROR: {exc}",
-                         log_callback)
+                    err_msg = f"[{acc['label']}] Klasör '{folder_name}' Hata: {exc}"
+                    _log(err_msg, log_callback)
                     report.errors += 1
+                    report.error_details.append(err_msg)
 
             # Deduplicate (cross-folder cleanup — already counted per-folder)
             dup_count = self._db.deduplicate_by_hash(acc["id"])
@@ -420,7 +424,7 @@ class SyncUseCase:
                      archive_unread: bool = True,
                      progress_callback: Optional[Callable[[int, str, int, int], None]] = None
                      ) -> Dict[str, int]:
-        result = {"fetched": 0, "updated": 0, "duplicates": 0, "errors": 0, "bytes": 0, "already_archived": 0}
+        result = {"fetched": 0, "updated": 0, "duplicates": 0, "errors": 0, "bytes": 0, "already_archived": 0, "error_details": []}
         acc = self._account_repo.get(account_id) or {}
 
         from core.settings import AppSettings
@@ -435,6 +439,13 @@ class SyncUseCase:
                     (account_id, folder_name, display_folder)
                 ).fetchall()
                 archived_uids = {r["uid"] for r in existing_rows}
+                if not archived_uids:
+                    # Fallback count all UIDs for this account
+                    all_rows = conn.execute(
+                        "SELECT uid FROM mail_metadata WHERE account_id=? AND is_deleted=0",
+                        (account_id,)
+                    ).fetchall()
+                    archived_uids = {r["uid"] for r in all_rows}
         except Exception:
             archived_uids = set()
 
@@ -476,7 +487,9 @@ class SyncUseCase:
         uids = provider.fetch_uids(folder_name, search_since_uid, since_date=since_date, before_date=before_date, archive_unread=archive_unread)
 
         new_uids = [u for u in uids if u > since_uid and u not in archived_uids]
-        _log(f"    [{folder_name}] Total server messages: {len(uids)}, new to fetch: {len(new_uids)}",
+        if uids:
+            result["already_archived"] = len(set(uids).intersection(archived_uids))
+        _log(f"    [{folder_name}] Total server messages: {len(uids)}, new to fetch: {len(new_uids)}, already archived: {result['already_archived']}",
              log_callback)
 
         if not new_uids:
@@ -655,8 +668,10 @@ class SyncUseCase:
 
                 except Exception as exc:
                     logger.exception("Error fetching UID %d in '%s'", uid, folder_name)
-                    _log(f"    [{folder_name}] UID {uid}: ERROR — {exc}", log_callback)
+                    err_msg = f"[{folder_name}] UID {uid} Alınırken Hata Oluştu: {exc}"
+                    _log(f"    {err_msg}", log_callback)
                     result["errors"] += 1
+                    result["error_details"].append(err_msg)
             else:
                 last_uid = max(max_uid_on_server, last_uid)
         finally:

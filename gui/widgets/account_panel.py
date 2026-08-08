@@ -176,6 +176,8 @@ class AccountPanel(QWidget):
         self.engine = engine
         self.settings = settings or AppSettings()
         self._active_optimizer = None
+        self._excel_editing_enabled = False
+        self._is_refreshing = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -240,15 +242,39 @@ class AccountPanel(QWidget):
         self.act_import_eml = self.actions_menu.addAction("📂  EML Tarama / Aktar")
         
         self.actions_menu.addSeparator()
-        
         self.act_toggle_active = self.actions_menu.addAction("⏸  Deactivate Selected")
         self.act_toggle_active.setEnabled(False)
         self.act_test = self.actions_menu.addAction("🔌  Test Connection")
         self.act_test.setEnabled(False)
         self.act_clean_start = self.actions_menu.addAction("🗑  Clean Start")
-        
+
+        self.actions_menu.addSeparator()
+        self.act_batch_group = self.actions_menu.addAction("🏷️  Toplu Grup Değiştir")
+        self.act_batch_group.triggered.connect(self._on_batch_change_group)
+        self.act_batch_password = self.actions_menu.addAction("🔑  Toplu Şifre Güncelle")
+        self.act_batch_password.triggered.connect(self._on_batch_change_password)
+
         self.btn_actions.setMenu(self.actions_menu)
         tool_layout.addWidget(self.btn_actions)
+
+        # Excel-Style Inline Editing Toggle Button
+        self.btn_excel_mode = QPushButton("⚡ Excel Tipi Canlı Düzenleme: Kapalı")
+        self.btn_excel_mode.setToolTip("Tablo üzerinde hücreye çift tıklayıp doğrudan Excel gibi değer değiştirebilmenizi sağlar")
+        self.btn_excel_mode.setStyleSheet("""
+            QPushButton {
+                background-color: #f1f5f9;
+                color: #475569;
+                border: 1px solid #cbd5e1;
+                font-weight: bold;
+                padding: 6px 12px;
+                border-radius: 6px;
+                font-size: 11px;
+                min-height: 24px;
+            }
+            QPushButton:hover { background-color: #e2e8f0; }
+        """)
+        self.btn_excel_mode.clicked.connect(self._toggle_excel_editing_mode)
+        tool_layout.addWidget(self.btn_excel_mode)
 
         # Background Optimizer restore status button
         self.btn_active_opt_status = QPushButton("🔄 Optimizasyon Çalışıyor (Geri Yükle)")
@@ -450,6 +476,7 @@ class AccountPanel(QWidget):
         self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.horizontalHeader().customContextMenuRequested.connect(self._on_header_context_menu)
         self.table.horizontalHeader().sectionResized.connect(self._auto_save_current_layout)
+        self.table.itemChanged.connect(self._on_table_item_changed)
 
         main_split_layout.addWidget(table_box, stretch=1)
         layout.addLayout(main_split_layout, stretch=1)
@@ -719,10 +746,167 @@ class AccountPanel(QWidget):
         self.act_toggle_active.setEnabled(has_selection)
 
     # ------------------------------------------------------------------
+    # Excel-Style Inline Editing Slots & Batch Actions
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _toggle_excel_editing_mode(self):
+        self._excel_editing_enabled = not self._excel_editing_enabled
+        if self._excel_editing_enabled:
+            self.btn_excel_mode.setText("⚡ Excel Tipi Canlı Düzenleme: AÇIK")
+            self.btn_excel_mode.setStyleSheet("""
+                QPushButton {
+                    background-color: #10b981;
+                    color: white;
+                    border: none;
+                    font-weight: bold;
+                    padding: 6px 12px;
+                    border-radius: 6px;
+                    font-size: 11px;
+                    min-height: 24px;
+                }
+                QPushButton:hover { background-color: #059669; }
+            """)
+            self.table.setEditTriggers(
+                QTableWidget.DoubleClicked | QTableWidget.AnyKeyPressed | QTableWidget.EditKeyPressed | QTableWidget.SelectedClicked
+            )
+            self.test_status.setText("⚡ Excel Tipi Canlı Düzenleme AÇIK — Hücreye çift tıklayıp yazarak Enter'a basın, anında güncellenir.")
+        else:
+            self.btn_excel_mode.setText("⚡ Excel Tipi Canlı Düzenleme: Kapalı")
+            self.btn_excel_mode.setStyleSheet("""
+                QPushButton {
+                    background-color: #f1f5f9;
+                    color: #475569;
+                    border: 1px solid #cbd5e1;
+                    font-weight: bold;
+                    padding: 6px 12px;
+                    border-radius: 6px;
+                    font-size: 11px;
+                    min-height: 24px;
+                }
+                QPushButton:hover { background-color: #e2e8f0; }
+            """)
+            self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.test_status.setText("⚡ Excel Tipi Canlı Düzenleme Kapalı.")
+
+        self.refresh()
+
+    @Slot(QTableWidgetItem)
+    def _on_table_item_changed(self, item: QTableWidgetItem):
+        if not getattr(self, "_excel_editing_enabled", False) or getattr(self, "_is_refreshing", False):
+            return
+
+        row = item.row()
+        col = item.column()
+
+        id_item = self.table.item(row, 0)
+        if not id_item:
+            return
+
+        try:
+            acc_id = int(id_item.text())
+        except ValueError:
+            return
+
+        acc = self.engine.accounts.get(acc_id)
+        if not acc:
+            return
+
+        val = item.text().strip()
+        update_field = ""
+
+        try:
+            if col == 1:  # Label
+                self.engine.accounts.update(acc_id, label=val)
+                update_field = f"Hesap Adı: '{val}'"
+            elif col == 2:  # Email
+                self.engine.accounts.update(acc_id, email=val)
+                update_field = f"E-Posta: '{val}'"
+            elif col == 3:  # IMAP Host
+                self.engine.accounts.update(acc_id, imap_host=val)
+                update_field = f"IMAP Sunucu: '{val}'"
+            elif col == 4:  # IMAP Port
+                try:
+                    port = int(val)
+                    self.engine.accounts.update(acc_id, imap_port=port)
+                    update_field = f"IMAP Port: '{port}'"
+                except ValueError:
+                    QMessageBox.warning(self, "Hatalı Değer", "Port numarası sayısal bir değer olmalıdır.")
+                    self.refresh()
+                    return
+            elif col == 5:  # SSL
+                use_ssl = 1 if val.lower() in ("yes", "evet", "1", "true") else 0
+                self.engine.accounts.update(acc_id, use_ssl=use_ssl)
+                update_field = f"SSL Kullanımı: {'Evet' if use_ssl else 'Hayır'}"
+            elif col == 6:  # Status
+                is_active = 1 if "active" in val.lower() or "aktif" in val.lower() or val.lower() in ("1", "true") else 0
+                self.engine.accounts.update(acc_id, is_active=is_active)
+                update_field = f"Hesap Durumu: {'Aktif' if is_active else 'Pasif'}"
+            elif col == 8:  # Subfolder
+                self.engine.accounts.update(acc_id, export_subfolder=val)
+                update_field = f"Alt Klasör: '{val}'"
+            elif col == 9:  # Group / Domain
+                self.engine.accounts.update(acc_id, account_group=val)
+                update_field = f"Domain Grubu: '{val}'"
+
+            if update_field:
+                self.engine.audit.append("account.updated_inline", account_id=acc_id, details={"col": col, "val": val})
+                self.test_status.setText(f"🟢 Hesap ID #{acc_id} başarıyla güncellendi ({update_field})")
+                logger.info("Account #%d inline updated via Excel mode: col %d -> %s", acc_id, col, val)
+        except Exception as exc:
+            logger.exception("Error in inline account cell edit: %s", exc)
+            self.test_status.setText(f"🔴 Güncelleme Hatası: {exc}")
+            QMessageBox.critical(self, "Güncelleme Hatası", f"Hesap bilgisi veritabanına kaydedilemedi:\n{exc}")
+            self.refresh()
+
+    @Slot()
+    def _on_batch_change_group(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Seçim Yapılmadı", "Lütfen önce grubunu değiştirmek istediğiniz bir hesap seçin.")
+            return
+
+        acc_id = int(self.table.item(row, 0).text())
+        acc = self.engine.accounts.get(acc_id)
+        current_group = acc.get("account_group", "") if acc else ""
+
+        new_group, ok = QInputDialog.getText(
+            self, "Toplu / Hızlı Grup Değiştir",
+            f"'{acc.get('label', '')}' hesabı için yeni Domain Grubunu girin:",
+            QLineEdit.Normal, current_group
+        )
+        if ok and new_group is not None:
+            self.engine.accounts.update(acc_id, account_group=new_group.strip())
+            self.test_status.setText(f"🟢 Hesap grubu '{new_group.strip()}' olarak güncellendi.")
+            self.refresh()
+
+    @Slot()
+    def _on_batch_change_password(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Seçim Yapılmadı", "Lütfen önce şifresini değiştirmek istediğiniz bir hesap seçin.")
+            return
+
+        acc_id = int(self.table.item(row, 0).text())
+        acc = self.engine.accounts.get(acc_id)
+
+        new_pwd, ok = QInputDialog.getText(
+            self, "Hızlı Şifre Güncelleme",
+            f"'{acc.get('label', '')}' hesabı için yeni şifreyi girin:",
+            QLineEdit.Password
+        )
+        if ok and new_pwd:
+            pwd_enc = self.engine.crypto.encrypt(new_pwd)
+            self.engine.accounts.update(acc_id, password_enc=pwd_enc)
+            self.test_status.setText(f"🟢 Hesap şifresi şifrelenerek başarıyla güncellendi.")
+            self.refresh()
+
+    # ------------------------------------------------------------------
     # Refresh
     # ------------------------------------------------------------------
 
     def refresh(self):
+        self._is_refreshing = True
         try:
             # Check if settings contain custom storage configurations
             has_custom_storage = (
@@ -810,23 +994,32 @@ class AccountPanel(QWidget):
                 action_layout.addStretch()
                 self.table.setCellWidget(i, 11, action_widget)
 
+                # Set cell editability flags based on _excel_editing_enabled
+                editable_cols = [1, 2, 3, 4, 5, 6, 8, 9]
+                for c_idx in editable_cols:
+                    it = self.table.item(i, c_idx)
+                    if it:
+                        if self._excel_editing_enabled:
+                            it.setFlags(it.flags() | Qt.ItemIsEditable)
+                        else:
+                            it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+
             self.table.resizeColumnsToContents()
-            # Ensure status, storage, group, and action columns are visible by default
             self.table.setColumnWidth(6, 100)
             self.table.setColumnWidth(7, 90)
             self.table.setColumnWidth(8, 90)
             self.table.setColumnWidth(9, 110)
             self.table.setColumnWidth(11, 220)
-            self.table.setColumnWidth(8, 90)
+        except Exception as exc:
+            logger.error("Refresh error: %s", exc)
+        finally:
+            self._is_refreshing = False
             self.table.setColumnWidth(9, 110)
             self.table.setColumnWidth(11, 160)
 
             # Apply active grid layout profile override
             active_profile = self.settings.get("grid_active_profile", "Default")
             self._apply_grid_profile(active_profile)
-
-        except Exception as exc:
-            logger.error("Refresh error: %s", exc)
 
     @Slot()
     def _on_import_eml(self):

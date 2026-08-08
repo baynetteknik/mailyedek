@@ -60,20 +60,58 @@ class ReportGenerator:
         Returns:
             Path to the generated report file.
         """
+        import re
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         account_label = report.get("account_label", "unknown")
-        base_name = f"sync_report_{account_label}_{timestamp}"
+        safe_label = re.sub(r'[\\/:*?"<>|]', '_', str(account_label)).strip() or "account"
+        base_name = f"sync_report_{safe_label}_{timestamp}"
+
+        formatted = self._format_sync_report(report)
 
         if output_format in ("json", "both"):
             json_path = self._report_dir / f"{base_name}.json"
-            self._write_json(json_path, self._format_sync_report(report))
+            self._write_json(json_path, formatted)
             logger.info("Sync report written to %s", json_path)
 
         if output_format in ("html", "both"):
             html_path = self._report_dir / f"{base_name}.html"
-            self._write_html(html_path, "Sync Report", self._format_sync_report(report),
+            self._write_html(html_path, f"Sync Report — {account_label}", formatted,
                              self._sync_html_template(report))
             logger.info("Sync report written to %s", html_path)
+
+        return self._report_dir / f"{base_name}.json"
+
+    def generate_batch_sync_report(self, reports: List[Dict[str, Any]],
+                                   group_name: Optional[str] = None,
+                                   output_format: str = "both") -> Path:
+        """Generate a combined sync report for multiple accounts or a group.
+
+        Args:
+            reports: List of SyncReport as dicts
+            group_name: Label for the group or batch
+            output_format: "json", "html", or "both"
+
+        Returns:
+            Path to the generated report file.
+        """
+        import re
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        label = group_name or f"Toplu_Sync_{len(reports)}_Hesap"
+        safe_label = re.sub(r'[\\/:*?"<>|]', '_', str(label)).strip() or "batch_sync"
+        base_name = f"sync_batch_report_{safe_label}_{timestamp}"
+
+        formatted = self._format_batch_sync_report(reports, group_name=label)
+
+        if output_format in ("json", "both"):
+            json_path = self._report_dir / f"{base_name}.json"
+            self._write_json(json_path, formatted)
+            logger.info("Batch sync report written to %s", json_path)
+
+        if output_format in ("html", "both"):
+            html_path = self._report_dir / f"{base_name}.html"
+            self._write_html(html_path, f"Toplu Sync Raporu — {label}", formatted,
+                             self._batch_sync_html_template(reports, label))
+            logger.info("Batch sync report written to %s", html_path)
 
         return self._report_dir / f"{base_name}.json"
 
@@ -81,12 +119,18 @@ class ReportGenerator:
         return {
             "type": "sync",
             "account": report.get("account_label", ""),
-            "timestamp": datetime.utcnow().isoformat(),
+            "account_label": report.get("account_label", ""),
+            "account_id": report.get("account_id"),
+            "email": report.get("email", ""),
+            "account_group": report.get("account_group", ""),
+            "timestamp": report.get("timestamp") or datetime.utcnow().isoformat(),
             "folders_synced": report.get("folders_synced", 0),
             "mails_fetched": report.get("mails_fetched", 0),
+            "mails_already_archived": report.get("mails_already_archived", 0),
             "mails_updated": report.get("mails_updated", 0),
             "duplicates_found": report.get("duplicates_found", 0),
             "errors": report.get("errors", 0),
+            "error_details": report.get("error_details", []),
             "total_bytes": report.get("total_bytes", 0),
             "total_bytes_formatted": _format_bytes(report.get("total_bytes", 0)),
             "duration_seconds": report.get("duration_seconds", 0),
@@ -95,20 +139,181 @@ class ReportGenerator:
             "finished_at": report.get("finished_at", ""),
         }
 
+    def _format_batch_sync_report(self, reports: List[Dict[str, Any]], group_name: str) -> Dict[str, Any]:
+        total_fetched = 0
+        total_archived = 0
+        total_updated = 0
+        total_duplicates = 0
+        total_errors = 0
+        total_bytes = 0
+        total_duration = 0.0
+        
+        formatted_reports = []
+        for r in reports:
+            r_dict = r if isinstance(r, dict) else (r.__dict__ if hasattr(r, "__dict__") else {})
+            fmt_r = self._format_sync_report(r_dict)
+            formatted_reports.append(fmt_r)
+            total_fetched += fmt_r.get("mails_fetched", 0)
+            total_archived += fmt_r.get("mails_already_archived", 0)
+            total_updated += fmt_r.get("mails_updated", 0)
+            total_duplicates += fmt_r.get("duplicates_found", 0)
+            total_errors += fmt_r.get("errors", 0)
+            total_bytes += fmt_r.get("total_bytes", 0)
+            total_duration += fmt_r.get("duration_seconds", 0.0)
+
+        return {
+            "type": "sync",
+            "is_batch": True,
+            "account_label": group_name,
+            "timestamp": datetime.utcnow().isoformat(),
+            "total_accounts": len(reports),
+            "mails_fetched": total_fetched,
+            "mails_already_archived": total_archived,
+            "mails_updated": total_updated,
+            "duplicates_found": total_duplicates,
+            "errors": total_errors,
+            "total_bytes": total_bytes,
+            "total_bytes_formatted": _format_bytes(total_bytes),
+            "duration_seconds": total_duration,
+            "duration_formatted": _format_duration(total_duration),
+            "accounts_reports": formatted_reports
+        }
+
     def _sync_html_template(self, report: Dict[str, Any]) -> str:
         r = self._format_sync_report(report)
+        err_details_html = ""
+        if r.get("error_details"):
+            err_details_html = "<div style='margin-top:20px;'><h3 style='color:#ef4444;'>⚠️ Hata Detayları Listesi</h3><ul style='color:#dc2626; font-size:12px; line-height:1.6; background-color:#fef2f2; padding:12px 20px; border-radius:6px; border:1px solid #fca5a5;'>"
+            for err_item in r["error_details"]:
+                err_details_html += f"<li>{err_item}</li>"
+            err_details_html += "</ul></div>"
+
+        cards_html = f"""
+        <div style="display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 110px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center;">
+                <div style="font-size: 11px; font-weight: bold; color: #64748b;">ÇEKİLEN İLETİLER</div>
+                <div style="font-size: 18px; font-weight: bold; color: #10b981; margin-top: 4px;">{r['mails_fetched']}</div>
+            </div>
+            <div style="flex: 1; min-width: 110px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center;">
+                <div style="font-size: 11px; font-weight: bold; color: #64748b;">MÜKERRER (KOPYA)</div>
+                <div style="font-size: 18px; font-weight: bold; color: #f59e0b; margin-top: 4px;">{r['duplicates_found']}</div>
+            </div>
+            <div style="flex: 1; min-width: 110px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center;">
+                <div style="font-size: 11px; font-weight: bold; color: #64748b;">HATALAR</div>
+                <div style="font-size: 18px; font-weight: bold; color: {'#ef4444' if r['errors'] > 0 else '#64748b'}; margin-top: 4px;">{r['errors']}</div>
+            </div>
+            <div style="flex: 1; min-width: 110px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center;">
+                <div style="font-size: 11px; font-weight: bold; color: #64748b;">TOPLAM BOYUT</div>
+                <div style="font-size: 18px; font-weight: bold; color: #7209b7; margin-top: 4px;">{r['total_bytes_formatted']}</div>
+            </div>
+        </div>
+        """
+
         return f"""
-        <h2>Sync Report: {r['account']}</h2>
+        <h2>📊 Sync Report: {r['account']}</h2>
+        {cards_html}
         <table class="report-table">
             <tr><td>Started</td><td>{r['started_at']}</td></tr>
             <tr><td>Finished</td><td>{r['finished_at']}</td></tr>
             <tr><td>Duration</td><td>{r['duration_formatted']}</td></tr>
             <tr><td>Folders Synced</td><td>{r['folders_synced']}</td></tr>
             <tr><td>Mails Fetched</td><td>{r['mails_fetched']}</td></tr>
+            <tr><td>Already Archived</td><td>{r['mails_already_archived']}</td></tr>
             <tr><td>Duplicates Found</td><td>{r['duplicates_found']}</td></tr>
             <tr><td>Total Data</td><td>{r['total_bytes_formatted']}</td></tr>
             <tr><td>Errors</td><td class="{'error' if r['errors'] > 0 else ''}">{r['errors']}</td></tr>
         </table>
+        {err_details_html}
+        """
+
+    def _batch_sync_html_template(self, reports: List[Dict[str, Any]], group_name: str) -> str:
+        data = self._format_batch_sync_report(reports, group_name)
+        
+        cards_html = f"""
+        <div style="display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 110px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center;">
+                <div style="font-size: 11px; font-weight: bold; color: #64748b;">TOPLAM HESAP</div>
+                <div style="font-size: 18px; font-weight: bold; color: #4361ee; margin-top: 4px;">{data['total_accounts']}</div>
+            </div>
+            <div style="flex: 1; min-width: 110px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center;">
+                <div style="font-size: 11px; font-weight: bold; color: #64748b;">ÇEKİLEN İLETİLER</div>
+                <div style="font-size: 18px; font-weight: bold; color: #10b981; margin-top: 4px;">{data['mails_fetched']}</div>
+            </div>
+            <div style="flex: 1; min-width: 110px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center;">
+                <div style="font-size: 11px; font-weight: bold; color: #64748b;">MÜKERRER (KOPYA)</div>
+                <div style="font-size: 18px; font-weight: bold; color: #f59e0b; margin-top: 4px;">{data['duplicates_found']}</div>
+            </div>
+            <div style="flex: 1; min-width: 110px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center;">
+                <div style="font-size: 11px; font-weight: bold; color: #64748b;">HATALAR</div>
+                <div style="font-size: 18px; font-weight: bold; color: {'#ef4444' if data['errors'] > 0 else '#64748b'}; margin-top: 4px;">{data['errors']}</div>
+            </div>
+            <div style="flex: 1; min-width: 110px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center;">
+                <div style="font-size: 11px; font-weight: bold; color: #64748b;">TOPLAM BOYUT</div>
+                <div style="font-size: 18px; font-weight: bold; color: #7209b7; margin-top: 4px;">{data['total_bytes_formatted']}</div>
+            </div>
+        </div>
+        """
+
+        rows_html = ""
+        all_err_details = []
+        for r_item in data["accounts_reports"]:
+            acc = r_item.get("account") or r_item.get("account_label") or "Hesap"
+            fetched = r_item.get("mails_fetched", 0)
+            archived = r_item.get("mails_already_archived", 0)
+            updated = r_item.get("mails_updated", 0)
+            dups = r_item.get("duplicates_found", 0)
+            errs = r_item.get("errors", 0)
+            size_fmt = r_item.get("total_bytes_formatted", "0 B")
+            dur_fmt = r_item.get("duration_formatted", "0s")
+
+            err_style = "color:#dc2626; font-weight:bold;" if errs > 0 else "color:#475569;"
+            fetched_style = "color:#10b981; font-weight:bold;" if fetched > 0 else "color:#475569;"
+
+            rows_html += f"""
+            <tr style="border-bottom: 1px solid #f1f5f9;">
+                <td style="padding:8px; font-weight:bold;">{acc}</td>
+                <td style="padding:8px; text-align:center; {fetched_style}">{fetched}</td>
+                <td style="padding:8px; text-align:center;">{archived}</td>
+                <td style="padding:8px; text-align:center;">{updated}</td>
+                <td style="padding:8px; text-align:center;">{dups}</td>
+                <td style="padding:8px; text-align:center; {err_style}">{errs}</td>
+                <td style="padding:8px; text-align:center;">{size_fmt}</td>
+                <td style="padding:8px; text-align:center;">{dur_fmt}</td>
+            </tr>
+            """
+            if r_item.get("error_details"):
+                for e_detail in r_item["error_details"]:
+                    all_err_details.append(f"[{acc}] {e_detail}")
+
+        err_details_html = ""
+        if all_err_details:
+            err_details_html = "<div style='margin-top:20px;'><h3 style='color:#ef4444;'>⚠️ Hata Detayları Listesi</h3><ul style='color:#dc2626; font-size:12px; line-height:1.6; background-color:#fef2f2; padding:12px 20px; border-radius:6px; border:1px solid #fca5a5;'>"
+            for err_item in all_err_details:
+                err_details_html += f"<li>{err_item}</li>"
+            err_details_html += "</ul></div>"
+
+        return f"""
+        <h2>📊 Toplu Senkronizasyon Raporu: {group_name}</h2>
+        {cards_html}
+        <h3>Hesap Bazlı Detay Listesi</h3>
+        <table class="report-table" style="font-size:13px; width:100%; border-collapse:collapse;">
+            <thead>
+                <tr style="background-color:#f1f5f9; font-weight:bold; color:#475569;">
+                    <th style="padding:8px; text-align:left;">Hesap Adı</th>
+                    <th style="padding:8px; text-align:center;">Çekilen E-Posta</th>
+                    <th style="padding:8px; text-align:center;">Zaten Arşivlenmiş</th>
+                    <th style="padding:8px; text-align:center;">Güncellenmiş</th>
+                    <th style="padding:8px; text-align:center;">Mükerrer (Kopya)</th>
+                    <th style="padding:8px; text-align:center;">Hatalar</th>
+                    <th style="padding:8px; text-align:center;">Veri Boyutu</th>
+                    <th style="padding:8px; text-align:center;">Süre</th>
+                </tr>
+            </thead>
+            <tbody>
+                {rows_html}
+            </tbody>
+        </table>
+        {err_details_html}
         """
 
     # ------------------------------------------------------------------
