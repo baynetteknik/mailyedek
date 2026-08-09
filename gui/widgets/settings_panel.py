@@ -568,73 +568,73 @@ class SettingsPanel(QWidget):
     # -----------------------------------------------------------------------
     def _create_version_git_tab(self) -> QWidget:
         widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(14)
+        main_layout = QVBoxLayout(widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
+        from gui.templates.three_panel_workspace import ThreePanelWorkspaceTemplate
         from core.version import get_version, get_git_info
 
         ver = get_version()
         git_info = get_git_info()
 
-        # 1. Version Badge & Control Card
-        ver_card = QGroupBox("Dinamik Versiyon & Sürüm Bilgisi")
-        ver_card.setStyleSheet("QGroupBox { font-weight: bold; font-size: 13px; }")
-        ver_layout = QHBoxLayout(ver_card)
-        ver_layout.setContentsMargins(12, 12, 12, 12)
+        ws = ThreePanelWorkspaceTemplate(title="⚙️ Git & Versiyon Yönetimi Paneli", parent=widget)
+        main_layout.addWidget(ws)
+
+        ws.btn_toggle_left.setText("📊 Versiyon Paneli")
+        ws.btn_toggle_right.setText("🖥️ İşlem Konsolu")
+
+        # -------------------------------------------------------------------
+        # 1. SOL PANEL: Versiyon Yükseltme & Git Commit Gönderme
+        # -------------------------------------------------------------------
+        ws.left_group.setTitle("📈 Versiyon & Sürüm Yayınlama")
+        left_layout = ws.left_inner_layout
 
         self.lbl_ver_badge = QLabel(f"Sürüm: v{ver}")
         self.lbl_ver_badge.setStyleSheet("""
-            background-color: #4361ee;
+            background-color: #2563eb;
             color: #ffffff;
-            font-size: 15px;
+            font-size: 14px;
             font-weight: bold;
-            padding: 6px 14px;
+            padding: 8px 12px;
             border-radius: 6px;
         """)
+        left_layout.addWidget(self.lbl_ver_badge)
 
         btn_bump_ver = QPushButton("📈 Versiyon Yükselt (+0.01)")
         btn_bump_ver.setCursor(Qt.PointingHandCursor)
-        btn_bump_ver.setStyleSheet("padding: 6px 14px; font-weight: bold; background: #e2e8f0;")
+        btn_bump_ver.setStyleSheet("padding: 8px 14px; font-weight: bold; background: #e2e8f0; border-radius: 4px; color: #0f172a;")
         btn_bump_ver.clicked.connect(self._bump_app_version)
+        left_layout.addWidget(btn_bump_ver)
 
-        ver_layout.addWidget(self.lbl_ver_badge)
-        ver_layout.addWidget(btn_bump_ver)
-        ver_layout.addStretch()
-
-        layout.addWidget(ver_card)
-
-        # 2. Git Status & Release Control Card
-        git_card = QGroupBox("Git Versiyon Kontrolü & Sürüm Yayınlama")
-        git_card.setStyleSheet("QGroupBox { font-weight: bold; font-size: 13px; }")
-        git_layout = QFormLayout(git_card)
-        git_layout.setSpacing(12)
-
+        left_layout.addSpacing(12)
+        left_layout.addWidget(QLabel("Aktif Git Branch / Commit:"))
         self.lbl_git_branch = QLabel(f"{git_info['branch']}  ({git_info['commit']})")
-        self.lbl_git_branch.setStyleSheet("font-family: Consolas, monospace; font-size: 12px; font-weight: bold;")
-        git_layout.addRow("Aktif Git Branch / Commit:", self.lbl_git_branch)
+        self.lbl_git_branch.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; font-weight: bold; color: #1e293b;")
+        self.lbl_git_branch.setWordWrap(True)
+        left_layout.addWidget(self.lbl_git_branch)
 
+        left_layout.addSpacing(8)
+        left_layout.addWidget(QLabel("Commit Mesajı:"))
         self.input_commit_msg = QLineEdit()
-        self.input_commit_msg.setPlaceholderText(f"v{ver} için değişiklik açıklaması (Commit mesajı)...")
-        self.input_commit_msg.setStyleSheet("padding: 6px; font-size: 12px;")
-        git_layout.addRow("Commit Mesajı:", self.input_commit_msg)
+        self.input_commit_msg.setPlaceholderText(f"v{ver} için değişiklik açıklaması...")
+        self.input_commit_msg.setStyleSheet("padding: 6px; font-size: 11px;")
+        left_layout.addWidget(self.input_commit_msg)
 
-        git_btn_row = QHBoxLayout()
-        btn_git_push = QPushButton("🚀 Git'e Commit & Push Gönder")
+        btn_git_push = QPushButton("🚀 Git Commit & Push Gönder")
         btn_git_push.setCursor(Qt.PointingHandCursor)
-        btn_git_push.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 7px 16px; border-radius: 4px;")
+        btn_git_push.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 8px 14px; border-radius: 4px;")
         btn_git_push.clicked.connect(self._commit_and_push_git)
+        left_layout.addWidget(btn_git_push)
 
-        git_btn_row.addWidget(btn_git_push)
-        git_btn_row.addStretch()
+        left_layout.addStretch()
 
-        git_layout.addRow("", git_btn_row)
+        # -------------------------------------------------------------------
+        # 2. ORTA PANEL: Remote Sunucu Ayarları & Setup Derleme
+        # -------------------------------------------------------------------
+        center_layout = ws.center_layout
 
-        layout.addWidget(git_card)
-
-        # 3. Git Remote & Repository Configuration Card
         git_config_card = QGroupBox("Git Remote Sunucu & Repository Ayarları")
-        git_config_card.setStyleSheet("QGroupBox { font-weight: bold; font-size: 13px; color: #1e293b; }")
+        git_config_card.setStyleSheet(ws._group_box_style())
         g_form = QFormLayout(git_config_card)
         g_form.setSpacing(10)
 
@@ -665,39 +665,53 @@ class SettingsPanel(QWidget):
         g_btns.addStretch()
         g_form.addRow("", g_btns)
 
-        layout.addWidget(git_config_card)
+        center_layout.addWidget(git_config_card)
 
-        # 4. Setup Building & Installation Guide Card
         setup_card = QGroupBox("Kurulum Paketi & Kullanıcı Yardım Rehberi")
-        setup_card.setStyleSheet("QGroupBox { font-weight: bold; font-size: 13px; color: #1e293b; }")
-        setup_layout = QHBoxLayout(setup_card)
+        setup_card.setStyleSheet(ws._group_box_style())
+        setup_layout = QVBoxLayout(setup_card)
         setup_layout.setSpacing(10)
 
         btn_build_setup = QPushButton("📦 Dinamik Setup Paketini Oluştur (build_setup.py)")
         btn_build_setup.setCursor(Qt.PointingHandCursor)
-        btn_build_setup.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 8px 16px; border-radius: 4px;")
+        btn_build_setup.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 10px 16px; border-radius: 4px;")
         btn_build_setup.clicked.connect(self._build_setup_package)
 
         btn_open_guide = QPushButton("📖 Kurulum Yardım Rehberini Aç")
         btn_open_guide.setCursor(Qt.PointingHandCursor)
-        btn_open_guide.setStyleSheet("background-color: #475569; color: white; font-weight: bold; padding: 8px 16px; border-radius: 4px;")
+        btn_open_guide.setStyleSheet("background-color: #475569; color: white; font-weight: bold; padding: 10px 16px; border-radius: 4px;")
         btn_open_guide.clicked.connect(self._open_kurulum_rehberi)
 
         setup_layout.addWidget(btn_build_setup)
         setup_layout.addWidget(btn_open_guide)
-        setup_layout.addStretch()
+        center_layout.addWidget(setup_card)
 
-        layout.addWidget(setup_card)
+        # -------------------------------------------------------------------
+        # 3. SAĞ PANEL: Git & Setup Konsol Çıktısı (Mavi Zemin Beyaz Yazı)
+        # -------------------------------------------------------------------
+        ws.right_group.setTitle("🖥️ Git & İşlem Konsolu")
+        right_layout = ws.right_inner_layout
 
-        # Log Output for Git & Setup operations (High Contrast Readable Styling)
         self.text_ver_log = QTextEdit()
         self.text_ver_log.setReadOnly(True)
-        self.text_ver_log.setStyleSheet("background: #1e293b; color: #ffffff; font-family: Consolas, monospace; font-size: 11px; padding: 10px; border-radius: 6px; border: 1px solid #334155;")
-        self.text_ver_log.setMaximumHeight(160)
+        self.text_ver_log.setStyleSheet("""
+            QTextEdit {
+                background-color: #2563eb;
+                color: #ffffff;
+                font-family: 'Consolas', monospace;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 12px;
+                border-radius: 6px;
+                border: 1px solid #1d4ed8;
+            }
+        """)
         self.text_ver_log.setPlaceholderText("Git ve Setup işlem çıktıları burada görüntülenecektir...")
-        layout.addWidget(self.text_ver_log)
+        right_layout.addWidget(self.text_ver_log, stretch=1)
 
-        layout.addStretch()
+        ws.load_splitter_state(self.settings, "git_workspace")
+        ws.splitter.splitterMoved.connect(lambda *args: ws.save_splitter_state(self.settings, "git_workspace"))
+
         return widget
 
     @Slot()
@@ -705,7 +719,7 @@ class SettingsPanel(QWidget):
         from core.version import bump_version, get_version
         new_v = bump_version("patch")
         self.lbl_ver_badge.setText(f"Sürüm: v{new_v}")
-        self.input_commit_msg.setPlaceholderText(f"v{new_v} için değişiklik açıklaması (Commit mesajı)...")
+        self.input_commit_msg.setPlaceholderText(f"v{new_v} için değişiklik açıklaması...")
         self.text_ver_log.append(f"📈 Uygulama versiyonu v{new_v} olarak güncellendi.")
 
     @Slot()
@@ -746,19 +760,24 @@ class SettingsPanel(QWidget):
 
     @Slot()
     def _commit_and_push_git(self):
+        import threading
         from core.version import git_commit_and_push, get_git_info
         msg = self.input_commit_msg.text().strip()
-        self.text_ver_log.append("⏳ Git commit & push başlatılıyor...")
-        ok, res_msg = git_commit_and_push(msg)
-        if ok:
-            self.text_ver_log.append(res_msg)
-            QMessageBox.information(self, "Git İşlemi Başarılı", res_msg)
-        else:
-            self.text_ver_log.append(f"❌ {res_msg}")
-            QMessageBox.warning(self, "Git İşlemi Uyarısı", res_msg)
-        
-        info = get_git_info()
-        self.lbl_git_branch.setText(f"{info['branch']}  ({info['commit']})")
+        self.text_ver_log.append("⏳ Git commit & push başlatılıyor... Lütfen bekleyin...")
+
+        def _worker():
+            ok, res_msg = git_commit_and_push(msg)
+            if ok:
+                self.text_ver_log.append(res_msg)
+                QMessageBox.information(self, "Git İşlemi Başarılı", res_msg)
+            else:
+                self.text_ver_log.append(f"❌ {res_msg}")
+                QMessageBox.warning(self, "Git İşlemi Uyarısı", res_msg)
+            
+            info = get_git_info()
+            self.lbl_git_branch.setText(f"{info['branch']}  ({info['commit']})")
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     @Slot()
     def _build_setup_package(self):

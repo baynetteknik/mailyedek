@@ -66,25 +66,28 @@ def get_git_info() -> Dict[str, Any]:
         "has_remote": False,
         "message": ""
     }
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
     try:
-        res = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=3)
+        res = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=5, env=env)
         if res.returncode == 0 and "true" in res.stdout:
             info["is_git"] = True
 
             # Get branch name
-            b_res = subprocess.run(["git", "branch", "--show-current"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=3)
+            b_res = subprocess.run(["git", "branch", "--show-current"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=5, env=env)
             info["branch"] = b_res.stdout.strip() or "main"
 
             # Get commit hash & msg
-            c_res = subprocess.run(["git", "log", "-1", "--format=%h - %s (%cr)"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=3)
+            c_res = subprocess.run(["git", "log", "-1", "--format=%h - %s (%cr)"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=5, env=env)
             info["commit"] = c_res.stdout.strip() or "Initial Commit"
 
             # Get status (dirty or clean)
-            s_res = subprocess.run(["git", "status", "--porcelain"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=3)
+            s_res = subprocess.run(["git", "status", "--porcelain"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=5, env=env)
             info["clean"] = len(s_res.stdout.strip()) == 0
 
             # Get remote URL
-            r_res = subprocess.run(["git", "remote", "-v"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=3)
+            r_res = subprocess.run(["git", "remote", "-v"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=5, env=env)
             info["has_remote"] = len(r_res.stdout.strip()) > 0
     except Exception as exc:
         info["message"] = str(exc)
@@ -97,26 +100,31 @@ def git_commit_and_push(commit_message: str, push_remote: bool = True) -> Tuple[
     Stage all changes, create a Git commit with the provided message,
     and optionally push to the configured remote repository.
     """
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
     try:
         # Add all
-        add_res = subprocess.run(["git", "add", "."], cwd=REPO_ROOT, capture_output=True, text=True, timeout=15)
+        add_res = subprocess.run(["git", "add", "."], cwd=REPO_ROOT, capture_output=True, text=True, timeout=30, env=env)
         if add_res.returncode != 0:
-            return False, f"Git add hatası: {add_res.stderr}"
+            return False, f"Git add hatası: {add_res.stderr.strip()}"
 
         # Commit
         msg = commit_message.strip() or f"v{get_version()} güncellemeleri ve geliştirmeler"
-        commit_res = subprocess.run(["git", "commit", "-m", msg], cwd=REPO_ROOT, capture_output=True, text=True, timeout=15)
+        commit_res = subprocess.run(["git", "commit", "-m", msg], cwd=REPO_ROOT, capture_output=True, text=True, timeout=30, env=env)
         if commit_res.returncode != 0 and "nothing to commit" not in commit_res.stdout.lower():
-            return False, f"Git commit hatası: {commit_res.stderr}"
+            return False, f"Git commit hatası: {commit_res.stderr.strip()}"
 
         push_msg = ""
         if push_remote:
-            push_res = subprocess.run(["git", "push"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=30)
+            push_res = subprocess.run(["git", "push"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=60, env=env)
             if push_res.returncode == 0:
                 push_msg = " ve uzak sunucuya (Remote Push) başarıyla gönderildi."
             else:
-                push_msg = f" (Local commit başarılı ancak push uyarısı: {push_res.stderr.strip()[:80]})"
+                push_msg = f" (Local commit başarılı ancak push uyarısı: {push_res.stderr.strip()[:100]})"
         
         return True, f"✅ Git Commit tamamlandı: '{msg}'{push_msg}"
+    except subprocess.TimeoutExpired:
+        return False, "❌ Git işlemi zaman aşımına (Timeout) uğradı. Lütfen remote bağlantınızı ve internet erişiminizi kontrol edin."
     except Exception as exc:
         return False, f"Git işlemi başarısız: {exc}"

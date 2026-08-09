@@ -554,7 +554,7 @@ class SearchPanel(QWidget):
                 
                 item = QStandardItem(display_name)
                 item.setData(orig_folder, Qt.UserRole)
-                item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 
                 standard_keywords = ["inbox", "sent", "draft", "spam", "junk", "trash", "archive", 
                                    "gelen", "giden", "gönderilen", "taslak", "çöp", "arşiv", "istenmeyen"]
