@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.mail_engine import MailEngine
+from infrastructure.imap_client import format_folder_display_name
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +160,8 @@ class FolderTree(QTreeWidget):
             logger.error("Folder tree refresh error: %s", exc)
 
     def _add_folder(self, parent: QTreeWidgetItem, account_id: int, folder: str, count: int):
-        item = QTreeWidgetItem([f"  {folder}  ({count})"])
+        display_name = format_folder_display_name(folder)
+        item = QTreeWidgetItem([f"  {display_name}  ({count})"])
         item.setData(0, Qt.UserRole, ("folder", account_id, folder))
         parent.addChild(item)
 
@@ -314,6 +316,7 @@ class MailPreview(QWidget):
         self.engine = engine
         self._current_mail: Optional[Dict] = None
         self._attachments: List[Dict] = []
+        self._loader_thread: Optional[MailBodyLoaderThread] = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -354,7 +357,7 @@ class MailPreview(QWidget):
 
         # Toolbar
         toolbar = QHBoxLayout()
-        self.btn_raw = QPushButton("📄 Raw Source")
+        self.btn_raw = QPushButton("📄 Ham Kaynak (Raw)")
         self.btn_raw.setProperty("small", True)
         self.btn_raw.setProperty("outline", True)
         self.btn_raw.setCursor(Qt.PointingHandCursor)
@@ -378,7 +381,7 @@ class MailPreview(QWidget):
         layout.addWidget(self.body_view, stretch=1)
 
         # Attachments
-        self.attach_box = QGroupBox("Attachments")
+        self.attach_box = QGroupBox("Ek Dosyalar")
         attach_layout = QVBoxLayout(self.attach_box)
         self.attach_list = QListWidget()
         self.attach_list.setMaximumHeight(120)
@@ -396,7 +399,7 @@ class MailPreview(QWidget):
         layout.addWidget(self.attach_box)
 
         # Status
-        self.label_status = QLabel("Select a mail to preview")
+        self.label_status = QLabel("Önizleme için tablodan bir e-posta seçin")
         self.label_status.setProperty("status", True)
         self.label_status.setAlignment(Qt.AlignCenter)
         self.label_status.setStyleSheet("color: #999; padding: 40px; font-size: 14px;")
@@ -410,14 +413,14 @@ class MailPreview(QWidget):
         mail_id = mail_meta.get("id")
 
         # Headers
-        self.lbl_from.setText(f"From:    {mail_meta.get('sender', '—')}")
-        self.lbl_to.setText(f"To:      {mail_meta.get('recipients', '—')}")
-        self.lbl_date.setText(f"Date:    {mail_meta.get('date', '—')}")
-        self.lbl_subject.setText(mail_meta.get('subject', '(No Subject)'))
+        self.lbl_from.setText(f"Gönderen:  {mail_meta.get('sender', '—')}")
+        self.lbl_to.setText(f"Alıcı:     {mail_meta.get('recipients', '—')}")
+        self.lbl_date.setText(f"Tarih:     {mail_meta.get('date', '—')}")
+        self.lbl_subject.setText(mail_meta.get('subject', '(Konusuz Mail)'))
 
         self.body_view.setHtml("<div style='text-align:center;padding:40px;color:#2563eb;'><h3>⏳ E-posta içeriği yükleniyor...</h3></div>")
 
-        if self._loader_thread and self._loader_thread.isRunning():
+        if getattr(self, '_loader_thread', None) is not None and self._loader_thread.isRunning():
             try:
                 self._loader_thread.finished_signal.disconnect()
             except Exception:
@@ -432,15 +435,20 @@ class MailPreview(QWidget):
     @Slot(object)
     def _on_mail_loaded(self, result):
         if isinstance(result, Exception):
-            self.body_view.setPlainText(f"Could not parse email: {result}")
+            self.body_view.setHtml(
+                f"<div style='text-align:center;padding:40px;color:#ef4444;'>"
+                f"<p style='font-size:24px;'>⚠️</p>"
+                f"<p>E-posta içeriği ayrıştırılamadı: {result}</p>"
+                f"</div>"
+            )
         elif isinstance(result, email.message.Message):
             self._render_message(result)
         else:
             self.body_view.setHtml(
-                "<div style='text-align:center;padding:40px;color:#999;'>"
-                "<p style='font-size:24px;'>📧</p>"
-                "<p>Email content not available in local database.</p>"
-                "<p style='font-size:11px;'>Run sync first to fetch email contents.</p>"
+                "<div style='text-align:center;padding:40px;color:#64748b;'>"
+                "<p style='font-size:32px;'>📧</p>"
+                "<h4 style='color:#1e293b;margin:8px 0;'>E-posta ham içeriği yerel veritabanında bulunamadı.</h4>"
+                "<p style='font-size:12px;color:#64748b;'>Tam e-posta gövdesini ve eklerini indirmek için lütfen sol menüden Senkronizasyon çalıştırın.</p>"
                 "</div>"
             )
             self.label_status.setVisible(False)

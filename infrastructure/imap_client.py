@@ -87,6 +87,62 @@ def decode_imap_utf7(s: str) -> str:
     return "".join(res)
 
 
+FOLDER_TRANSLATIONS_TR = {
+    "inbox": "Gelen Kutusu (INBOX)",
+    "входящие": "Gelen Kutusu (INBOX)",
+    "sent": "Gönderilenler (Sent)",
+    "sent items": "Gönderilenler (Sent Items)",
+    "sent messages": "Gönderilenler (Sent Messages)",
+    "отправленные": "Gönderilenler (Sent)",
+    "отправленные messages": "Gönderilenler (Sent)",
+    "drafts": "Taslaklar (Drafts)",
+    "черновики": "Taslaklar (Drafts)",
+    "trash": "Çöp Kutusu (Trash)",
+    "deleted items": "Çöp Kutusu (Deleted Items)",
+    "deleted": "Çöp Kutusu (Deleted)",
+    "удаленные": "Çöp Kutusu (Trash)",
+    "удалённые": "Çöp Kutusu (Trash)",
+    "корзина": "Çöp Kutusu (Trash)",
+    "junk": "İstenmeyen / Spam",
+    "spam": "İstenmeyen / Spam",
+    "спам": "İstenmeyen / Spam",
+    "archive": "Arşiv (Archive)",
+    "архив": "Arşiv (Archive)",
+    "outbox": "Giden Kutusu (Outbox)",
+    "исходящие": "Giden Kutusu (Outbox)",
+    "notes": "Notlar (Notes)",
+    "заметки": "Notlar (Notes)",
+}
+
+
+def format_folder_display_name(folder_name: str) -> str:
+    """Decodes IMAP UTF-7 / encoded Russian folder names and translates them into clean Turkish/English labels."""
+    if not folder_name:
+        return ""
+    
+    decoded = folder_name
+    try:
+        if folder_name.startswith("_") and folder_name.endswith("-"):
+            temp = "&" + folder_name[1:].replace("_", "/")
+            decoded = decode_imap_utf7(temp)
+        elif folder_name.startswith("&"):
+            decoded = decode_imap_utf7(folder_name)
+    except Exception:
+        pass
+
+    decoded_clean = decoded.strip()
+    decoded_lower = decoded_clean.lower()
+
+    if decoded_lower in FOLDER_TRANSLATIONS_TR:
+        return FOLDER_TRANSLATIONS_TR[decoded_lower]
+
+    for key, tr_name in FOLDER_TRANSLATIONS_TR.items():
+        if key in decoded_lower:
+            return f"{tr_name} ({decoded_clean})"
+
+    return decoded_clean
+
+
 # Regex to parse IMAP LIST response: (flags) "delimiter" "name" (supporting quoted and unquoted name)
 _LIST_RE = re.compile(
     r'\((?P<flags>[^)]*)\)\s+"(?P<delim>[^"]*)"\s+(?:"(?P<name_quoted>[^"]*)"|(?P<name_unquoted>[^\s]+))'

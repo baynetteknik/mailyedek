@@ -489,8 +489,17 @@ class DatabaseManager:
                 params.append(account_id)
 
             if folder:
-                sql += " AND folder = ?"
-                params.append(folder)
+                if isinstance(folder, (list, tuple, set)):
+                    if len(folder) == 1:
+                        sql += " AND folder = ?"
+                        params.append(list(folder)[0])
+                    elif len(folder) > 1:
+                        placeholders = ", ".join("?" for _ in folder)
+                        sql += f" AND folder IN ({placeholders})"
+                        params.extend(list(folder))
+                elif isinstance(folder, str) and folder.strip():
+                    sql += " AND folder = ?"
+                    params.append(folder.strip())
 
             if since_date:
                 sql += " AND date >= ?"

@@ -198,6 +198,51 @@ class AppSettings:
         self._data["folder_translation_restore"] = mode
         self.save()
 
+    # ------------------------------------------------------------------
+    # App Language & Port Listener Preferences
+    # ------------------------------------------------------------------
+
+    def language(self) -> str:
+        """Return application UI language ('tr', 'en', 'ru')."""
+        return self._data.get("language", "tr")
+
+    def set_language(self, lang: str):
+        self._data["language"] = lang
+        self.save()
+
+    def port_listener_enabled(self) -> bool:
+        """Return whether background network port monitoring is enabled."""
+        return bool(self._data.get("port_listener_enabled", False))
+
+    def set_port_listener_enabled(self, enabled: bool):
+        self._data["port_listener_enabled"] = bool(enabled)
+        self.save()
+
+    def port_listener_ports(self) -> List[int]:
+        """Return target ports to monitor."""
+        return self._data.get("port_listener_ports", [993, 143, 995, 110, 465, 587, 2096])
+
+    def set_port_listener_ports(self, ports: List[int]):
+        self._data["port_listener_ports"] = ports
+        self.save()
+
+    def network_timeout(self) -> int:
+        """Return network socket timeout in seconds."""
+        return int(self._data.get("network_timeout", 15))
+
+    def set_network_timeout(self, seconds: int):
+        self._data["network_timeout"] = max(3, min(120, int(seconds)))
+        self.save()
+
+    def ssl_strict_mode(self) -> bool:
+        """Return whether SSL certificate validation is strict."""
+        return bool(self._data.get("ssl_strict_mode", False))
+
+    def set_ssl_strict_mode(self, strict: bool):
+        self._data["ssl_strict_mode"] = bool(strict)
+        self.save()
+
+
 
 
 

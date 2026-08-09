@@ -1427,6 +1427,10 @@ class SyncPanel(QWidget):
         self.settings = settings or AppSettings()
         self._reports: list = []
         self._all_selected_flag = False
+
+        self._log_model = LogTableModel(self)
+        self._log_proxy = LogFilterProxy(self)
+        self._log_proxy.setSourceModel(self._log_model)
         
         self._active_syncs = {}  # account_id -> {cancel_event, pause_event, thread, status}
         self._accounts_ui = {}  # account_id -> {chk, lbl_status, progress_bar, btn_start, etc.}
@@ -1932,9 +1936,6 @@ class SyncPanel(QWidget):
             }
         """)
 
-        self._log_model = LogTableModel(self)
-        self._log_proxy = LogFilterProxy(self)
-        self._log_proxy.setSourceModel(self._log_model)
         self.log_table.setModel(self._log_proxy)
         self.log_table.setColumnHidden(1, True)
         self.log_table.setColumnHidden(2, True)
@@ -2566,10 +2567,12 @@ class SyncPanel(QWidget):
         source = src_match.group(1) if src_match else "sync"
         message = rest[src_match.end():] if src_match else rest
         entry = LogEntry(ts, level, source, message)
-        self._log_model.append_entry(entry)
-        self._update_pagination()
-        self._log_proxy.set_page(self._log_proxy.total_pages() - 1)
-        self._update_pagination()
+        if getattr(self, '_log_model', None) is not None:
+            self._log_model.append_entry(entry)
+            if getattr(self, '_log_proxy', None) is not None:
+                self._update_pagination()
+                self._log_proxy.set_page(self._log_proxy.total_pages() - 1)
+                self._update_pagination()
 
         # Clean parsing for Current Folder stat card
         if "Syncing folder" in message:
@@ -2609,11 +2612,14 @@ class SyncPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _update_pagination(self):
-        total = self._log_proxy.total_pages()
-        cur = self._log_proxy.current_page() + 1
-        self.label_page.setText(f"Page {cur} / {total}")
-        self.btn_prev_page.setEnabled(cur > 1)
-        self.btn_next_page.setEnabled(cur < total)
+        if hasattr(self, 'label_page') and self.label_page and getattr(self, '_log_proxy', None) is not None:
+            total = self._log_proxy.total_pages()
+            cur = self._log_proxy.current_page() + 1
+            self.label_page.setText(f"Page {cur} / {total}")
+            if hasattr(self, 'btn_prev_page') and self.btn_prev_page:
+                self.btn_prev_page.setEnabled(cur > 1)
+            if hasattr(self, 'btn_next_page') and self.btn_next_page:
+                self.btn_next_page.setEnabled(cur < total)
 
     def _on_filter_changed(self, text: str):
         self._log_proxy.set_filter_text(text)

@@ -11,7 +11,7 @@ This is the main entry point for the application logic.
 import logging
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from core.crypto_utils import CryptoManager
 from core.database import DatabaseManager
@@ -293,7 +293,7 @@ class MailEngine:
     def search(self, query: str, limit: int = 50,
                offset: int = 0,
                account_id: Optional[int] = None,
-               folder: Optional[str] = None,
+               folder: Optional[Union[str, List[str]]] = None,
                since_date: Optional[str] = None,
                before_date: Optional[str] = None,
                has_attachments: Optional[bool] = None,
@@ -419,6 +419,218 @@ class MailEngine:
             "total_size_bytes": stats["total_size_bytes"],
             "report_path": str(report_path),
             "stats": stats
+        }
+
+    # ------------------------------------------------------------------
+    # Portable Backup Import
+    # ------------------------------------------------------------------
+
+    def inspect_portable_backup(self, backup_dir: Path) -> Dict[str, Any]:
+        """Inspect an external backup directory (e.g. portable drive / backup folder)."""
+        backup_dir = Path(backup_dir)
+        db_file = backup_dir / "mail_archive.db"
+        settings_file = backup_dir / "settings.json"
+        
+        if not db_file.exists():
+            return {
+                "is_valid": False,
+                "error": "Klasör içerisinde 'mail_archive.db' veritabanı bulunamadı."
+            }
+            
+        import sqlite3
+        accounts = []
+        conflicting_accounts = []
+        total_mails = 0
+        total_attachments = 0
+        export_profiles = []
+        
+        try:
+            conn = sqlite3.connect(db_file)
+            conn.row_factory = sqlite3.Row
+            
+            # Fetch accounts
+            acc_rows = conn.execute("SELECT * FROM accounts").fetchall()
+            accounts = [dict(r) for r in acc_rows]
+            
+            # Check conflicting accounts
+            active_emails = {a.get("email", "").lower() for a in self.accounts.list_all()}
+            for a in accounts:
+                if a.get("email", "").lower() in active_emails:
+                    conflicting_accounts.append(a)
+                    
+            # Count mails
+            m_row = conn.execute("SELECT COUNT(*) as cnt FROM mail_metadata WHERE is_deleted=0").fetchone()
+            total_mails = m_row["cnt"] if m_row else 0
+            
+            # Count attachments
+            try:
+                a_row = conn.execute("SELECT COUNT(*) as cnt FROM attachments").fetchone()
+                total_attachments = a_row["cnt"] if a_row else 0
+            except Exception:
+                pass
+            conn.close()
+        except Exception as exc:
+            return {
+                "is_valid": False,
+                "error": f"Veritabanı okunamadı: {exc}"
+            }
+            
+        if settings_file.exists():
+            try:
+                import json
+                with open(settings_file, "r", encoding="utf-8") as f:
+                    s_data = json.load(f)
+                    export_profiles = s_data.get("export_profiles", [])
+            except Exception:
+                pass
+                
+        return {
+            "is_valid": True,
+            "backup_dir": str(backup_dir),
+            "accounts": accounts,
+            "conflicting_accounts": conflicting_accounts,
+            "total_mails": total_mails,
+            "total_attachments": total_attachments,
+            "export_profiles": export_profiles
+        }
+
+    def import_portable_backup(self, backup_dir: Path, progress_callback=None) -> Dict[str, Any]:
+        """Merge database records, key, attachments, and export profiles from a portable backup folder."""
+        backup_dir = Path(backup_dir)
+        db_file = backup_dir / "mail_archive.db"
+        settings_file = backup_dir / "settings.json"
+        key_file = backup_dir / "key.key"
+        
+        if not db_file.exists():
+            raise FileNotFoundError("Klasör içerisinde 'mail_archive.db' veritabanı bulunamadı.")
+            
+        import sqlite3, shutil
+        
+        # Key import check
+        if key_file.exists() and not self.crypto._key_file.exists():
+            try:
+                shutil.copy2(key_file, self.crypto._key_file)
+                logger.info("Fernet key file copied from backup directory")
+            except Exception as exc:
+                logger.warning("Failed to copy key.key: %s", exc)
+
+        ext_conn = sqlite3.connect(db_file)
+        ext_conn.row_factory = sqlite3.Row
+        
+        # 1. Map external account_ids -> active account_ids
+        account_id_map = {}
+        ext_accounts = [dict(r) for r in ext_conn.execute("SELECT * FROM accounts").fetchall()]
+        
+        active_accs = {a.get("email", "").lower(): a["id"] for a in self.accounts.list_all()}
+        
+        imported_acc_count = 0
+        for acc in ext_accounts:
+            email_clean = acc.get("email", "").strip().lower()
+            if email_clean in active_accs:
+                account_id_map[acc["id"]] = active_accs[email_clean]
+            else:
+                # Insert account
+                new_id = self.accounts.create({
+                    "label": acc.get("label") or email_clean,
+                    "email": acc.get("email"),
+                    "imap_host": acc.get("imap_host", ""),
+                    "imap_port": acc.get("imap_port", 993),
+                    "use_ssl": acc.get("use_ssl", True),
+                    "username": acc.get("username", ""),
+                    "password_encrypted": acc.get("password_encrypted", ""),
+                    "export_subfolder": acc.get("export_subfolder", ""),
+                    "account_group": acc.get("account_group", ""),
+                    "status": "Active"
+                })
+                account_id_map[acc["id"]] = new_id
+                active_accs[email_clean] = new_id
+                imported_acc_count += 1
+
+        # 2. Merge mail_metadata & mail_raw
+        ext_mails = ext_conn.execute("SELECT m.*, r.raw_data FROM mail_metadata m LEFT JOIN mail_raw r ON r.mail_id=m.id WHERE m.is_deleted=0").fetchall()
+        total_mails = len(ext_mails)
+        imported_mail_count = 0
+        
+        if progress_callback:
+            progress_callback(0, total_mails, "Mailler içe aktarılıyor...")
+            
+        with self.db.get_conn() as act_conn:
+            for idx, m in enumerate(ext_mails):
+                ext_acc_id = m["account_id"]
+                act_acc_id = account_id_map.get(ext_acc_id)
+                if not act_acc_id:
+                    continue
+                    
+                msg_id = m["message_id"]
+                uid = m["uid"]
+                folder = m["folder"]
+                
+                # Check duplicate
+                dup = None
+                if msg_id:
+                    dup = act_conn.execute("SELECT id FROM mail_metadata WHERE account_id=? AND message_id=? AND is_deleted=0", (act_acc_id, msg_id)).fetchone()
+                if not dup and uid and folder:
+                    dup = act_conn.execute("SELECT id FROM mail_metadata WHERE account_id=? AND folder=? AND uid=? AND is_deleted=0", (act_acc_id, folder, uid)).fetchone()
+                    
+                if not dup:
+                    cur = act_conn.execute(
+                        """INSERT INTO mail_metadata (account_id, uid, folder, subject, sender, recipients, date, message_id, size, has_attachments, is_deleted)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+                        (act_acc_id, m["uid"], m["folder"], m["subject"], m["sender"], m["recipients"], m["date"], m["message_id"], m["size"], m["has_attachments"])
+                    )
+                    new_mail_id = cur.lastrowid
+                    if m["raw_data"]:
+                        act_conn.execute("INSERT OR REPLACE INTO mail_raw (mail_id, raw_data) VALUES (?, ?)", (new_mail_id, m["raw_data"]))
+                    imported_mail_count += 1
+                    
+                if progress_callback and (idx % 20 == 0 or idx == total_mails - 1):
+                    progress_callback(idx + 1, total_mails, f"Mail {idx+1}/{total_mails}")
+
+        # 3. Copy Attachments if any
+        ext_attach_dir = backup_dir / "attachments"
+        act_attach_dir = self.db._db_path.parent / "attachments"
+        imported_attach_count = 0
+        if ext_attach_dir.exists() and ext_attach_dir.is_dir():
+            act_attach_dir.mkdir(parents=True, exist_ok=True)
+            for item in ext_attach_dir.glob("*"):
+                if item.is_file():
+                    target = act_attach_dir / item.name
+                    if not target.exists():
+                        try:
+                            shutil.copy2(item, target)
+                            imported_attach_count += 1
+                        except Exception:
+                            pass
+
+        ext_conn.close()
+        
+        # 4. Import Export Profiles from settings.json
+        imported_profiles_count = 0
+        if settings_file.exists():
+            try:
+                import json
+                with open(settings_file, "r", encoding="utf-8") as f:
+                    s_data = json.load(f)
+                    ext_profiles = s_data.get("export_profiles", [])
+                    if ext_profiles:
+                        from core.settings import AppSettings
+                        settings = AppSettings()
+                        act_profiles = settings.get("export_profiles", [])
+                        act_names = {p.get("name") for p in act_profiles if isinstance(p, dict)}
+                        for p in ext_profiles:
+                            if isinstance(p, dict) and p.get("name") and p.get("name") not in act_names:
+                                act_profiles.append(p)
+                                imported_profiles_count += 1
+                        settings.set("export_profiles", act_profiles)
+                        settings.save()
+            except Exception as exc:
+                logger.warning("Failed to import export profiles from settings.json: %s", exc)
+
+        return {
+            "imported_accounts": imported_acc_count,
+            "imported_mails": imported_mail_count,
+            "imported_attachments": imported_attach_count,
+            "imported_profiles": imported_profiles_count
         }
 
     # ------------------------------------------------------------------

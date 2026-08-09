@@ -13,18 +13,114 @@ from email.header import decode_header
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, Slot, QDate, QUrl
-from PySide6.QtGui import QFont, QColor, QDesktopServices
+from PySide6.QtCore import Qt, Slot, QDate, QUrl, QEvent
+from PySide6.QtGui import QFont, QColor, QDesktopServices, QStandardItemModel, QStandardItem
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit,
     QGroupBox, QTextBrowser, QMessageBox, QComboBox, QDateEdit,
     QCheckBox, QSplitter, QFrame, QListWidget, QListWidgetItem,
+    QAbstractItemView, QListView,
 )
 
 from core.mail_engine import MailEngine
+from core.settings import AppSettings
 
 logger = logging.getLogger(__name__)
+
+
+class CheckableComboBox(QComboBox):
+    """Custom QComboBox with checkable items to support multi-select in compact height."""
+
+    def __init__(self, placeholder="Tüm Klasörler", parent=None):
+        super().__init__(parent)
+        self._placeholder = placeholder
+        self.setModel(QStandardItemModel(self))
+        self.setView(QListView(self))
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.view().viewport().installEventFilter(self)
+        self.model().dataChanged.connect(self._on_data_changed)
+        self.on_selection_changed = None
+
+        self.setStyleSheet("""
+            QComboBox {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 11px;
+                color: #0f172a;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #ffffff;
+                color: #0f172a;
+                selection-background-color: #e2e8f0;
+                selection-color: #0f172a;
+                border: 1px solid #cbd5e1;
+                outline: none;
+                font-size: 11px;
+            }
+            QLineEdit {
+                border: none;
+                background: transparent;
+                font-size: 11px;
+                color: #0f172a;
+                font-weight: bold;
+            }
+        """)
+        self._update_display_text()
+
+    def eventFilter(self, widget, event):
+        if widget == self.view().viewport() and event.type() == QEvent.MouseButtonRelease:
+            index = self.view().indexAt(event.pos())
+            if index.isValid():
+                item = self.model().itemFromIndex(index)
+                if item.checkState() == Qt.Checked:
+                    item.setCheckState(Qt.Unchecked)
+                else:
+                    item.setCheckState(Qt.Checked)
+                return True
+        return super().eventFilter(widget, event)
+
+    def hidePopup(self):
+        super().hidePopup()
+        self._update_display_text()
+
+    def _on_data_changed(self, top_left=None, bottom_right=None, roles=None):
+        self._update_display_text()
+        if callable(self.on_selection_changed):
+            self.on_selection_changed()
+
+    def _update_display_text(self):
+        checked_items = self.get_checked_items()
+        total = self.model().rowCount()
+        if not checked_items or len(checked_items) == total:
+            self.setEditText(f"📁 {self._placeholder}")
+        elif len(checked_items) == 1:
+            self.setEditText(f"📁 {checked_items[0]}")
+        else:
+            self.setEditText(f"📁 {len(checked_items)} Klasör Seçili")
+
+    def get_checked_items(self) -> List[str]:
+        items = []
+        for row in range(self.model().rowCount()):
+            item = self.model().item(row)
+            if item and item.checkState() == Qt.Checked:
+                orig = item.data(Qt.UserRole)
+                items.append(orig if orig is not None else item.text())
+        return items
+
+    def set_all_checked(self, checked: bool = True):
+        self.model().blockSignals(True)
+        for row in range(self.model().rowCount()):
+            item = self.model().item(row)
+            if item:
+                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self.model().blockSignals(False)
+        self._update_display_text()
+        if callable(self.on_selection_changed):
+            self.on_selection_changed()
 
 # BTN styling helpers
 BTN_STYLE_BLUE = """
@@ -60,45 +156,121 @@ BTN_STYLE_OUTLINE = """
 
 
 class SearchPanel(QWidget):
-    """Full-text search panel with advanced metadata filters and rich preview."""
+    """Full-text search panel with advanced metadata filters, 3-panel workspace layout, and rich preview."""
 
     def __init__(self, engine: MailEngine, parent=None):
         super().__init__(parent)
         self.engine = engine
+        self.settings = AppSettings()
         self._results: List[Dict[str, Any]] = []
         self._current_attachments: List[Dict[str, Any]] = []
         self._raw_mode = False
         self._setup_ui()
+        self.refresh()
 
     def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(12)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Header
-        header = QLabel("Full-Text Search & Discovery")
-        header.setProperty("heading", True)
-        header.setStyleSheet("font-size: 22px; font-weight: bold; color: #1a1a2e;")
-        layout.addWidget(header)
+        from gui.templates.three_panel_workspace import ThreePanelWorkspaceTemplate
+        self.workspace = ThreePanelWorkspaceTemplate(title="🔍 Detaylı E-Posta Arama Paneli", parent=self)
+        main_layout.addWidget(self.workspace)
 
-        sub = QLabel("Search archived messages across all folders, dates, and contents using SQLite FTS5 index.")
-        sub.setProperty("subheading", True)
-        sub.setStyleSheet("font-size: 13px; color: #64748b; margin-bottom: 4px;")
-        layout.addWidget(sub)
+        ws = self.workspace
+        ws.btn_toggle_left.setText("🌐 Sol Filtre Paneli")
+        ws.btn_toggle_right.setText("📧 Sağ Önizleme Paneli")
 
-        # Splitter for Filters+Table (Left) vs Email Viewer (Right)
-        main_splitter = QSplitter(Qt.Horizontal)
-        main_splitter.setStyleSheet("QSplitter::handle { background-color: #e2e8f0; width: 2px; }")
+        # -------------------------------------------------------------------
+        # 1. SOL PANEL: Domain, Grup, Hesap, Klasör ve Tarih Filtreleri
+        # -------------------------------------------------------------------
+        ws.left_group.setTitle("🌐 Domain & Filtre Seçenekleri")
+        left_layout = ws.left_inner_layout
 
-        # Left Widget containing search inputs, advanced filters, and results list
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 8, 0)
-        left_layout.setSpacing(10)
+        left_layout.addWidget(QLabel("🌐 Domain Filtresi:"))
+        self.combo_domain = QComboBox()
+        self.combo_domain.currentIndexChanged.connect(self._on_filter_account_changed)
+        left_layout.addWidget(self.combo_domain)
 
-        # Search bar
+        left_layout.addWidget(QLabel("👥 Grup Filtresi:"))
+        self.combo_group = QComboBox()
+        self.combo_group.currentIndexChanged.connect(self._on_filter_account_changed)
+        left_layout.addWidget(self.combo_group)
+
+        left_layout.addWidget(QLabel("👤 Hesap Seçimi:"))
+        self.combo_account = QComboBox()
+        self.combo_account.currentIndexChanged.connect(self._on_filter_account_changed)
+        left_layout.addWidget(self.combo_account)
+
+        left_layout.addWidget(QLabel("📁 Klasör Filtresi (Açılır Çoklu Seçim):"))
+        self.combo_folder = CheckableComboBox(placeholder="Tüm Klasörler", parent=self)
+        self.combo_folder.on_selection_changed = self._search
+        left_layout.addWidget(self.combo_folder)
+
+        f_ctrls = QHBoxLayout()
+        btn_all_f = QPushButton("Tümünü Seç")
+        btn_all_f.setCursor(Qt.PointingHandCursor)
+        btn_all_f.setStyleSheet("background-color: #2563eb; color: #ffffff; font-weight: bold; padding: 4px 8px; font-size: 10px; border-radius: 3px;")
+        btn_all_f.clicked.connect(self._select_all_folders)
+
+        btn_none_f = QPushButton("Seçimleri Temizle")
+        btn_none_f.setCursor(Qt.PointingHandCursor)
+        btn_none_f.setStyleSheet("background-color: #475569; color: #ffffff; font-weight: bold; padding: 4px 8px; font-size: 10px; border-radius: 3px;")
+        btn_none_f.clicked.connect(self._clear_all_folders)
+
+        f_ctrls.addWidget(btn_all_f)
+        f_ctrls.addWidget(btn_none_f)
+        f_ctrls.addStretch()
+        left_layout.addLayout(f_ctrls)
+
+        left_layout.addWidget(QLabel("📎 Ek Dosya Durumu:"))
+        self.combo_attachments = QComboBox()
+        self.combo_attachments.addItems(["Tümü", "Ekli Olanlar", "Eksiz Olanlar"])
+        self.combo_attachments.currentIndexChanged.connect(self._apply_filters)
+        left_layout.addWidget(self.combo_attachments)
+
+        left_layout.addWidget(QLabel("📩 Okuma Durumu:"))
+        self.combo_read = QComboBox()
+        self.combo_read.addItems(["Tümü", "Yalnızca Okunmamış", "Yalnızca Okunmuş"])
+        self.combo_read.currentIndexChanged.connect(self._apply_filters)
+        left_layout.addWidget(self.combo_read)
+
+        left_layout.addSpacing(6)
+        self.chk_since = QCheckBox("Şu tarihten yeni:")
+        self.chk_since.setStyleSheet("font-weight: bold; color: #1e293b;")
+        self.date_since = QDateEdit(QDate.currentDate().addYears(-1))
+        self.date_since.setCalendarPopup(True)
+        self.date_since.setEnabled(False)
+        self.chk_since.toggled.connect(self.date_since.setEnabled)
+        self.chk_since.toggled.connect(self._apply_filters)
+        left_layout.addWidget(self.chk_since)
+        left_layout.addWidget(self.date_since)
+
+        self.chk_before = QCheckBox("Şu tarihten eski:")
+        self.chk_before.setStyleSheet("font-weight: bold; color: #1e293b;")
+        self.date_before = QDateEdit(QDate.currentDate())
+        self.date_before.setCalendarPopup(True)
+        self.date_before.setEnabled(False)
+        self.chk_before.toggled.connect(self.date_before.setEnabled)
+        self.chk_before.toggled.connect(self._apply_filters)
+        left_layout.addWidget(self.chk_before)
+        left_layout.addWidget(self.date_before)
+
+        left_layout.addSpacing(10)
+        btn_reset_filters = QPushButton("🔄 Filtreleri Sıfırla")
+        btn_reset_filters.setCursor(Qt.PointingHandCursor)
+        btn_reset_filters.setStyleSheet(BTN_STYLE_OUTLINE)
+        btn_reset_filters.clicked.connect(self._reset_filters)
+        left_layout.addWidget(btn_reset_filters)
+
+        left_layout.addStretch()
+
+        # -------------------------------------------------------------------
+        # 2. ORTA PANEL: Arama Girişi & Sonuç Tablosu
+        # -------------------------------------------------------------------
+        center_layout = ws.center_layout
+
         search_box = QFrame()
-        search_box.setStyleSheet("QFrame { background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; }")
+        search_box.setStyleSheet("QFrame { background-color: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; }")
         search_bar_layout = QHBoxLayout(search_box)
         search_bar_layout.setContentsMargins(10, 8, 10, 8)
         search_bar_layout.setSpacing(8)
@@ -110,93 +282,22 @@ class SearchPanel(QWidget):
         search_bar_layout.addWidget(self.input_query, stretch=1)
 
         self.btn_search = QPushButton("🔍 Ara")
+        self.btn_search.setCursor(Qt.PointingHandCursor)
         self.btn_search.setStyleSheet(BTN_STYLE_BLUE)
         self.btn_search.setMinimumHeight(34)
         search_bar_layout.addWidget(self.btn_search)
 
         self.btn_rebuild = QPushButton("Dizini Yeniden Kur")
+        self.btn_rebuild.setCursor(Qt.PointingHandCursor)
         self.btn_rebuild.setStyleSheet(BTN_STYLE_OUTLINE)
         self.btn_rebuild.setMinimumHeight(34)
         search_bar_layout.addWidget(self.btn_rebuild)
 
-        left_layout.addWidget(search_box)
+        center_layout.addWidget(search_box)
 
-        # Advanced Filters Group
-        filters_box = QGroupBox("Gelişmiş Arama Filtreleri")
-        filters_box.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold;
-                font-size: 11px;
-                border: 1px solid #cbd5e1;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 14px;
-                background-color: #ffffff;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                color: #4361ee;
-            }
-        """)
-        filters_grid = QVBoxLayout(filters_box)
-        filters_grid.setContentsMargins(10, 10, 10, 10)
-        filters_grid.setSpacing(8)
-
-        # Row 1 of Filters: Account, Folder, Attachment
-        row1 = QHBoxLayout()
-        row1.setSpacing(8)
-        
-        row1.addWidget(QLabel("Hesap:"))
-        self.combo_account = QComboBox()
-        self.combo_account.setMinimumWidth(180)
-        row1.addWidget(self.combo_account)
-
-        row1.addWidget(QLabel("Klasör:"))
-        self.input_folder = QLineEdit()
-        self.input_folder.setPlaceholderText("Örn: INBOX, Sent")
-        self.input_folder.setMinimumWidth(100)
-        row1.addWidget(self.input_folder)
-
-        row1.addWidget(QLabel("Ek Dosya:"))
-        self.combo_attachments = QComboBox()
-        self.combo_attachments.addItems(["Tümü", "Ekli Olanlar", "Eksiz Olanlar"])
-        row1.addWidget(self.combo_attachments)
-
-        filters_grid.addLayout(row1)
-
-        # Row 2 of Filters: Date constraints & Read status
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
-
-        self.chk_since = QCheckBox("Şu tarihten yeni:")
-        row2.addWidget(self.chk_since)
-        self.date_since = QDateEdit(QDate.currentDate().addYears(-1))
-        self.date_since.setCalendarPopup(True)
-        self.date_since.setEnabled(False)
-        self.chk_since.toggled.connect(self.date_since.setEnabled)
-        row2.addWidget(self.date_since)
-
-        self.chk_before = QCheckBox("Şu tarihten eski:")
-        row2.addWidget(self.chk_before)
-        self.date_before = QDateEdit(QDate.currentDate())
-        self.date_before.setCalendarPopup(True)
-        self.date_before.setEnabled(False)
-        self.chk_before.toggled.connect(self.date_before.setEnabled)
-        row2.addWidget(self.date_before)
-
-        row2.addWidget(QLabel("Okuma Durumu:"))
-        self.combo_read = QComboBox()
-        self.combo_read.addItems(["Tümü", "Yalnızca Okunmamış", "Yalnızca Okunmuş"])
-        row2.addWidget(self.combo_read)
-
-        filters_grid.addLayout(row2)
-        left_layout.addWidget(filters_box)
-
-        # Results Table
         self.label_count = QLabel("0 sonuç bulundu")
-        self.label_count.setStyleSheet("font-size: 12px; color: #64748b; font-weight: 500;")
-        left_layout.addWidget(self.label_count)
+        self.label_count.setStyleSheet("font-size: 12px; color: #2563eb; font-weight: bold;")
+        center_layout.addWidget(self.label_count)
 
         self.table = QTableWidget()
         self.table.setColumnCount(6)
@@ -211,25 +312,23 @@ class SearchPanel(QWidget):
         self.table.setSortingEnabled(True)
         self.table.setStyleSheet("""
             QTableWidget {
-                border: 1px solid #e2e8f0;
+                border: 1px solid #cbd5e1;
                 border-radius: 6px;
                 background-color: #ffffff;
                 color: #0f172a;
+                font-size: 11px;
             }
             QTableWidget::item { padding: 6px 8px; }
             QTableWidget::item:selected { background-color: #cbd5e1; color: #000000; }
         """)
-        left_layout.addWidget(self.table, stretch=1)
+        center_layout.addWidget(self.table, stretch=1)
 
-        main_splitter.addWidget(left_widget)
+        # -------------------------------------------------------------------
+        # 3. SAĞ PANEL: Önizleme & Hızlı Dışa Aktarım İşlemleri
+        # -------------------------------------------------------------------
+        ws.right_group.setTitle("📧 Önizleme & Dışa Aktar")
+        right_layout = ws.right_inner_layout
 
-        # Right Widget: Thunderbird-style Email Viewer Pane
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(8, 0, 0, 0)
-        right_layout.setSpacing(10)
-
-        # Preview Headers Group
         self.preview_header_frame = QFrame()
         self.preview_header_frame.setFrameShape(QFrame.StyledPanel)
         self.preview_header_frame.setStyleSheet("""
@@ -245,11 +344,11 @@ class SearchPanel(QWidget):
             }
         """)
         header_grid = QVBoxLayout(self.preview_header_frame)
-        header_grid.setContentsMargins(12, 12, 12, 12)
+        header_grid.setContentsMargins(10, 10, 10, 10)
         header_grid.setSpacing(4)
 
         self.lbl_subject = QLabel("(Konu Yok)")
-        self.lbl_subject.setStyleSheet("font-size: 14px; font-weight: bold; color: #1e3a8a;")
+        self.lbl_subject.setStyleSheet("font-size: 13px; font-weight: bold; color: #1e3a8a;")
         header_grid.addWidget(self.lbl_subject)
 
         self.lbl_from = QLabel("Kimden: —")
@@ -264,21 +363,23 @@ class SearchPanel(QWidget):
         self.lbl_date.setStyleSheet("font-size: 11px;")
         header_grid.addWidget(self.lbl_date)
 
-        # Toolbar inside preview pane
         preview_toolbar = QHBoxLayout()
         preview_toolbar.setSpacing(6)
 
         self.btn_save_eml = QPushButton("📥 .EML Dışa Aktar")
-        self.btn_save_eml.setStyleSheet(BTN_STYLE_OUTLINE)
+        self.btn_save_eml.setCursor(Qt.PointingHandCursor)
+        self.btn_save_eml.setStyleSheet(BTN_STYLE_BLUE)
         self.btn_save_eml.setEnabled(False)
         preview_toolbar.addWidget(self.btn_save_eml)
 
         self.btn_print = QPushButton("🖨️ Yazdır")
+        self.btn_print.setCursor(Qt.PointingHandCursor)
         self.btn_print.setStyleSheet(BTN_STYLE_OUTLINE)
         self.btn_print.setEnabled(False)
         preview_toolbar.addWidget(self.btn_print)
 
         self.btn_toggle_raw = QPushButton("📄 Ham Kaynak")
+        self.btn_toggle_raw.setCursor(Qt.PointingHandCursor)
         self.btn_toggle_raw.setStyleSheet(BTN_STYLE_OUTLINE)
         self.btn_toggle_raw.setEnabled(False)
         self.btn_toggle_raw.setCheckable(True)
@@ -289,7 +390,6 @@ class SearchPanel(QWidget):
 
         right_layout.addWidget(self.preview_header_frame)
 
-        # Body Preview Browser
         self.preview_browser = QTextBrowser()
         self.preview_browser.setOpenLinks(False)
         self.preview_browser.setStyleSheet("""
@@ -297,27 +397,14 @@ class SearchPanel(QWidget):
                 border: 1px solid #cbd5e1;
                 border-radius: 8px;
                 background-color: #ffffff;
-                padding: 12px;
+                padding: 10px;
+                font-size: 11px;
             }
         """)
         right_layout.addWidget(self.preview_browser, stretch=1)
 
-        # Attachments pane
         self.attach_box = QGroupBox("Ekli Dosyalar")
-        self.attach_box.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold;
-                border: 1.5px solid #ef4444;
-                border-radius: 6px;
-                margin-top: 10px;
-                padding-top: 12px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                color: #ef4444;
-            }
-        """)
+        self.attach_box.setStyleSheet(ws._group_box_style())
         attach_layout = QVBoxLayout(self.attach_box)
         attach_layout.setContentsMargins(8, 8, 8, 8)
 
@@ -328,8 +415,10 @@ class SearchPanel(QWidget):
 
         attach_btns = QHBoxLayout()
         self.btn_open_attach = QPushButton("📂 Aç")
+        self.btn_open_attach.setCursor(Qt.PointingHandCursor)
         self.btn_open_attach.setStyleSheet(BTN_STYLE_OUTLINE)
         self.btn_save_attach = QPushButton("📥 Kaydet")
+        self.btn_save_attach.setCursor(Qt.PointingHandCursor)
         self.btn_save_attach.setStyleSheet(BTN_STYLE_BLUE)
         attach_btns.addWidget(self.btn_open_attach)
         attach_btns.addWidget(self.btn_save_attach)
@@ -339,9 +428,16 @@ class SearchPanel(QWidget):
         self.attach_box.setVisible(False)
         right_layout.addWidget(self.attach_box)
 
-        main_splitter.addWidget(right_widget)
-        main_splitter.setSizes([850, 550])
-        layout.addWidget(main_splitter)
+        # Load persisted layout splitter state
+        ws.load_splitter_state(self.settings, "search_workspace")
+        ws.splitter.splitterMoved.connect(lambda *args: ws.save_splitter_state(self.settings, "search_workspace"))
+
+        def _on_search_panel_toggled(panel_name: str, visible: bool):
+            self.settings.set(f"search_{panel_name}_visible", visible)
+            self.settings.save()
+            ws.save_splitter_state(self.settings, "search_workspace")
+
+        ws.panel_toggled.connect(_on_search_panel_toggled)
 
         # Connections
         self.btn_search.clicked.connect(self._search)
@@ -361,14 +457,161 @@ class SearchPanel(QWidget):
     # ------------------------------------------------------------------
 
     def refresh(self):
+        self.combo_account.blockSignals(True)
         self.combo_account.clear()
-        self.combo_account.addItem("Tüm Hesaplar", None)
+        self.combo_account.addItem("👤 Tüm Hesaplar", None)
+
+        self.combo_domain.blockSignals(True)
+        self.combo_domain.clear()
+        self.combo_domain.addItem("🌐 Tüm Domainler", None)
+
+        self.combo_group.blockSignals(True)
+        self.combo_group.clear()
+        self.combo_group.addItem("👥 Tüm Gruplar", None)
+
+        domains = set()
+        groups = set()
+
         try:
             accounts = self.engine.list_accounts()
             for acc in accounts:
-                self.combo_account.addItem(acc["label"], acc["id"])
+                acc_id = acc.get("id")
+                label = acc.get("label") or acc.get("email")
+                self.combo_account.addItem(f"👤 {label}", acc_id)
+
+                dom = acc.get("domain")
+                if not dom and acc.get("email") and "@" in acc.get("email"):
+                    dom = acc.get("email").split("@")[-1].strip().lower()
+                if dom:
+                    domains.add(dom)
+
+                grp = acc.get("account_group") or acc.get("group_name") or acc.get("group")
+                if grp:
+                    groups.add(grp)
+
+            for d in sorted(domains):
+                self.combo_domain.addItem(f"🌐 {d}", d)
+            for g in sorted(groups):
+                self.combo_group.addItem(f"👥 {g}", g)
+
         except Exception as exc:
             logger.error("Failed to load accounts in search: %s", exc)
+        finally:
+            self.combo_account.blockSignals(False)
+            self.combo_domain.blockSignals(False)
+            self.combo_group.blockSignals(False)
+
+        self._load_folders_for_selected_account()
+
+    @Slot()
+    def _on_filter_account_changed(self):
+        self._load_folders_for_selected_account()
+        self._search()
+
+    def _load_folders_for_selected_account(self):
+        if not hasattr(self, "combo_folder"):
+            return
+        model = self.combo_folder.model()
+        model.clear()
+
+        account_id = self.combo_account.currentData() if hasattr(self, "combo_account") else None
+        sel_domain = self.combo_domain.currentData() if hasattr(self, "combo_domain") else None
+        sel_group = self.combo_group.currentData() if hasattr(self, "combo_group") else None
+
+        try:
+            from infrastructure.imap_client import format_folder_display_name
+            with self.engine.db.get_conn() as conn:
+                params = []
+                where_clauses = ["is_deleted = 0"]
+
+                if account_id:
+                    where_clauses.append("account_id = ?")
+                    params.append(account_id)
+                elif sel_domain or sel_group:
+                    matching_ids = []
+                    for acc in self.engine.list_accounts():
+                        acc_dom = acc.get("domain") or (acc.get("email").split("@")[-1] if acc.get("email") and "@" in acc.get("email") else "")
+                        acc_grp = acc.get("account_group") or acc.get("group_name") or acc.get("group") or ""
+                        if sel_domain and acc_dom != sel_domain:
+                            continue
+                        if sel_group and acc_grp != sel_group:
+                            continue
+                        matching_ids.append(acc.get("id"))
+                    if matching_ids:
+                        placeholders = ", ".join("?" for _ in matching_ids)
+                        where_clauses.append(f"account_id IN ({placeholders})")
+                        params.extend(matching_ids)
+
+                where_sql = " AND ".join(where_clauses)
+                rows = conn.execute(
+                    f"SELECT DISTINCT folder FROM mail_metadata WHERE {where_sql} ORDER BY folder ASC",
+                    params
+                ).fetchall()
+
+            for r in rows:
+                orig_folder = r["folder"]
+                display_name = format_folder_display_name(orig_folder)
+                
+                item = QStandardItem(display_name)
+                item.setData(orig_folder, Qt.UserRole)
+                item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                
+                standard_keywords = ["inbox", "sent", "draft", "spam", "junk", "trash", "archive", 
+                                   "gelen", "giden", "gönderilen", "taslak", "çöp", "arşiv", "istenmeyen"]
+                is_standard = any(w in display_name.lower() for w in standard_keywords)
+                
+                item.setCheckState(Qt.Checked if is_standard else Qt.Unchecked)
+                model.appendRow(item)
+
+            self.combo_folder._update_display_text()
+
+        except Exception as exc:
+            logger.error("Failed to load search folder list: %s", exc)
+
+    def _select_all_folders(self):
+        if hasattr(self, "combo_folder"):
+            self.combo_folder.set_all_checked(True)
+            self._search()
+
+    def _clear_all_folders(self):
+        if hasattr(self, "combo_folder"):
+            self.combo_folder.set_all_checked(False)
+            self._search()
+
+    def _get_selected_folders(self) -> Optional[List[str]]:
+        if not hasattr(self, "combo_folder"):
+            return None
+        checked = self.combo_folder.get_checked_items()
+        total = self.combo_folder.model().rowCount()
+        if total == 0 or len(checked) == total or len(checked) == 0:
+            return None
+        return checked
+
+    @Slot()
+    def _apply_filters(self):
+        self._search()
+
+    @Slot()
+    def _reset_filters(self):
+        self.combo_domain.blockSignals(True)
+        self.combo_group.blockSignals(True)
+        self.combo_account.blockSignals(True)
+        
+        self.combo_domain.setCurrentIndex(0)
+        self.combo_group.setCurrentIndex(0)
+        self.combo_account.setCurrentIndex(0)
+        self.combo_attachments.setCurrentIndex(0)
+        self.combo_read.setCurrentIndex(0)
+        self.chk_since.setChecked(False)
+        self.chk_before.setChecked(False)
+        self.input_query.clear()
+
+        self.combo_domain.blockSignals(False)
+        self.combo_group.blockSignals(False)
+        self.combo_account.blockSignals(False)
+
+        self._load_folders_for_selected_account()
+        self._search()
 
     # ------------------------------------------------------------------
     # Search implementation
@@ -380,7 +623,7 @@ class SearchPanel(QWidget):
         
         # Resolve filter params
         account_id = self.combo_account.currentData()
-        folder = self.input_folder.text().strip() or None
+        folder = self._get_selected_folders()
         
         since_date = None
         if self.chk_since.isChecked():
@@ -415,6 +658,23 @@ class SearchPanel(QWidget):
                 has_attachments=has_attachments,
                 unread_only=unread_only
             )
+
+            sel_domain = self.combo_domain.currentData()
+            sel_group = self.combo_group.currentData()
+
+            if sel_domain or sel_group:
+                filtered_results = []
+                for r in results:
+                    acc_id = r.get("account_id")
+                    acc = self.engine.accounts.get(acc_id) if acc_id else None
+                    if acc:
+                        if sel_domain and acc.get("domain") != sel_domain:
+                            continue
+                        if sel_group and acc.get("group_name") != sel_group:
+                            continue
+                    filtered_results.append(r)
+                results = filtered_results
+
             self.label_count.setText(f"{len(results)} sonuç bulundu")
             self._results = results
             

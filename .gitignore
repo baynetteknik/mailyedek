@@ -11,6 +11,14 @@ data/
 settings.json
 *.log
 
+# PyInstaller Build & Dist Packages
+installer/dist/
+installer/build/
+installer/*.zip
+build/
+dist/
+*.spec
+
 # Environments
 .venv/
 venv/

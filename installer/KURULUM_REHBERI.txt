@@ -1,0 +1,64 @@
+================================================================================
+          MAIL ARCHIVE SYSTEM — KULLANIM VE KURULUM YARDIM REHBERİ
+================================================================================
+
+Bu rehber, Mail Archive System uygulamasını herhangi bir Windows 10/11 
+bilgisayara kolayca kurmanız ve kullanmanız için hazırlanmıştır.
+
+Uygulamanın çalışabilmesi için kurulacağı bilgisayarda Python veya başka 
+hiçbir yazılımın bulunmasına GEREK YOKTUR. Tüm bileşenler gömülü olarak gelir.
+
+
+--------------------------------------------------------------------------------
+1. OTOMATİK KURULUM ADIMLARI (ÖNERİLEN)
+--------------------------------------------------------------------------------
+
+1. 'MailArchiveSystem_v1.0.01_Kurulum_Paketi.zip' (veya benzeri isimli zip) 
+   dosyasını kurmak istediğiniz bilgisayara kopyalayın.
+
+2. Zip dosyasına sağ tıklayın ve "Tümünü Ayıkla..." (Extract All) seçeneğini 
+   tıklayarak bir klasöre çıkarın.
+
+3. Ayıklanan klasörün içerisindeki 'Kurulum_Yap.bat' dosyasına çift tıklayın.
+
+4. Kurulum sihirbazı otomatik olarak:
+   - Uygulamayı '%LocalAppData%\MailArchiveSystem' dizinine yükler.
+   - Masaüstünüze "Mail Archive System" kısayolunu ekler.
+   - Başlat Menünüze "Mail Archive System" program klasörünü ekler.
+
+5. Ekrana "KURULUM BAŞARIYLA TAMAMLANDI" mesajı geldiğinde 'E' tuşuna basarak
+   veya Masaüstündeki simgeye çift tıklayarak uygulamayı çalıştırabilirsiniz.
+
+
+--------------------------------------------------------------------------------
+2. TAŞINABİLİR (PORTABLE) KULLANIM
+--------------------------------------------------------------------------------
+
+Eğer bilgisayara hiçbir kurulum yapmadan doğrudan USB bellek üzerinden 
+çalıştırmak isterseniz:
+
+1. Zip paketi içindeki 'MailArchiveSystem' klasörünü harici diskinize alın.
+2. Klasör içindeki 'MailArchiveSystem.exe' dosyasına çift tıklayarak çalıştırın.
+
+
+--------------------------------------------------------------------------------
+3. SIKÇA SORULAN SORULAR VE SORUN GİDERME
+--------------------------------------------------------------------------------
+
+S: E-posta senkronizasyonunda "Bağlantı Zaman Aşımı (Timeout)" hatası alıyorum?
+C: Sunucu adresinizi ve portlarınızı (IMAP SSL 993, POP3 SSL 995) kontrol edin.
+   Cenuta veya hosting firmanızın güvenlik duvarı (CSF Firewall) geçici engel 
+   koymuş olabilir. Modeminizi kapatıp açarak IP adresinizi değiştirebilirsiniz.
+
+S: Yedeklenen e-postalarım nerede tutuluyor?
+C: Varsayılan olarak 'D:\mailyedek' dizininde şifreli veritabanı (mail_archive.db)
+   ve ham e-posta dosyaları olarak saklanır. Ayarlar menüsünden dizini değiştirebilirsiniz.
+
+S: Rusça / Yabancı klasör isimleri Türkçe görünüyor mu?
+C: Evet! Mail Viewer ve Senkronizasyon ekranında klasörler otomatik olarak 
+   Türkçe karşılıklarına dönüştürülür (Örn: Черновики -> Taslaklar).
+
+
+================================================================================
+Teknik Destek ve Sorularınız İçin: Baynet Teknik Mail Archive System
+================================================================================

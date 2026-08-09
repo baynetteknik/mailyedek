@@ -35,6 +35,7 @@ from gui.widgets.report_panel import ReportPanel
 from gui.widgets.schedule_panel import SchedulePanel
 from gui.widgets.mail_viewer_panel import MailViewerPanel
 from gui.widgets.export_panel import ExportPanel
+from gui.widgets.settings_panel import SettingsPanel
 
 logger = logging.getLogger(__name__)
 
@@ -230,17 +231,18 @@ class MainWindow(QMainWindow):
         # Navigation buttons
         self.nav_buttons = {}
         nav_items = [
-            ("mail",      "📧", "Mail Viewer"),
-            ("accounts",  "👤", "Accounts"),
-            ("sync",      "🔄", "Sync"),
-            ("export",    "📤", "Export Workspace"),
-            ("backup",    "☁️", "Backup"),
-            ("restore",   "📥", "Restore"),
-            ("search",    "🔍", "Search"),
-            ("audit",     "📋", "Audit Trail"),
-            ("schedule",  "⏰", "Schedule"),
-            ("report",    "📊", "Reports"),
-            ("health",    "❤️", "Health"),
+            ("mail",      "📧", "Mail İzleyici"),
+            ("accounts",  "👤", "Hesaplar"),
+            ("sync",      "🔄", "Senkronizasyon"),
+            ("export",    "📤", "Dışa Aktarım"),
+            ("backup",    "☁️", "Yedekleme"),
+            ("restore",   "📥", "Geri Yükleme"),
+            ("search",    "🔍", "Arama"),
+            ("audit",     "📋", "Denetim İzi"),
+            ("schedule",  "⏰", "Zamanlayıcı"),
+            ("report",    "📊", "Raporlar"),
+            ("health",    "❤️", "Sistem Sağlığı"),
+            ("settings",  "⚙️", "Ayarlar & Depolama"),
         ]
 
         for key, icon, label in nav_items:
@@ -251,33 +253,12 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        # Settings button
-        self.btn_settings = SidebarButton("Storage", "⚙")
-        self.btn_settings.setMinimumHeight(36)
-        self.btn_settings.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                color: #a0a4b0;
-                border: none;
-                border-radius: 6px;
-                padding: 6px 14px;
-                text-align: left;
-                font-size: 12px;
-                font-weight: 400;
-            }
-            QPushButton:hover {
-                background: rgba(255,255,255,0.08);
-                color: #ffffff;
-            }
-        """)
-        self.btn_settings.clicked.connect(self._open_settings)
-        layout.addWidget(self.btn_settings)
-
         # Version label
-        ver = QLabel("v1.0  —  Clean Architecture")
-        ver.setStyleSheet("color: #555; font-size: 11px; padding: 8px;")
-        ver.setAlignment(Qt.AlignCenter)
-        layout.addWidget(ver)
+        from core.version import get_version
+        self.lbl_app_ver = QLabel(f"v{get_version()}  —  Baynet Teknik")
+        self.lbl_app_ver.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold; padding: 8px;")
+        self.lbl_app_ver.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.lbl_app_ver)
 
         return self.sidebar
 
@@ -349,11 +330,12 @@ class MainWindow(QMainWindow):
             ("schedule", "Schedule", SchedulePanel),
             ("report", "Reports", ReportPanel),
             ("health", "Health", HealthPanel),
+            ("settings", "Settings Workspace", SettingsPanel),
         ]
 
         for key, title, PanelClass in panels_def:
             kwargs = {"engine": self.engine, "parent": self}
-            if PanelClass in (AccountPanel, SyncPanel):
+            if PanelClass in (AccountPanel, SyncPanel, SettingsPanel):
                 kwargs["settings"] = self.settings
             panel = PanelClass(**kwargs)
             self.panels[key] = panel
@@ -370,17 +352,18 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.panels[key])
             # Update header title & tooltip hints
             titles = {
-                "mail": "Mail Viewer",
-                "accounts": "Account Management",
-                "sync": "Email Synchronization",
-                "export": "Export & Server Migration Workspace",
-                "backup": "Cloud Backup",
-                "restore": "Restore from Backup",
-                "search": "Full-Text Search",
-                "audit": "Audit Trail",
-                "schedule": "Task Scheduler",
-                "report": "Reports",
-                "health": "System Health",
+                "mail": "Mail İzleyici",
+                "accounts": "Hesap Yönetimi",
+                "sync": "E-Posta Senkronizasyonu",
+                "export": "Dışa Aktarım ve Sunucu Göçü Çalışma Alanı",
+                "backup": "Bulut Yedekleme",
+                "restore": "Yedekten Geri Yükleme",
+                "search": "Detaylı Mail Arama",
+                "audit": "Denetim ve Log İzi",
+                "schedule": "Zamanlanmış Görevler",
+                "report": "Sistem ve Arşiv Raporları",
+                "health": "Sistem Sağlığı",
+                "settings": "Uygulama Ayarları ve Port Teşhis Paneli",
             }
             descriptions = {
                 "mail": "View local archived mails asynchronously.",
@@ -409,10 +392,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _open_settings(self):
-        """Open storage settings dialog with path + locations management."""
-        dialog = StorageSettingsDialog(self.settings, self)
-        if dialog.exec() == QDialog.Accepted:
-            self.label_data_path.setText(f"📁 {self.settings.data_path()}")
+        """Navigate to settings & diagnostic workspace."""
+        self._navigate("settings")
 
     @Slot()
     def _open_export_dialog(self):

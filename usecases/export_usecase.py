@@ -52,19 +52,58 @@ class ExportUseCase:
 
         try:
             with self._db.get_conn() as conn:
-                rows = conn.execute(
-                    f"""SELECT m.id, m.uid, m.folder, m.subject, m.sender, m.date, m.message_id, r.raw_data
+                meta_rows = conn.execute(
+                    f"""SELECT m.id, m.uid, m.folder, m.subject, m.sender, m.date, m.message_id
                         FROM mail_metadata m
-                        LEFT JOIN mail_raw r ON r.mail_id = m.id
                         WHERE {where_clause}
                         ORDER BY m.date""",
                     params
                 ).fetchall()
         except Exception as exc:
-            logger.exception("Database query for export failed")
+            logger.exception("Database query for export metadata failed")
             raise exc
 
-        total = len(rows)
+        total = len(meta_rows)
+
+        if progress_callback:
+            progress_callback(0, total, {
+                "subject": "",
+                "sender": "",
+                "date": "",
+                "folder": "",
+                "status": f"Veritabanından {total} mail bulundu, aktarım başlatılıyor..."
+            })
+
+        def stream_rows():
+            chunk_size = 50
+            for i in range(0, total, chunk_size):
+                chunk = meta_rows[i:i + chunk_size]
+                mail_ids = [r["id"] for r in chunk]
+                placeholders = ", ".join("?" for _ in mail_ids)
+                blob_map = {}
+                try:
+                    with self._db.get_conn() as conn:
+                        raw_rows = conn.execute(
+                            f"SELECT mail_id, raw_data FROM mail_raw WHERE mail_id IN ({placeholders})",
+                            mail_ids
+                        ).fetchall()
+                        blob_map = {r["mail_id"]: r["raw_data"] for r in raw_rows}
+                except Exception as b_err:
+                    logger.warning("Failed to fetch raw_data chunk: %s", b_err)
+
+                for r in chunk:
+                    m_id = r["id"]
+                    yield {
+                        "id": m_id,
+                        "uid": r["uid"],
+                        "folder": r["folder"],
+                        "subject": r["subject"],
+                        "sender": r["sender"],
+                        "date": r["date"],
+                        "message_id": r["message_id"],
+                        "raw_data": blob_map.get(m_id),
+                    }
+
         exported = 0
         errors = 0
 
@@ -93,12 +132,25 @@ class ExportUseCase:
         if format_type == "ZIP":
             if not output_path:
                 raise ValueError("Output path is required for ZIP format")
+            output_path = Path(output_path)
+            if output_path.is_dir() or not output_path.suffix:
+                output_path = output_path / f"mails_{account_id}.zip"
             actual_output_path = output_path
             if export_subfolder:
                 actual_output_path = output_path.parent / export_subfolder / output_path.name
-                actual_output_path.parent.mkdir(parents=True, exist_ok=True)
+            actual_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if progress_callback:
+                progress_callback(0, total, {
+                    "subject": "",
+                    "sender": "",
+                    "date": "",
+                    "folder": "",
+                    "status": f"ZIP arşivleme başlatılıyor ({total} mail)..."
+                })
+
             with zipfile.ZipFile(actual_output_path, 'w', zipfile.ZIP_DEFLATED) as z:
-                for idx, row in enumerate(rows):
+                for idx, row in enumerate(stream_rows()):
                     try:
                         raw = row["raw_data"]
                         if raw:
@@ -124,9 +176,20 @@ class ExportUseCase:
         elif format_type == "DIRECTORY":
             if not output_path:
                 raise ValueError("Output path is required for DIRECTORY format")
+            output_path = Path(output_path)
             base_dir = output_path / export_subfolder if export_subfolder else output_path
             base_dir.mkdir(parents=True, exist_ok=True)
-            for idx, row in enumerate(rows):
+
+            if progress_callback:
+                progress_callback(0, total, {
+                    "subject": "",
+                    "sender": "",
+                    "date": "",
+                    "folder": "",
+                    "status": f"Dizine EML aktarımı başlatılıyor ({total} mail)..."
+                })
+
+            for idx, row in enumerate(stream_rows()):
                 try:
                     raw = row["raw_data"]
                     if raw:
@@ -153,12 +216,25 @@ class ExportUseCase:
         elif format_type == "JSON":
             if not output_path:
                 raise ValueError("Output path is required for JSON format")
+            output_path = Path(output_path)
+            if output_path.is_dir() or not output_path.suffix:
+                output_path = output_path / f"mails_{account_id}.json"
             actual_output_path = output_path
             if export_subfolder:
                 actual_output_path = output_path.parent / export_subfolder / output_path.name
-                actual_output_path.parent.mkdir(parents=True, exist_ok=True)
+            actual_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if progress_callback:
+                progress_callback(0, total, {
+                    "subject": "",
+                    "sender": "",
+                    "date": "",
+                    "folder": "",
+                    "status": f"JSON aktarımı başlatılıyor ({total} mail)..."
+                })
+
             mails_data = []
-            for idx, row in enumerate(rows):
+            for idx, row in enumerate(stream_rows()):
                 try:
                     raw = row["raw_data"]
                     body = ""
@@ -202,13 +278,22 @@ class ExportUseCase:
         elif format_type == "MBOX":
             if not output_path:
                 raise ValueError("Output path is required for MBOX format")
-            
+            output_path = Path(output_path)
+            if output_path.is_dir() or not output_path.suffix:
+                output_path = output_path / f"mails_{account_id}.mbox"
             actual_output_path = output_path
             if export_subfolder:
                 actual_output_path = output_path.parent / export_subfolder / output_path.name
-
-            # Ensure folder structure exists
             actual_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if progress_callback:
+                progress_callback(0, total, {
+                    "subject": "",
+                    "sender": "",
+                    "date": "",
+                    "folder": "",
+                    "status": f"MBOX aktarımı başlatılıyor ({total} mail)..."
+                })
             
             # If mbox file exists, delete it first to ensure clean start
             if actual_output_path.exists():
@@ -217,7 +302,7 @@ class ExportUseCase:
             mbox = mailbox.mbox(str(actual_output_path))
             mbox.lock()
             try:
-                for idx, row in enumerate(rows):
+                for idx, row in enumerate(stream_rows()):
                     try:
                         raw = row["raw_data"]
                         if raw:
@@ -244,6 +329,15 @@ class ExportUseCase:
         elif format_type == "IMAP_SERVER":
             if not imap_host or not imap_username or not imap_password:
                 raise ValueError("IMAP host, username and password are required for Server Export")
+
+            if progress_callback:
+                progress_callback(0, total, {
+                    "subject": "",
+                    "sender": "",
+                    "date": "",
+                    "folder": "",
+                    "status": f"IMAP Sunucusuna aktarım başlatılıyor ({total} mail)..."
+                })
             
             if imap_ssl:
                 client = imaplib.IMAP4_SSL(imap_host, imap_port or 993)
@@ -363,7 +457,7 @@ class ExportUseCase:
                         return False
 
                 created_folders = set()
-                for idx, row in enumerate(rows):
+                for idx, row in enumerate(stream_rows()):
                     try:
                         raw = row["raw_data"]
                         if raw:

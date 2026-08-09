@@ -86,27 +86,29 @@ QGroupBox::title {
 
 /* Buttons */
 QPushButton {
-    background: #4361ee;
-    color: white;
+    background-color: #2563eb !important;
+    color: #ffffff !important;
     border: none;
     border-radius: 6px;
     padding: 9px 22px;
-    font-weight: 600;
+    font-weight: 700;
     font-size: 12px;
-    min-height: 20px;
+    min-height: 22px;
 }
 
 QPushButton:hover {
-    background: #3a56d4;
+    background-color: #1d4ed8 !important;
+    color: #ffffff !important;
 }
 
 QPushButton:pressed {
-    background: #2f4ab8;
+    background-color: #1e40af !important;
+    color: #ffffff !important;
 }
 
 QPushButton:disabled {
-    background: #b0b8c8;
-    color: #eee;
+    background-color: #94a3b8 !important;
+    color: #f8fafc !important;
 }
 
 QPushButton[danger="true"] {
