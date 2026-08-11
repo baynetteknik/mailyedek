@@ -23,6 +23,8 @@ class ProHeaderView(QHeaderView):
     """Custom Header View with right-click column visibility menu."""
     
     column_visibility_changed = Signal(int, bool)
+    save_requested = Signal()
+    reset_requested = Signal()
 
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
@@ -74,6 +76,13 @@ class ProHeaderView(QHeaderView):
 
             action.triggered.connect(_toggle)
             menu.addAction(action)
+
+        menu.addSeparator()
+        act_save = menu.addAction("💾 Sütun Düzenini Kaydet")
+        act_save.triggered.connect(self.save_requested.emit)
+        
+        act_reset = menu.addAction("🔄 Varsayılan Düzene Sıfırla")
+        act_reset.triggered.connect(self.reset_requested.emit)
 
         menu.exec(QCursor.pos())
 
@@ -191,6 +200,8 @@ class ProGridWidget(QWidget):
                 color: #0f172a;
             }
         """)
+        custom_header.save_requested.connect(self.save_grid_state)
+        custom_header.reset_requested.connect(self.reset_grid_state)
         self.table.setHorizontalHeader(custom_header)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(48)  # Generous row height for readability

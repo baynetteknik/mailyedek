@@ -211,3 +211,13 @@ class ThreePanelWorkspaceTemplate(QWidget):
                 self.splitter.setSizes(state)
         except Exception:
             pass
+
+
+class DiaThreePanelWorkspace(ThreePanelWorkspaceTemplate):
+    """
+    Standard DIA-Style 3-Panel Workspace architecture component.
+    Provides Left Filter Panel, Center Pro Grid Panel, and Right Action/Log Panel.
+    """
+    def __init__(self, title: str = "DIA Workspace", parent=None):
+        super().__init__(title=title, parent=parent)
+

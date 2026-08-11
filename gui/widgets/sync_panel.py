@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from core.mail_engine import MailEngine
 from core.settings import AppSettings
+from gui.widgets.pro_grid_widget import ProHeaderView
 
 logger = logging.getLogger(__name__)
 
@@ -1643,14 +1644,20 @@ class SyncPanel(QWidget):
 
         self.account_table = QTableWidget()
         self.account_table.setColumnCount(4)
+        header = ProHeaderView(Qt.Horizontal, self.account_table)
+        header.setSectionsMovable(True)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.save_requested.connect(self._save_grid_state)
+        header.reset_requested.connect(self._reset_grid_state)
+        self.account_table.setHorizontalHeader(header)
         self.account_table.setHorizontalHeaderLabels([
             "Sync", "Account Details", "Archiving Status & Progress", "Actions"
         ])
-        self.account_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.account_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.account_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.account_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.account_table.verticalHeader().setDefaultSectionSize(54)
+        self.account_table.setColumnWidth(0, 70)
+        self.account_table.setColumnWidth(1, 400)
+        self.account_table.setColumnWidth(2, 320)
+        self.account_table.setColumnWidth(3, 150)
+        self.account_table.verticalHeader().setDefaultSectionSize(92)
         self.account_table.verticalHeader().setVisible(False)
         self.account_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.account_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -3118,11 +3125,11 @@ class SyncPanel(QWidget):
                 except Exception:
                     pass
 
-                # Column 1: Account details (name + email + group badge)
+                # Column 1: Account details (name + email + stats in 3 distinct well-spaced lines)
                 info_widget = QWidget()
                 info_layout = QVBoxLayout(info_widget)
-                info_layout.setContentsMargins(6, 4, 6, 4)
-                info_layout.setSpacing(2)
+                info_layout.setContentsMargins(10, 8, 10, 8)
+                info_layout.setSpacing(6)
                 
                 g_val = acc.get("account_group", "").strip()
                 if not g_val and "@" in acc.get("email", ""):
@@ -3131,12 +3138,17 @@ class SyncPanel(QWidget):
                 group_badge = f"<span style='background-color:#e0e7ff; color:#4361ee; font-weight:bold; font-size:10px; padding:2px 6px; border-radius:4px;'>📁 {g_val}</span>" if g_val else ""
 
                 lbl_label = QLabel(f"<b>{acc['label']}</b>  {group_badge}")
-                lbl_label.setStyleSheet("color: #1e293b; font-size: 12px;")
-                lbl_email = QLabel(f"{acc['email']}  |  📁 {folders_cnt} klasör  |  📧 {local_mails_cnt} arşivlenmiş")
-                lbl_email.setStyleSheet("color: #64748b; font-size: 11px;")
+                lbl_label.setStyleSheet("color: #0f172a; font-size: 13px; font-weight: 700; padding-bottom: 2px;")
+                
+                lbl_email = QLabel(f"✉️ {acc['email']}")
+                lbl_email.setStyleSheet("color: #334155; font-size: 11.5px; font-weight: 500; padding-bottom: 2px;")
+                
+                lbl_stats = QLabel(f"📂 <b>{folders_cnt}</b> Klasör   •   📧 <b>{local_mails_cnt:,}</b> Arşivlenmiş Mail")
+                lbl_stats.setStyleSheet("color: #64748b; font-size: 10.5px; font-weight: 500;")
                 
                 info_layout.addWidget(lbl_label)
                 info_layout.addWidget(lbl_email)
+                info_layout.addWidget(lbl_stats)
                 self.account_table.setCellWidget(i, 1, info_widget)
                 
                 # Column 2: Progress status + progress bar
@@ -3249,6 +3261,44 @@ class SyncPanel(QWidget):
                 ui["btn_stop"].setEnabled(True)
             self.btn_cancel.setEnabled(True)
             self.btn_pause.setEnabled(True)
+
+        self._load_grid_state()
+
+    def _save_grid_state(self):
+        if not self.settings:
+            return
+        state = {
+            "hidden_columns": [c for c in range(self.account_table.columnCount()) if self.account_table.isColumnHidden(c)],
+            "column_widths": [self.account_table.columnWidth(c) for c in range(self.account_table.columnCount())]
+        }
+        self.settings.set("grid_state_sync_account_table", state)
+        self.settings.save()
+        QMessageBox.information(self, "Grid Düzeni Kaydedildi", "Hesap tablosu sütun görünürlük ve genişlik tercihleri başarıyla kaydedildi.")
+
+    def _load_grid_state(self):
+        if not self.settings:
+            return
+        state = self.settings.get("grid_state_sync_account_table", None)
+        if state and isinstance(state, dict):
+            hidden = state.get("hidden_columns", [])
+            widths = state.get("column_widths", [])
+            for c in range(self.account_table.columnCount()):
+                if c < len(widths) and widths[c] > 10:
+                    self.account_table.setColumnWidth(c, widths[c])
+                self.account_table.setColumnHidden(c, c in hidden)
+
+    def _reset_grid_state(self):
+        for c in range(self.account_table.columnCount()):
+            self.account_table.setColumnHidden(c, False)
+        self.account_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.account_table.setColumnWidth(0, 70)
+        self.account_table.setColumnWidth(1, 400)
+        self.account_table.setColumnWidth(2, 320)
+        self.account_table.setColumnWidth(3, 150)
+        if self.settings:
+            self.settings.set("grid_state_sync_account_table", None)
+            self.settings.save()
+        QMessageBox.information(self, "Grid Sıfırlandı", "Tablo sütunları varsayılan genişlik ve görünürlüğe sıfırlandı.")
 
     # ------------------------------------------------------------------
     # Group Sidebar Filtering Slots & Helpers
