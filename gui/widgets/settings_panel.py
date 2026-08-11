@@ -32,12 +32,16 @@ class SettingsPanel(QWidget):
     """Main Settings and Diagnostic Workspace Panel."""
 
     _log_signal = Signal(str)
+    _git_done_signal = Signal(bool, str)
+    _setup_done_signal = Signal(bool, str)
 
     def __init__(self, settings: AppSettings, engine: Optional[MailEngine] = None, parent=None):
         super().__init__(parent)
         self.settings = settings
         self.engine = engine
         self._listener_thread: Optional[PortListenerThread] = None
+        self._git_done_signal.connect(self._on_git_done)
+        self._setup_done_signal.connect(self._on_setup_done)
         self._setup_ui()
         self.refresh()
 
@@ -728,42 +732,66 @@ class SettingsPanel(QWidget):
         msg_box.setIcon(QMessageBox.Information)
         msg_box.setText(text)
         msg_box.setStandardButtons(QMessageBox.Ok)
-        ok_btn = msg_box.button(QMessageBox.Ok)
-        if ok_btn:
-            ok_btn.setText("Tamam")
-            ok_btn.setCursor(Qt.PointingHandCursor)
-            ok_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #2563eb !important;
-                    color: #ffffff !important;
-                    font-weight: bold !important;
-                    font-size: 13px !important;
-                    border: none !important;
-                    border-radius: 6px !important;
-                    padding: 8px 24px !important;
-                    min-width: 95px !important;
-                    min-height: 28px !important;
-                }
-                QPushButton:hover {
-                    background-color: #1d4ed8 !important;
-                    color: #ffffff !important;
-                }
-                QPushButton:pressed {
-                    background-color: #1e40af !important;
-                    color: #ffffff !important;
-                }
-            """)
+        
         msg_box.setStyleSheet("""
             QMessageBox {
                 background-color: #ffffff;
             }
             QLabel {
-                color: #0f172a;
-                font-size: 13px;
-                font-weight: 600;
+                color: #0f172a !important;
+                font-size: 13px !important;
+                font-weight: 600 !important;
+                background-color: transparent !important;
+            }
+            QPushButton {
+                background-color: #2563eb !important;
+                color: #ffffff !important;
+                font-weight: bold !important;
+                font-size: 13px !important;
+                border: none !important;
+                border-radius: 6px !important;
+                padding: 8px 24px !important;
+                min-width: 95px !important;
+                min-height: 28px !important;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8 !important;
+                color: #ffffff !important;
+            }
+            QPushButton:pressed {
+                background-color: #1e40af !important;
+                color: #ffffff !important;
             }
         """)
+
+        ok_btn = msg_box.button(QMessageBox.Ok)
+        if ok_btn:
+            ok_btn.setText("Tamam")
+            ok_btn.setCursor(Qt.PointingHandCursor)
+
         msg_box.exec()
+
+    @Slot(bool, str)
+    def _on_git_done(self, ok: bool, res_msg: str):
+        from core.version import get_git_info
+        if ok:
+            self.text_ver_log.append(res_msg)
+            self._show_styled_info_dialog("Git İşlemi Başarılı", res_msg)
+        else:
+            self.text_ver_log.append(f"❌ {res_msg}")
+            QMessageBox.warning(self, "Git İşlemi Uyarısı", res_msg)
+        
+        info = get_git_info()
+        self.lbl_git_branch.setText(f"{info['branch']}  ({info['commit']})")
+
+    @Slot(bool, str)
+    def _on_setup_done(self, ok: bool, res_msg: str):
+        if ok:
+            self.text_ver_log.append(f"✅ Setup Paketi Derlendi: {res_msg}")
+            self._show_styled_info_dialog("Setup Derleme Başarılı", f"Paket üretildi:\ninstaller/{res_msg}")
+        else:
+            self.text_ver_log.append(f"❌ Derleme Hatası:\n{res_msg[:300]}")
+            QMessageBox.critical(self, "Derleme Hatası", res_msg[:500])
 
     @Slot()
     def _save_git_config(self):
@@ -804,21 +832,13 @@ class SettingsPanel(QWidget):
     @Slot()
     def _commit_and_push_git(self):
         import threading
-        from core.version import git_commit_and_push, get_git_info
+        from core.version import git_commit_and_push
         msg = self.input_commit_msg.text().strip()
         self.text_ver_log.append("⏳ Git commit & push başlatılıyor... Lütfen bekleyin...")
 
         def _worker():
             ok, res_msg = git_commit_and_push(msg)
-            if ok:
-                self.text_ver_log.append(res_msg)
-                self._show_styled_info_dialog("Git İşlemi Başarılı", res_msg)
-            else:
-                self.text_ver_log.append(f"❌ {res_msg}")
-                QMessageBox.warning(self, "Git İşlemi Uyarısı", res_msg)
-            
-            info = get_git_info()
-            self.lbl_git_branch.setText(f"{info['branch']}  ({info['commit']})")
+            self._git_done_signal.emit(ok, res_msg)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -836,13 +856,12 @@ class SettingsPanel(QWidget):
                 res = subprocess.run([sys.executable, str(script_file)], cwd=repo_root, capture_output=True, text=True, timeout=120)
                 out = res.stdout + "\n" + res.stderr
                 if res.returncode == 0:
-                    self.text_ver_log.append(f"✅ Setup Paketi Derlendi: MailArchiveSystem_v{v}_Kurulum_Paketi.zip")
-                    self._show_styled_info_dialog("Setup Derleme Başarılı", f"Paket üretildi:\ninstaller/MailArchiveSystem_v{v}_Kurulum_Paketi.zip")
+                    pkg_name = f"MailArchiveSystem_v{v}_Kurulum_Paketi.zip"
+                    self._setup_done_signal.emit(True, pkg_name)
                 else:
-                    self.text_ver_log.append(f"❌ Derleme Hatası:\n{out[:300]}")
-                    QMessageBox.critical(self, "Derleme Hatası", out[:500])
+                    self._setup_done_signal.emit(False, out)
             except Exception as exc:
-                self.text_ver_log.append(f"❌ Derleme İşlem Hatası: {exc}")
+                self._setup_done_signal.emit(False, str(exc))
 
         import threading
         threading.Thread(target=run_b, daemon=True).start()
