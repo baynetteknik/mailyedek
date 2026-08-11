@@ -722,6 +722,49 @@ class SettingsPanel(QWidget):
         self.input_commit_msg.setPlaceholderText(f"v{new_v} için değişiklik açıklaması...")
         self.text_ver_log.append(f"📈 Uygulama versiyonu v{new_v} olarak güncellendi.")
 
+    def _show_styled_info_dialog(self, title: str, text: str):
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(title)
+        msg_box.setIcon(QMessageBox.Information)
+        msg_box.setText(text)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        ok_btn = msg_box.button(QMessageBox.Ok)
+        if ok_btn:
+            ok_btn.setText("Tamam")
+            ok_btn.setCursor(Qt.PointingHandCursor)
+            ok_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #2563eb !important;
+                    color: #ffffff !important;
+                    font-weight: bold !important;
+                    font-size: 13px !important;
+                    border: none !important;
+                    border-radius: 6px !important;
+                    padding: 8px 24px !important;
+                    min-width: 95px !important;
+                    min-height: 28px !important;
+                }
+                QPushButton:hover {
+                    background-color: #1d4ed8 !important;
+                    color: #ffffff !important;
+                }
+                QPushButton:pressed {
+                    background-color: #1e40af !important;
+                    color: #ffffff !important;
+                }
+            """)
+        msg_box.setStyleSheet("""
+            QMessageBox {
+                background-color: #ffffff;
+            }
+            QLabel {
+                color: #0f172a;
+                font-size: 13px;
+                font-weight: 600;
+            }
+        """)
+        msg_box.exec()
+
     @Slot()
     def _save_git_config(self):
         import subprocess
@@ -741,7 +784,7 @@ class SettingsPanel(QWidget):
             except Exception as e:
                 self.text_ver_log.append(f"⚠️ Remote güncelleme uyarısı: {e}")
 
-        QMessageBox.information(self, "Kaydedildi", "Git remote ve branch ayarları başarıyla kaydedildi.")
+        self._show_styled_info_dialog("Kaydedildi", "Git remote ve branch ayarları başarıyla kaydedildi.")
 
     @Slot()
     def _delete_git_remote(self):
@@ -754,7 +797,7 @@ class SettingsPanel(QWidget):
                 self.settings.set("git_remote_url", "")
                 self.settings.save()
                 self.text_ver_log.append("✅ Git remote 'origin' bağlantısı kaldırıldı.")
-                QMessageBox.information(self, "Silindi", "Git remote bağlantısı silindi.")
+                self._show_styled_info_dialog("Silindi", "Git remote bağlantısı silindi.")
             except Exception as e:
                 QMessageBox.critical(self, "Hata", f"Remote silinemedi: {e}")
 
@@ -769,7 +812,7 @@ class SettingsPanel(QWidget):
             ok, res_msg = git_commit_and_push(msg)
             if ok:
                 self.text_ver_log.append(res_msg)
-                QMessageBox.information(self, "Git İşlemi Başarılı", res_msg)
+                self._show_styled_info_dialog("Git İşlemi Başarılı", res_msg)
             else:
                 self.text_ver_log.append(f"❌ {res_msg}")
                 QMessageBox.warning(self, "Git İşlemi Uyarısı", res_msg)
@@ -794,7 +837,7 @@ class SettingsPanel(QWidget):
                 out = res.stdout + "\n" + res.stderr
                 if res.returncode == 0:
                     self.text_ver_log.append(f"✅ Setup Paketi Derlendi: MailArchiveSystem_v{v}_Kurulum_Paketi.zip")
-                    QMessageBox.information(self, "Setup Derleme Başarılı", f"Paket üretildi:\ninstaller/MailArchiveSystem_v{v}_Kurulum_Paketi.zip")
+                    self._show_styled_info_dialog("Setup Derleme Başarılı", f"Paket üretildi:\ninstaller/MailArchiveSystem_v{v}_Kurulum_Paketi.zip")
                 else:
                     self.text_ver_log.append(f"❌ Derleme Hatası:\n{out[:300]}")
                     QMessageBox.critical(self, "Derleme Hatası", out[:500])
