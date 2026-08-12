@@ -97,6 +97,7 @@ class MailEngine:
         )
         self.export_usecase = ExportUseCase(
             db=self.db,
+            audit_repo=self.audit,
         )
 
         logger.info("MailEngine initialized")
@@ -154,6 +155,114 @@ class MailEngine:
             if "password_enc" in acc:
                 del acc["password_enc"]
         return accounts
+
+    def update_account(self, account_id: int, **kwargs) -> None:
+        """Update account details. Handles server migration detection and audit log chaining."""
+        old_acc = self.accounts.get(account_id)
+        if not old_acc:
+            raise ValueError(f"Account {account_id} not found")
+
+        old_host = old_acc.get("imap_host", "")
+        new_host = kwargs.get("imap_host")
+        host_changed = new_host and new_host != old_host
+
+        # Encrypt raw credentials if provided
+        if "username" in kwargs:
+            kwargs["username_enc"] = self.crypto.encrypt(kwargs.pop("username"))
+        if "password" in kwargs:
+            kwargs["password_enc"] = self.crypto.encrypt(kwargs.pop("password"))
+
+        self.accounts.update(account_id, **kwargs)
+
+        if host_changed:
+            self.db.reset_account_sync_state(account_id, reason=f"Server host changed from {old_host} to {new_host}")
+            self.audit.append("account.server_changed", account_id=account_id, details={
+                "old_host": old_host,
+                "new_host": new_host,
+                "email": old_acc.get("email", ""),
+                "action": "server_migration",
+            })
+            logger.info("Account %d IMAP host changed: '%s' -> '%s'. Sync state reset for server migration.",
+                        account_id, old_host, new_host)
+        else:
+            self.audit.append("account.updated", account_id=account_id, details=kwargs)
+
+    def reset_account_sync_state(self, account_id: int, reason: str = "server_migration") -> int:
+        """Reset sync state for account to force a complete re-sync from server."""
+        count = self.db.reset_account_sync_state(account_id, reason=reason)
+        self.audit.append("account.sync_state_reset", account_id=account_id, details={"reason": reason, "folders_reset": count})
+        return count
+
+    # ------------------------------------------------------------------
+    # Server Profiles Management (Multi-Server Endpoints)
+    # ------------------------------------------------------------------
+
+    def add_server_profile(self, account_id: int, profile_name: str, imap_host: str,
+                           imap_port: int = 993, use_ssl: bool = True,
+                           username: str = None, password: str = None,
+                           make_default: bool = False) -> int:
+        """Add a new server profile (endpoint) for an account."""
+        acc = self.accounts.get(account_id)
+        if not acc:
+            raise ValueError(f"Account {account_id} not found")
+
+        if username is None:
+            username = acc.get("email", "")
+        if password is None:
+            password = ""
+
+        username_enc = self.crypto.encrypt(username)
+        password_enc = self.crypto.encrypt(password)
+
+        prof_id = self.db.add_server_profile(
+            account_id=account_id,
+            profile_name=profile_name,
+            imap_host=imap_host,
+            imap_port=imap_port,
+            use_ssl=use_ssl,
+            username_enc=username_enc,
+            password_enc=password_enc,
+            make_default=make_default,
+        )
+
+        self.audit.append("account.server_profile_added", account_id=account_id, details={
+            "profile_id": prof_id,
+            "profile_name": profile_name,
+            "imap_host": imap_host,
+            "make_default": make_default,
+        })
+        return prof_id
+
+    def list_server_profiles(self, account_id: int) -> List[Dict[str, Any]]:
+        """Return all server profiles configured for an account with decrypted usernames."""
+        profiles = self.db.get_server_profiles(account_id)
+        for p in profiles:
+            try:
+                if "username_enc" in p and p["username_enc"]:
+                    p["username"] = self.crypto.decrypt(p["username_enc"])
+                p.pop("username_enc", None)
+            except Exception:
+                p["username"] = "(decryption error)"
+            p.pop("password_enc", None)
+        return profiles
+
+    def set_default_server_profile(self, account_id: int, profile_id: int) -> None:
+        """Set the active default server profile for an account."""
+        self.db.set_default_server_profile(account_id, profile_id)
+        profs = self.db.get_server_profiles(account_id)
+        active_prof = next((p for p in profs if p["id"] == profile_id), None)
+        active_host = active_prof["imap_host"] if active_prof else "unknown"
+        self.audit.append("account.default_server_changed", account_id=account_id, details={
+            "profile_id": profile_id,
+            "active_host": active_host,
+        })
+
+    def delete_server_profile(self, account_id: int, profile_id: int) -> None:
+        """Delete a server profile from an account."""
+        self.db.delete_server_profile(account_id, profile_id)
+        self.audit.append("account.server_profile_deleted", account_id=account_id, details={
+            "profile_id": profile_id,
+        })
 
     def remove_account(self, account_id: int) -> None:
         self.accounts.delete(account_id)
@@ -358,8 +467,9 @@ class MailEngine:
                      imap_port: Optional[int] = None,
                      imap_ssl: bool = True,
                      imap_username: Optional[str] = None,
-                     imap_password: Optional[str] = None) -> Dict[str, Any]:
-        """Export mails from an account with optional folder and date filtering."""
+                     imap_password: Optional[str] = None,
+                     server_host: Optional[str] = None) -> Dict[str, Any]:
+        """Export mails from an account with optional folder, server_host and date filtering."""
         return self.export_usecase.export_mails(
             account_id=account_id,
             format_type=format_type,
@@ -372,7 +482,8 @@ class MailEngine:
             imap_port=imap_port,
             imap_ssl=imap_ssl,
             imap_username=imap_username,
-            imap_password=imap_password
+            imap_password=imap_password,
+            server_host=server_host,
         )
 
     def generate_custom_report(self, account_id: Optional[int] = None,

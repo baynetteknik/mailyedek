@@ -225,8 +225,23 @@ class DatabaseManager:
                     ON sync_state(account_id, folder);
                 CREATE INDEX IF NOT EXISTS idx_audit_action_ts
                     ON audit_log(action, timestamp DESC);
+
+                -- Account Server Profiles (Multiple IMAP Endpoints per Account)
+                CREATE TABLE IF NOT EXISTS account_server_profiles (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    profile_name    TEXT NOT NULL,
+                    imap_host       TEXT NOT NULL,
+                    imap_port       INTEGER NOT NULL DEFAULT 993,
+                    use_ssl         INTEGER NOT NULL DEFAULT 1,
+                    username_enc    TEXT NOT NULL,
+                    password_enc    TEXT NOT NULL,
+                    is_default      INTEGER NOT NULL DEFAULT 0,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_server_profiles_account
+                    ON account_server_profiles(account_id);
             """)
-            # Self-healing column addition for existing databases
             try:
                 conn.execute("ALTER TABLE accounts ADD COLUMN export_subfolder TEXT DEFAULT ''")
             except sqlite3.OperationalError as exc:
@@ -237,6 +252,35 @@ class DatabaseManager:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     logger.warning("Failed to add account_group column to accounts: %s", exc)
+            try:
+                conn.execute("ALTER TABLE mail_metadata ADD COLUMN server_host TEXT DEFAULT ''")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    logger.warning("Failed to add server_host column to mail_metadata: %s", exc)
+            try:
+                conn.execute("ALTER TABLE sync_state ADD COLUMN server_host TEXT DEFAULT ''")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    logger.warning("Failed to add server_host column to sync_state: %s", exc)
+
+            # Self-healing: Ensure every existing account has at least 1 server profile in account_server_profiles
+            try:
+                accs = conn.execute("SELECT * FROM accounts").fetchall()
+                for acc in accs:
+                    existing_p = conn.execute(
+                        "SELECT id FROM account_server_profiles WHERE account_id=?", (acc["id"],)
+                    ).fetchone()
+                    if not existing_p:
+                        p_name = f"{acc['imap_host']} (Varsayılan)"
+                        conn.execute(
+                            """INSERT INTO account_server_profiles
+                               (account_id, profile_name, imap_host, imap_port, use_ssl, username_enc, password_enc, is_default)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+                            (acc["id"], p_name, acc["imap_host"], acc["imap_port"], acc["use_ssl"], acc["username_enc"], acc["password_enc"])
+                        )
+            except Exception as p_err:
+                logger.warning("Self-healing server profiles failed: %s", p_err)
+
             logger.info("Database schema initialized at %s", self._db_path)
 
     # ------------------------------------------------------------------
@@ -253,7 +297,117 @@ class DatabaseManager:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (label, email, imap_host, imap_port, int(use_ssl), username_enc, password_enc, export_subfolder, account_group)
             )
-            return cur.lastrowid
+            acc_id = cur.lastrowid
+            # Create default server profile
+            p_name = f"{imap_host} (Varsayılan)"
+            conn.execute(
+                """INSERT INTO account_server_profiles
+                   (account_id, profile_name, imap_host, imap_port, use_ssl, username_enc, password_enc, is_default)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+                (acc_id, p_name, imap_host, imap_port, int(use_ssl), username_enc, password_enc)
+            )
+            return acc_id
+
+    # ------------------------------------------------------------------
+    # Server profile operations (Multi-Server Endpoints)
+    # ------------------------------------------------------------------
+
+    def add_server_profile(self, account_id: int, profile_name: str, imap_host: str,
+                           imap_port: int, use_ssl: bool, username_enc: str, password_enc: str,
+                           make_default: bool = False) -> int:
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT COUNT(*) as cnt FROM account_server_profiles WHERE account_id=?", (account_id,)
+            ).fetchone()
+            is_first = (existing["cnt"] == 0)
+            should_be_default = 1 if (make_default or is_first) else 0
+
+            if should_be_default:
+                conn.execute(
+                    "UPDATE account_server_profiles SET is_default=0 WHERE account_id=?", (account_id,)
+                )
+
+            cur = conn.execute(
+                """INSERT INTO account_server_profiles
+                   (account_id, profile_name, imap_host, imap_port, use_ssl, username_enc, password_enc, is_default)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (account_id, profile_name, imap_host, imap_port, int(use_ssl), username_enc, password_enc, should_be_default)
+            )
+            prof_id = cur.lastrowid
+
+            if should_be_default:
+                conn.execute(
+                    """UPDATE accounts SET imap_host=?, imap_port=?, use_ssl=?, username_enc=?, password_enc=?
+                       WHERE id=?""",
+                    (imap_host, imap_port, int(use_ssl), username_enc, password_enc, account_id)
+                )
+            return prof_id
+
+    def get_server_profiles(self, account_id: int) -> List[Dict[str, Any]]:
+        with self.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM account_server_profiles WHERE account_id=? ORDER BY is_default DESC, id ASC",
+                (account_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_active_server_profile(self, account_id: int) -> Optional[Dict[str, Any]]:
+        with self.get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM account_server_profiles WHERE account_id=? AND is_default=1 LIMIT 1",
+                (account_id,)
+            ).fetchone()
+            if not row:
+                row = conn.execute(
+                    "SELECT * FROM account_server_profiles WHERE account_id=? ORDER BY id ASC LIMIT 1",
+                    (account_id,)
+                ).fetchone()
+            return dict(row) if row else None
+
+    def set_default_server_profile(self, account_id: int, profile_id: int) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE account_server_profiles SET is_default=0 WHERE account_id=?", (account_id,)
+            )
+            conn.execute(
+                "UPDATE account_server_profiles SET is_default=1 WHERE id=? AND account_id=?",
+                (profile_id, account_id)
+            )
+            prof = conn.execute(
+                "SELECT * FROM account_server_profiles WHERE id=?", (profile_id,)
+            ).fetchone()
+            if prof:
+                conn.execute(
+                    """UPDATE accounts SET imap_host=?, imap_port=?, use_ssl=?, username_enc=?, password_enc=?
+                       WHERE id=?""",
+                    (prof["imap_host"], prof["imap_port"], prof["use_ssl"], prof["username_enc"], prof["password_enc"], account_id)
+                )
+
+    def delete_server_profile(self, account_id: int, profile_id: int) -> None:
+        with self.transaction() as conn:
+            prof = conn.execute(
+                "SELECT is_default FROM account_server_profiles WHERE id=? AND account_id=?",
+                (profile_id, account_id)
+            ).fetchone()
+            if not prof:
+                return
+
+            was_default = bool(prof["is_default"])
+            conn.execute("DELETE FROM account_server_profiles WHERE id=?", (profile_id,))
+
+            if was_default:
+                remaining = conn.execute(
+                    "SELECT id, imap_host, imap_port, use_ssl, username_enc, password_enc "
+                    "FROM account_server_profiles WHERE account_id=? ORDER BY id ASC LIMIT 1",
+                    (account_id,)
+                ).fetchone()
+                if remaining:
+                    conn.execute("UPDATE account_server_profiles SET is_default=1 WHERE id=?", (remaining["id"],))
+                    conn.execute(
+                        """UPDATE accounts SET imap_host=?, imap_port=?, use_ssl=?, username_enc=?, password_enc=?
+                           WHERE id=?""",
+                        (remaining["imap_host"], remaining["imap_port"], remaining["use_ssl"], remaining["username_enc"], remaining["password_enc"], account_id)
+                    )
 
     def get_account(self, account_id: int) -> Optional[Dict[str, Any]]:
         with self.get_conn() as conn:
@@ -295,11 +449,19 @@ class DatabaseManager:
                              **fields) -> int:
         """Insert or update mail metadata. Returns the mail_metadata.id."""
         fields.setdefault("fetched_at", datetime.utcnow().isoformat())
+        server_host = fields.get("server_host", "")
         with self.transaction() as conn:
-            existing = conn.execute(
-                "SELECT id FROM mail_metadata WHERE account_id=? AND folder=? AND uid=?",
-                (account_id, folder, uid)
-            ).fetchone()
+            if server_host:
+                existing = conn.execute(
+                    "SELECT id FROM mail_metadata WHERE account_id=? AND folder=? AND uid=? AND server_host=?",
+                    (account_id, folder, uid, server_host)
+                ).fetchone()
+            else:
+                existing = conn.execute(
+                    "SELECT id FROM mail_metadata WHERE account_id=? AND folder=? AND uid=?",
+                    (account_id, folder, uid)
+                ).fetchone()
+
             if existing:
                 set_clause = ", ".join(f"{k} = ?" for k in fields)
                 values = list(fields.values()) + [existing["id"]]
@@ -315,12 +477,18 @@ class DatabaseManager:
                 )
                 return cur.lastrowid
 
-    def get_mail_by_uid(self, account_id: int, folder: str, uid: int) -> Optional[Dict[str, Any]]:
+    def get_mail_by_uid(self, account_id: int, folder: str, uid: int, server_host: str = "") -> Optional[Dict[str, Any]]:
         with self.get_conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM mail_metadata WHERE account_id=? AND folder=? AND uid=?",
-                (account_id, folder, uid)
-            ).fetchone()
+            if server_host:
+                row = conn.execute(
+                    "SELECT * FROM mail_metadata WHERE account_id=? AND folder=? AND uid=? AND server_host=?",
+                    (account_id, folder, uid, server_host)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM mail_metadata WHERE account_id=? AND folder=? AND uid=?",
+                    (account_id, folder, uid)
+                ).fetchone()
             return dict(row) if row else None
 
     def get_mails_for_account(self, account_id: int, folder: str = "INBOX",
@@ -328,7 +496,7 @@ class DatabaseManager:
         with self.get_conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM mail_metadata WHERE account_id=? AND folder=? AND is_deleted=0 "
-                "ORDER BY uid DESC LIMIT ? OFFSET ?",
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
                 (account_id, folder, limit, offset)
             ).fetchall()
             return [dict(r) for r in rows]
@@ -350,19 +518,36 @@ class DatabaseManager:
             return dict(row) if row else None
 
     def update_sync_state(self, account_id: int, folder: str,
-                          last_uid: int, uid_validity: int, mail_count: int) -> None:
+                          last_uid: int, uid_validity: int, mail_count: int,
+                          server_host: str = "") -> None:
         with self.transaction() as conn:
             conn.execute(
                 """INSERT INTO sync_state (account_id, folder, last_uid, uid_validity,
-                                           last_sync_at, mail_count)
-                   VALUES (?, ?, ?, ?, datetime('now'), ?)
+                                           last_sync_at, mail_count, server_host)
+                   VALUES (?, ?, ?, ?, datetime('now'), ?, ?)
                    ON CONFLICT(account_id, folder) DO UPDATE SET
                        last_uid=excluded.last_uid,
                        uid_validity=excluded.uid_validity,
                        last_sync_at=excluded.last_sync_at,
-                       mail_count=excluded.mail_count""",
-                (account_id, folder, last_uid, uid_validity, mail_count)
+                       mail_count=excluded.mail_count,
+                       server_host=excluded.server_host""",
+                (account_id, folder, last_uid, uid_validity, mail_count, server_host)
             )
+
+    def reset_account_sync_state(self, account_id: int, reason: str = "server_migration") -> int:
+        """Reset last_uid and uid_validity for an account to force a fresh re-sync of UIDs from a new server,
+        without deleting any previously archived mail_metadata or raw messages.
+        """
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE sync_state SET last_uid = 0, uid_validity = 0, last_sync_at = datetime('now') "
+                "WHERE account_id = ?",
+                (account_id,)
+            )
+            affected = cur.rowcount
+            logger.info("Reset sync state for account %d (affected %d folders, reason: %s)",
+                        account_id, affected, reason)
+            return affected
 
     # ------------------------------------------------------------------
     # Deduplication

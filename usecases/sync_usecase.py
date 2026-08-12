@@ -304,15 +304,32 @@ class SyncUseCase:
             provider._timeout = timeout
 
         try:
-            username = self._crypto.decrypt(acc["username_enc"])
-            password = self._crypto.decrypt(acc["password_enc"])
+            active_profile = self._db.get_active_server_profile(acc["id"])
+            if active_profile:
+                imap_host = active_profile["imap_host"]
+                imap_port = active_profile["imap_port"]
+                use_ssl = bool(active_profile["use_ssl"])
+                username_enc = active_profile["username_enc"]
+                password_enc = active_profile["password_enc"]
+                prof_name = active_profile.get("profile_name", imap_host)
+            else:
+                imap_host = acc["imap_host"]
+                imap_port = acc["imap_port"]
+                use_ssl = bool(acc["use_ssl"])
+                username_enc = acc["username_enc"]
+                password_enc = acc["password_enc"]
+                prof_name = imap_host
 
-            _log(f"[{acc['label']}] Connecting to {acc['imap_host']}:{acc['imap_port']} "
-                 f"(SSL={bool(acc['use_ssl'])})...", log_callback)
+            # Store active host on acc dictionary for sub-methods
+            acc["imap_host"] = imap_host
 
-            if not provider.connect(acc["imap_host"], acc["imap_port"],
-                                    bool(acc["use_ssl"]), username, password):
-                _log(f"[{acc['label']}] CONNECTION FAILED — check host, port, credentials",
+            username = self._crypto.decrypt(username_enc)
+            password = self._crypto.decrypt(password_enc)
+
+            _log(f"[{acc['label']}] Connecting to {prof_name} ({imap_host}:{imap_port}, SSL={use_ssl})...", log_callback)
+
+            if not provider.connect(imap_host, imap_port, use_ssl, username, password):
+                _log(f"[{acc['label']}] CONNECTION FAILED — check host {imap_host}:{imap_port}",
                      log_callback)
                 report.errors = 1
                 return report
@@ -432,20 +449,20 @@ class SyncUseCase:
         display_folder = translate_folder_name(folder_name, folder_lang)
 
         # Count existing archived UIDs and get the list
+        imap_host = acc.get("imap_host", "")
         try:
             with self._db.get_conn() as conn:
-                existing_rows = conn.execute(
-                    "SELECT uid FROM mail_metadata WHERE account_id=? AND (folder=? OR folder=?) AND is_deleted=0",
-                    (account_id, folder_name, display_folder)
-                ).fetchall()
-                archived_uids = {r["uid"] for r in existing_rows}
-                if not archived_uids:
-                    # Fallback count all UIDs for this account
-                    all_rows = conn.execute(
-                        "SELECT uid FROM mail_metadata WHERE account_id=? AND is_deleted=0",
-                        (account_id,)
+                if imap_host:
+                    existing_rows = conn.execute(
+                        "SELECT uid FROM mail_metadata WHERE account_id=? AND (server_host=? OR server_host='') AND (folder=? OR folder=?) AND is_deleted=0",
+                        (account_id, imap_host, folder_name, display_folder)
                     ).fetchall()
-                    archived_uids = {r["uid"] for r in all_rows}
+                else:
+                    existing_rows = conn.execute(
+                        "SELECT uid FROM mail_metadata WHERE account_id=? AND (folder=? OR folder=?) AND is_deleted=0",
+                        (account_id, folder_name, display_folder)
+                    ).fetchall()
+                archived_uids = {r["uid"] for r in existing_rows}
         except Exception:
             archived_uids = set()
 
@@ -559,6 +576,7 @@ class SyncUseCase:
                         has_attachments=int(message.metadata.has_attachments),
                         sha256_hash=sha256,
                         is_duplicate=int(is_dup),
+                        server_host=imap_host,
                     )
 
                     # Store raw content

@@ -17,8 +17,9 @@ from typing import Optional, List, Dict, Any
 logger = logging.getLogger(__name__)
 
 class ExportUseCase:
-    def __init__(self, db):
+    def __init__(self, db, audit_repo=None):
         self._db = db
+        self._audit_repo = audit_repo
 
     def export_mails(self, account_id: int, format_type: str, output_path: Optional[Path] = None,
                      folders: Optional[List[str]] = None,
@@ -29,7 +30,8 @@ class ExportUseCase:
                      imap_port: Optional[int] = None,
                      imap_ssl: bool = True,
                      imap_username: Optional[str] = None,
-                     imap_password: Optional[str] = None) -> Dict[str, Any]:
+                     imap_password: Optional[str] = None,
+                     server_host: Optional[str] = None) -> Dict[str, Any]:
         """Export emails to the chosen format (ZIP, DIRECTORY, JSON, MBOX, IMAP_SERVER)."""
         # Formulate query conditions
         conditions = ["m.account_id = ?", "m.is_deleted = 0"]
@@ -47,6 +49,10 @@ class ExportUseCase:
         if before_date:
             conditions.append("m.date <= ?")
             params.append(before_date)
+
+        if server_host and server_host.strip():
+            conditions.append("(m.server_host = ? OR m.server_host IS NULL OR m.server_host = '')")
+            params.append(server_host.strip())
 
         where_clause = " AND ".join(conditions)
 
@@ -105,6 +111,7 @@ class ExportUseCase:
                     }
 
         exported = 0
+        skipped_duplicates = 0
         errors = 0
 
         # Get export subfolder from accounts table
@@ -198,6 +205,17 @@ class ExportUseCase:
                         date_str = (row["date"] or "").replace(":", "-").replace(" ", "_")[:19]
                         subject = sanitize(row["subject"])
                         file_path = folder_dir / f"{date_str}_{row['uid']}_{subject}.eml"
+                        if file_path.exists():
+                            skipped_duplicates += 1
+                            if progress_callback:
+                                progress_callback(idx + 1, total, {
+                                    "subject": row["subject"],
+                                    "sender": row["sender"],
+                                    "date": row["date"],
+                                    "folder": row["folder"],
+                                    "status": "Zaten Mevcut (Atlandı)"
+                                })
+                            continue
                         file_path.write_bytes(raw)
                         exported += 1
                     else:
@@ -545,6 +563,7 @@ class ExportUseCase:
                                         break
 
                             if is_duplicate_on_server:
+                                skipped_duplicates += 1
                                 if progress_callback:
                                     progress_callback(idx + 1, total, {
                                         "subject": row["subject"],
@@ -589,4 +608,27 @@ class ExportUseCase:
                 except Exception:
                     pass
 
-        return {"total": total, "exported": exported, "errors": errors}
+        if self._audit_repo:
+            try:
+                self._audit_repo.append(
+                    f"export.{format_type.lower()}",
+                    account_id=account_id,
+                    details={
+                        "format": format_type,
+                        "total": total,
+                        "exported": exported,
+                        "skipped_duplicates": skipped_duplicates,
+                        "errors": errors,
+                        "server_host_filter": server_host or "ALL",
+                        "target_path": str(output_path) if output_path else imap_host,
+                    }
+                )
+            except Exception as audit_err:
+                logger.warning("Failed to record export audit log: %s", audit_err)
+
+        return {
+            "total": total,
+            "exported": exported,
+            "skipped_duplicates": skipped_duplicates,
+            "errors": errors
+        }

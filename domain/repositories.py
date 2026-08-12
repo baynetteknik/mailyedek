@@ -78,6 +78,10 @@ class ISyncStateRepository(ABC):
                last_uid: int, uid_validity: int = 0, mail_count: int = 0) -> None:
         self.update(account_id, folder, last_uid, uid_validity, mail_count)
 
+    @abstractmethod
+    def reset_sync_state(self, account_id: int, reason: str = "server_migration") -> int: ...
+
+
 
 class IAttachmentRepository(ABC):
     @abstractmethod

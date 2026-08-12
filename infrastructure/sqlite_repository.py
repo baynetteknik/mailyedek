@@ -101,6 +101,10 @@ class SqliteSyncStateRepository(ISyncStateRepository):
         self._db.update_sync_state(account_id, folder, last_uid,
                                    uid_validity, mail_count)
 
+    def reset_sync_state(self, account_id: int, reason: str = "server_migration") -> int:
+        return self._db.reset_account_sync_state(account_id, reason=reason)
+
+
 
 class SqliteAttachmentRepository(IAttachmentRepository):
     def __init__(self, db: DatabaseManager):

@@ -350,6 +350,18 @@ class ExportConfigDialog(QDialog):
         dates_layout.addWidget(self.date_before)
         dates_form.addRow("Tarih Aralığı:", dates_layout)
 
+        self.combo_server_filter = QComboBox()
+        self.combo_server_filter.addItem("— Tüm Sunuculardan Çekilen Mailler —", None)
+        try:
+            with self.engine.db.get_conn() as conn:
+                hosts = conn.execute("SELECT DISTINCT server_host FROM mail_metadata WHERE server_host IS NOT NULL AND server_host != ''").fetchall()
+                for h in hosts:
+                    if h["server_host"]:
+                        self.combo_server_filter.addItem(f"🖥️ {h['server_host']}", h["server_host"])
+        except Exception:
+            pass
+        dates_form.addRow("Kaynak Sunucu Filtresi:", self.combo_server_filter)
+
         filters_layout.addLayout(dates_form)
 
         self.folder_list = QListWidget()
@@ -1950,6 +1962,7 @@ class ExportPanel(QWidget):
             folders = c.get("folders")
             since_date = c.get("since_date")
             before_date = c.get("before_date")
+            server_host_filter = c.get("server_host")
 
             tasks.append({
                 "acc_id": acc_id,
@@ -1963,6 +1976,7 @@ class ExportPanel(QWidget):
                 "imap_ssl": imap_ssl,
                 "imap_username": imap_username,
                 "imap_password": imap_password,
+                "server_host": server_host_filter,
             })
 
         if not tasks:
@@ -2011,6 +2025,7 @@ class ExportPanel(QWidget):
                             imap_ssl=task["imap_ssl"],
                             imap_username=task["imap_username"],
                             imap_password=task["imap_password"],
+                            server_host=task.get("server_host"),
                         )
                         self._export_done_signal.emit(acc_id, report)
                     except Exception as exc:

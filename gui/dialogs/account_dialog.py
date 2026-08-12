@@ -8,11 +8,13 @@ from typing import Any, Dict, Optional
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Slot, QThread, Signal, QTimer
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
     QLineEdit, QSpinBox, QCheckBox, QPushButton, QLabel,
     QMessageBox, QProgressBar, QDialogButtonBox, QFrame,
-    QComboBox, QFileDialog, QInputDialog,
+    QComboBox, QFileDialog, QInputDialog, QTableWidget,
+    QTableWidgetItem, QHeaderView, QGroupBox,
 )
 
 from core.mail_engine import MailEngine
@@ -339,6 +341,61 @@ class AccountDialog(QDialog):
         form.addLayout(group_layout, 4, 4)
 
         layout.addWidget(form_frame)
+
+        # Multi-Server Endpoints Group Box (Visible in Edit mode or if profiles exist)
+        if self._is_edit and self.account:
+            profiles_group = QGroupBox("Çoklu Sunucu Profilleri (Multi-Server Endpoints)")
+            profiles_group.setStyleSheet("""
+                QGroupBox {
+                    font-weight: bold;
+                    color: #1e293b;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 8px;
+                    margin-top: 6px;
+                    padding-top: 14px;
+                    background: #ffffff;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 4px;
+                    color: #2563eb;
+                }
+            """)
+            p_layout = QVBoxLayout(profiles_group)
+            p_layout.setContentsMargins(10, 10, 10, 10)
+
+            self.table_profiles = QTableWidget()
+            self.table_profiles.setColumnCount(5)
+            self.table_profiles.setHorizontalHeaderLabels(["Aktif", "Profil Adı", "IMAP Host", "Port/SSL", "Kullanıcı Adı"])
+            self.table_profiles.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            self.table_profiles.setSelectionBehavior(QTableWidget.SelectRows)
+            self.table_profiles.setSelectionMode(QTableWidget.SingleSelection)
+            self.table_profiles.setMinimumHeight(120)
+            self.table_profiles.setMaximumHeight(160)
+            self.table_profiles.setStyleSheet("QTableWidget { background: #ffffff; font-size: 11px; border: 1px solid #e2e8f0; }")
+            p_layout.addWidget(self.table_profiles)
+
+            p_btns = QHBoxLayout()
+            self.btn_add_profile = QPushButton("➕ Yeni Sunucu Profili Ekle (Örn: Yandex / Eski Sunucu)")
+            self.btn_add_profile.setStyleSheet("background-color: #10b981 !important; color: white !important; font-weight: bold; padding: 5px 10px;")
+            self.btn_add_profile.clicked.connect(self._add_new_server_profile)
+
+            self.btn_set_default_profile = QPushButton("⭐ Varsayılan (Aktif) Yap")
+            self.btn_set_default_profile.setStyleSheet("background-color: #2563eb !important; color: white !important; font-weight: bold; padding: 5px 10px;")
+            self.btn_set_default_profile.clicked.connect(self._set_selected_profile_as_default)
+
+            self.btn_del_profile = QPushButton("🗑️ Profili Sil")
+            self.btn_del_profile.setStyleSheet("background-color: #ef4444 !important; color: white !important; font-weight: bold; padding: 5px 10px;")
+            self.btn_del_profile.clicked.connect(self._delete_selected_server_profile)
+
+            p_btns.addWidget(self.btn_add_profile)
+            p_btns.addWidget(self.btn_set_default_profile)
+            p_btns.addWidget(self.btn_del_profile)
+            p_btns.addStretch()
+            p_layout.addLayout(p_btns)
+
+            layout.addWidget(profiles_group)
 
         # Fill provider presets combo box
         self._refresh_preset_combo()
@@ -747,6 +804,122 @@ class AccountDialog(QDialog):
                 else:
                     self.input_group.setCurrentText(grp)
 
+            self._refresh_server_profiles_table()
+
+    def _refresh_server_profiles_table(self):
+        if not hasattr(self, "table_profiles") or not self.account:
+            return
+        self.table_profiles.setRowCount(0)
+        profiles = self.engine.list_server_profiles(self.account["id"])
+        self.table_profiles.setRowCount(len(profiles))
+
+        for row, prof in enumerate(profiles):
+            is_def = bool(prof.get("is_default"))
+            item_active = QTableWidgetItem("★ Aktif" if is_def else "")
+            if is_def:
+                item_active.setForeground(QColor("#10b981"))
+                f = item_active.font()
+                f.setBold(True)
+                item_active.setFont(f)
+
+            item_name = QTableWidgetItem(prof.get("profile_name", ""))
+            item_name.setData(Qt.UserRole, prof["id"])
+            item_host = QTableWidgetItem(prof.get("imap_host", ""))
+            ssl_str = "SSL" if prof.get("use_ssl") else "Plain"
+            item_port = QTableWidgetItem(f"{prof.get('imap_port')}/{ssl_str}")
+            item_user = QTableWidgetItem(prof.get("username", ""))
+
+            self.table_profiles.setItem(row, 0, item_active)
+            self.table_profiles.setItem(row, 1, item_name)
+            self.table_profiles.setItem(row, 2, item_host)
+            self.table_profiles.setItem(row, 3, item_port)
+            self.table_profiles.setItem(row, 4, item_user)
+
+    @Slot()
+    def _add_new_server_profile(self):
+        if not self.account:
+            return
+
+        name, ok = QInputDialog.getText(self, "Yeni Sunucu Profili", "Profil Adı (Örn: Yandex Mail, Eski cPanel):")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        host, ok2 = QInputDialog.getText(self, "IMAP Sunucu Adresi", "IMAP Host Adresi (Örn: imap.yandex.com):")
+        if not ok2 or not host.strip():
+            return
+        host = host.strip()
+
+        pwd, ok3 = QInputDialog.getText(self, "Şifre", "Posta Kutusu Şifresi:", QLineEdit.Password)
+        if not ok3:
+            pwd = ""
+
+        try:
+            prof_id = self.engine.add_server_profile(
+                account_id=self.account["id"],
+                profile_name=name,
+                imap_host=host,
+                imap_port=993,
+                use_ssl=True,
+                username=self.account.get("email", ""),
+                password=pwd,
+                make_default=False,
+            )
+            QMessageBox.information(self, "Başarılı", f"'{name}' sunucu profili başarıyla eklendi.")
+            self._refresh_server_profiles_table()
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Profil eklenirken hata oluştu: {e}")
+
+    @Slot()
+    def _set_selected_profile_as_default(self):
+        if not hasattr(self, "table_profiles") or not self.account:
+            return
+        curr_row = self.table_profiles.currentRow()
+        if curr_row < 0:
+            QMessageBox.warning(self, "Seçim Yapılmadı", "Lütfen aktif yapmak istediğiniz sunucu profilini seçin.")
+            return
+
+        item = self.table_profiles.item(curr_row, 1)
+        prof_id = item.data(Qt.UserRole) if item else None
+        if prof_id is None:
+            return
+
+        try:
+            self.engine.set_default_server_profile(self.account["id"], prof_id)
+            QMessageBox.information(self, "Varsayılan Sunucu Değişti", "Seçilen sunucu profili varsayılan (aktif) yapıldı.")
+            self._refresh_server_profiles_table()
+            # Update Host UI input
+            profs = self.engine.list_server_profiles(self.account["id"])
+            active = next((p for p in profs if p["id"] == prof_id), None)
+            if active:
+                self.input_host.setText(active.get("imap_host", ""))
+                self.input_port.setValue(active.get("imap_port", 993))
+                self.input_ssl.setChecked(bool(active.get("use_ssl", True)))
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Aktif profil değiştirilemedi: {e}")
+
+    @Slot()
+    def _delete_selected_server_profile(self):
+        if not hasattr(self, "table_profiles") or not self.account:
+            return
+        curr_row = self.table_profiles.currentRow()
+        if curr_row < 0:
+            QMessageBox.warning(self, "Seçim Yapılmadı", "Lütfen silmek istediğiniz sunucu profilini seçin.")
+            return
+
+        item = self.table_profiles.item(curr_row, 1)
+        prof_id = item.data(Qt.UserRole) if item else None
+        if prof_id is None:
+            return
+
+        reply = QMessageBox.question(self, "Profili Sil", "Seçilen sunucu profilini silmek istediğinizden emin misiniz?")
+        if reply == QMessageBox.Yes:
+            try:
+                self.engine.delete_server_profile(self.account["id"], prof_id)
+                self._refresh_server_profiles_table()
+            except Exception as e:
+                QMessageBox.critical(self, "Hata", f"Profil silinemedi: {e}")
+
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
@@ -795,6 +968,25 @@ class AccountDialog(QDialog):
             if self._is_edit:
                 # Update existing
                 acc_id = self.account["id"]
+                old_host = self.account.get("imap_host", "")
+                host_changed = host and old_host and host != old_host
+
+                if host_changed:
+                    reply = QMessageBox.question(
+                        self,
+                        "Sunucu Değişikliği Tespit Edildi (Server Migration)",
+                        f"Hesabın IMAP sunucu adresi '{old_host}' -> '{host}' olarak değiştiriliyor.\n\n"
+                        "• Arşivdeki eski e-postalarınız korunacaktır.\n"
+                        "• Yeni sunucudaki e-postalar indirilerek var olan maillere eklenecektir (Append/Merge).\n"
+                        "• Çakışan aynı e-postalar otomatik elenecektir (Deduplikasyon).\n"
+                        "• İşlem Denetim İzi (Audit Log) kaydına işlenecektir.\n\n"
+                        "Devam etmek istiyor musunuz?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes
+                    )
+                    if reply != QMessageBox.Yes:
+                        return
+
                 update_data = {
                     "label": label,
                     "email": email_addr,
@@ -805,13 +997,12 @@ class AccountDialog(QDialog):
                     "account_group": account_group,
                 }
                 if username:
-                    update_data["username_enc"] = self.engine.crypto.encrypt(username)
+                    update_data["username"] = username
                 if password:
-                    update_data["password_enc"] = self.engine.crypto.encrypt(password)
+                    update_data["password"] = password
 
-                self.engine.accounts.update(acc_id, **update_data)
-                self.engine.audit.append("account.updated", account_id=acc_id)
-                QMessageBox.information(self, "Success", "Account updated.")
+                self.engine.update_account(acc_id, **update_data)
+                QMessageBox.information(self, "Başarılı", "Hesap bilgileri ve sunucu yapılandırması güncellendi.")
             else:
                 # Add new (or save copied account as new)
                 acc_id = self.engine.add_account(

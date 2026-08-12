@@ -514,16 +514,42 @@ class AccountPanel(QWidget):
         """)
 
         act_edt = menu.addAction("✏️ Hesabı Düzenle (Edit)")
+        act_mig = menu.addAction("🔄 Sunucu Değiştir / Yönet (Multi-Server)")
         act_cpy = menu.addAction("📋 Hesabı Kopyala (Duplicate)")
         act_tst = menu.addAction("🔌 Bağlantı Testi Yap")
         act_flt = menu.addAction("⚙️ Klasör & Filtre Ayarları")
+
+        # Dynamic Server Switcher Sub-menu
+        acc_id_str = self.table.item(row, 0).text() if self.table.item(row, 0) else ""
+        server_actions = {}
+        if acc_id_str.isdigit():
+            acc_id = int(acc_id_str)
+            profiles = self.engine.list_server_profiles(acc_id)
+            if profiles and len(profiles) > 1:
+                menu_servers = menu.addMenu("🔌 Aktif Sunucuyu Seç")
+                menu_servers.setStyleSheet("""
+                    QMenu { background-color: #ffffff; border: 1px solid #cbd5e1; padding: 4px; }
+                    QMenu::item { padding: 6px 16px; font-size: 11px; }
+                    QMenu::item:selected { background-color: #2563eb; color: #ffffff; }
+                """)
+                for p in profiles:
+                    icon_prefix = "★ " if p.get("is_default") else "  "
+                    label_text = f"{icon_prefix}{p.get('profile_name')} ({p.get('imap_host')})"
+                    act_p = menu_servers.addAction(label_text)
+                    server_actions[act_p] = p["id"]
+
         menu.addSeparator()
         act_cp_email = menu.addAction("📋 E-Posta Adresini Kopyala")
         menu.addSeparator()
         act_del = menu.addAction("🗑️ Hesabı Sil")
 
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
-        if action == act_edt:
+        if action in server_actions:
+            prof_id = server_actions[action]
+            acc_id = int(acc_id_str)
+            self.engine.set_default_server_profile(acc_id, prof_id)
+            self.refresh()
+        elif action == act_edt or action == act_mig:
             self._edit_account()
         elif action == act_cpy:
             self._copy_account()
