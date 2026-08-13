@@ -314,29 +314,29 @@ QDialog QLabel, QMessageBox QLabel, QProgressDialog QLabel, QInputDialog QLabel,
     font-weight: 500;
 }
 
-QDialog QPushButton, QMessageBox QPushButton, QProgressDialog QPushButton, QInputDialog QPushButton, QFileDialog QPushButton, QDialogButtonBox QPushButton {
+QDialog QPushButton, QMessageBox QPushButton, QProgressDialog QPushButton, QInputDialog QPushButton, QFileDialog QPushButton, QDialogButtonBox QPushButton, QMessageBox QDialogButtonBox QPushButton, QDialog QDialogButtonBox QPushButton {
     background-color: #2563eb !important;
     color: #ffffff !important;
-    border: none;
-    border-radius: 6px;
-    padding: 8px 20px;
-    min-height: 28px;
-    min-width: 95px;
-    font-weight: 700;
-    font-size: 13px;
+    border: none !important;
+    border-radius: 6px !important;
+    padding: 8px 20px !important;
+    min-height: 28px !important;
+    min-width: 95px !important;
+    font-weight: 700 !important;
+    font-size: 13px !important;
 }
 
-QDialog QPushButton:hover, QMessageBox QPushButton:hover, QProgressDialog QPushButton:hover, QInputDialog QPushButton:hover, QFileDialog QPushButton:hover, QDialogButtonBox QPushButton:hover {
+QDialog QPushButton:hover, QMessageBox QPushButton:hover, QProgressDialog QPushButton:hover, QInputDialog QPushButton:hover, QFileDialog QPushButton:hover, QDialogButtonBox QPushButton:hover, QMessageBox QDialogButtonBox QPushButton:hover, QDialog QDialogButtonBox QPushButton:hover {
     background-color: #1d4ed8 !important;
     color: #ffffff !important;
 }
 
-QDialog QPushButton:pressed, QMessageBox QPushButton:pressed, QProgressDialog QPushButton:pressed, QInputDialog QPushButton:pressed, QFileDialog QPushButton:pressed, QDialogButtonBox QPushButton:pressed {
+QDialog QPushButton:pressed, QMessageBox QPushButton:pressed, QProgressDialog QPushButton:pressed, QInputDialog QPushButton:pressed, QFileDialog QPushButton:pressed, QDialogButtonBox QPushButton:pressed, QMessageBox QDialogButtonBox QPushButton:pressed, QDialog QDialogButtonBox QPushButton:pressed {
     background-color: #1e40af !important;
     color: #ffffff !important;
 }
 
-QDialog QPushButton:disabled, QMessageBox QPushButton:disabled, QProgressDialog QPushButton:disabled, QInputDialog QPushButton:disabled, QFileDialog QPushButton:disabled, QDialogButtonBox QPushButton:disabled {
+QDialog QPushButton:disabled, QMessageBox QPushButton:disabled, QProgressDialog QPushButton:disabled, QInputDialog QPushButton:disabled, QFileDialog QPushButton:disabled, QDialogButtonBox QPushButton:disabled, QMessageBox QDialogButtonBox QPushButton:disabled, QDialog QDialogButtonBox QPushButton:disabled {
     background-color: #94a3b8 !important;
     color: #f8fafc !important;
 }

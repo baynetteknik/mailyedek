@@ -99,7 +99,7 @@ class ReportLoaderWorker(QThread):
                     rows = conn.execute(
                         """SELECT * FROM audit_log 
                            WHERE action IN ('sync.completed', 'backup.s3', 'backup.gdrive', 'restore.s3', 'restore.gdrive') 
-                           ORDER BY timestamp DESC LIMIT 50"""
+                           ORDER BY timestamp DESC LIMIT 500"""
                     ).fetchall()
 
                     for r in rows:
@@ -1731,12 +1731,23 @@ class ReportPanel(QWidget):
         if val == "ALL":
             matched = all_accounts
         elif val.startswith("GROUP:"):
-            grp = val.split("GROUP:")[1]
-            matched = [a for a in all_accounts if str(a.get("account_group", "")).lower() == grp.lower()]
+            grp = val.split("GROUP:")[1].lower()
+            matched = [
+                a for a in all_accounts 
+                if grp == str(a.get("account_group", "")).lower() 
+                or grp in a.get("email", "").lower()
+            ]
         elif val.startswith("DOMAIN:"):
             dom = val.split("DOMAIN:")[1].lower()
             dom_prefix = dom.split(".")[0]
-            matched = [a for a in all_accounts if a.get("email", "").lower().endswith("@" + dom) or dom_prefix in a.get("label", "").lower() or dom_prefix in a.get("email", "").lower()]
+            matched = [
+                a for a in all_accounts 
+                if a.get("email", "").lower().endswith("@" + dom) 
+                or dom in a.get("email", "").lower() 
+                or dom_prefix in a.get("email", "").lower()
+                or dom in str(a.get("account_group", "")).lower()
+                or dom_prefix in str(a.get("account_group", "")).lower()
+            ]
 
         status_filter = self.combo_acc_rep_status.currentText()
 
@@ -2067,7 +2078,7 @@ class ReportPanel(QWidget):
                 ).fetchone()
 
                 row_att = conn.execute(
-                    f"SELECT COUNT(*) as cnt FROM attachments WHERE mail_id IN (SELECT id FROM mail_metadata WHERE account_id IN ({placeholders}))",
+                    f"SELECT COUNT(*) as cnt FROM attachment_links WHERE mail_id IN (SELECT id FROM mail_metadata WHERE account_id IN ({placeholders}))",
                     acc_ids
                 ).fetchone()
 
@@ -2517,7 +2528,12 @@ class ReportPanel(QWidget):
         self.acc_rep_group_filter_list.addItem(item_all4)
         self.acc_rep_group_filter_list.setCurrentItem(item_all4)
 
-        domains_set = set()
+        groups_status = {}
+        settings_groups = self.settings.get("group_domains", []) if hasattr(self, "settings") and self.settings else []
+        for g in settings_groups:
+            name = g if isinstance(g, str) else (g.get("name", "") if isinstance(g, dict) else "")
+            if name and name.strip():
+                groups_status[name.strip()] = True
 
         try:
             accounts = self.engine.list_accounts()
@@ -2525,53 +2541,33 @@ class ReportPanel(QWidget):
                 lbl_str = f"{acc['label']} ({acc['email']})"
                 self.combo_sync_account.addItem(lbl_str, acc["id"])
                 self.combo_custom_account.addItem(lbl_str, acc["id"])
-                if "@" in acc.get("email", ""):
-                    dom = acc["email"].split("@")[-1].strip().lower()
-                    if dom:
-                        domains_set.add(dom)
 
             with self.engine.db.get_conn() as conn:
                 rows = conn.execute("SELECT DISTINCT account_group FROM accounts WHERE account_group IS NOT NULL AND account_group != ''").fetchall()
                 for r in rows:
-                    grp = r["account_group"]
-                    self.combo_custom_group.addItem(grp)
-                    self.combo_sync_group.addItem(grp)
+                    grp = r["account_group"].strip()
+                    if grp:
+                        groups_status[grp] = True
 
-                    item_grp1 = QListWidgetItem(f"📁 Grup: {grp}")
-                    item_grp1.setData(Qt.UserRole, f"GROUP:{grp}")
-                    self.group_filter_list.addItem(item_grp1)
+            for grp in sorted(groups_status.keys()):
+                self.combo_custom_group.addItem(grp)
+                self.combo_sync_group.addItem(grp)
 
-                    item_grp2 = QListWidgetItem(f"📁 Grup: {grp}")
-                    item_grp2.setData(Qt.UserRole, f"GROUP:{grp}")
-                    self.custom_group_filter_list.addItem(item_grp2)
+                item_grp1 = QListWidgetItem(f"📁 {grp}")
+                item_grp1.setData(Qt.UserRole, f"GROUP:{grp}")
+                self.group_filter_list.addItem(item_grp1)
 
-                    item_grp3 = QListWidgetItem(f"📁 Grup: {grp}")
-                    item_grp3.setData(Qt.UserRole, f"GROUP:{grp}")
-                    self.stats_group_filter_list.addItem(item_grp3)
+                item_grp2 = QListWidgetItem(f"📁 {grp}")
+                item_grp2.setData(Qt.UserRole, f"GROUP:{grp}")
+                self.custom_group_filter_list.addItem(item_grp2)
 
-                    item_grp4 = QListWidgetItem(f"📁 Grup: {grp}")
-                    item_grp4.setData(Qt.UserRole, f"GROUP:{grp}")
-                    self.acc_rep_group_filter_list.addItem(item_grp4)
+                item_grp3 = QListWidgetItem(f"📁 {grp}")
+                item_grp3.setData(Qt.UserRole, f"GROUP:{grp}")
+                self.stats_group_filter_list.addItem(item_grp3)
 
-            for dom in sorted(domains_set):
-                if self.combo_sync_group.findText(f"@{dom}") < 0:
-                    self.combo_sync_group.addItem(f"@{dom}")
-                
-                item_dom1 = QListWidgetItem(f"@ Domain: {dom}")
-                item_dom1.setData(Qt.UserRole, f"DOMAIN:{dom}")
-                self.group_filter_list.addItem(item_dom1)
-
-                item_dom2 = QListWidgetItem(f"@ Domain: {dom}")
-                item_dom2.setData(Qt.UserRole, f"DOMAIN:{dom}")
-                self.custom_group_filter_list.addItem(item_dom2)
-
-                item_dom3 = QListWidgetItem(f"@ Domain: {dom}")
-                item_dom3.setData(Qt.UserRole, f"DOMAIN:{dom}")
-                self.stats_group_filter_list.addItem(item_dom3)
-
-                item_dom4 = QListWidgetItem(f"@ Domain: {dom}")
-                item_dom4.setData(Qt.UserRole, f"DOMAIN:{dom}")
-                self.acc_rep_group_filter_list.addItem(item_dom4)
+                item_grp4 = QListWidgetItem(f"📁 {grp}")
+                item_grp4.setData(Qt.UserRole, f"GROUP:{grp}")
+                self.acc_rep_group_filter_list.addItem(item_grp4)
 
             self._load_reports_history()
             self._load_account_reports()

@@ -76,13 +76,17 @@ class AccountDialog(QDialog):
     def _stop_autodiscover_worker(self):
         if self._autodiscover_worker is not None:
             try:
-                self._autodiscover_worker.finished.disconnect()
-            except Exception:
-                pass
-            if self._autodiscover_worker.isRunning():
-                self._autodiscover_worker.quit()
-                self._autodiscover_worker.wait(500)
-            self._autodiscover_worker = None
+                try:
+                    self._autodiscover_worker.finished.disconnect()
+                except Exception:
+                    pass
+                if self._autodiscover_worker.isRunning():
+                    self._autodiscover_worker.quit()
+                    self._autodiscover_worker.wait(500)
+            except Exception as e:
+                logger.debug("Error stopping autodiscover worker: %s", e)
+            finally:
+                self._autodiscover_worker = None
 
     def closeEvent(self, event):
         self._stop_autodiscover_worker()
@@ -91,6 +95,48 @@ class AccountDialog(QDialog):
     def reject(self):
         self._stop_autodiscover_worker()
         super().reject()
+
+    def _show_styled_msg(self, title: str, text: str, icon=QMessageBox.Information, buttons=QMessageBox.Ok):
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(title)
+        msg_box.setIcon(icon)
+        msg_box.setText(text)
+        msg_box.setStandardButtons(buttons)
+        msg_box.setStyleSheet("""
+            QMessageBox {
+                background-color: #ffffff;
+            }
+            QLabel {
+                color: #0f172a !important;
+                font-size: 13px !important;
+                font-weight: 600 !important;
+                background-color: transparent !important;
+            }
+            QPushButton {
+                background-color: #2563eb !important;
+                color: #ffffff !important;
+                font-weight: 700 !important;
+                font-size: 13px !important;
+                border: none !important;
+                border-radius: 6px !important;
+                padding: 8px 24px !important;
+                min-width: 95px !important;
+                min-height: 28px !important;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8 !important;
+                color: #ffffff !important;
+            }
+            QPushButton:pressed {
+                background-color: #1e40af !important;
+                color: #ffffff !important;
+            }
+        """)
+        ok_btn = msg_box.button(QMessageBox.Ok)
+        if ok_btn:
+            ok_btn.setText("Tamam")
+            ok_btn.setCursor(Qt.PointingHandCursor)
+        return msg_box.exec()
 
     def _setup_ui(self):
         if self._is_copy:
@@ -865,10 +911,10 @@ class AccountDialog(QDialog):
                 password=pwd,
                 make_default=False,
             )
-            QMessageBox.information(self, "Başarılı", f"'{name}' sunucu profili başarıyla eklendi.")
+            self._show_styled_msg("Başarılı", f"'{name}' sunucu profili başarıyla eklendi.", icon=QMessageBox.Information)
             self._refresh_server_profiles_table()
         except Exception as e:
-            QMessageBox.critical(self, "Hata", f"Profil eklenirken hata oluştu: {e}")
+            self._show_styled_msg("Hata", f"Profil eklenirken hata oluştu: {e}", icon=QMessageBox.Critical)
 
     @Slot()
     def _set_selected_profile_as_default(self):
@@ -876,7 +922,7 @@ class AccountDialog(QDialog):
             return
         curr_row = self.table_profiles.currentRow()
         if curr_row < 0:
-            QMessageBox.warning(self, "Seçim Yapılmadı", "Lütfen aktif yapmak istediğiniz sunucu profilini seçin.")
+            self._show_styled_msg("Seçim Yapılmadı", "Lütfen aktif yapmak istediğiniz sunucu profilini seçin.", icon=QMessageBox.Warning)
             return
 
         item = self.table_profiles.item(curr_row, 1)
@@ -886,7 +932,7 @@ class AccountDialog(QDialog):
 
         try:
             self.engine.set_default_server_profile(self.account["id"], prof_id)
-            QMessageBox.information(self, "Varsayılan Sunucu Değişti", "Seçilen sunucu profili varsayılan (aktif) yapıldı.")
+            self._show_styled_msg("Varsayılan Sunucu Değişti", "Seçilen sunucu profili varsayılan (aktif) yapıldı.", icon=QMessageBox.Information)
             self._refresh_server_profiles_table()
             # Update Host UI input
             profs = self.engine.list_server_profiles(self.account["id"])
@@ -896,7 +942,7 @@ class AccountDialog(QDialog):
                 self.input_port.setValue(active.get("imap_port", 993))
                 self.input_ssl.setChecked(bool(active.get("use_ssl", True)))
         except Exception as e:
-            QMessageBox.critical(self, "Hata", f"Aktif profil değiştirilemedi: {e}")
+            self._show_styled_msg("Hata", f"Aktif profil değiştirilemedi: {e}", icon=QMessageBox.Critical)
 
     @Slot()
     def _delete_selected_server_profile(self):
@@ -904,7 +950,7 @@ class AccountDialog(QDialog):
             return
         curr_row = self.table_profiles.currentRow()
         if curr_row < 0:
-            QMessageBox.warning(self, "Seçim Yapılmadı", "Lütfen silmek istediğiniz sunucu profilini seçin.")
+            self._show_styled_msg("Seçim Yapılmadı", "Lütfen silmek istediğiniz sunucu profilini seçin.", icon=QMessageBox.Warning)
             return
 
         item = self.table_profiles.item(curr_row, 1)
@@ -918,7 +964,7 @@ class AccountDialog(QDialog):
                 self.engine.delete_server_profile(self.account["id"], prof_id)
                 self._refresh_server_profiles_table()
             except Exception as e:
-                QMessageBox.critical(self, "Hata", f"Profil silinemedi: {e}")
+                self._show_styled_msg("Hata", f"Profil silinemedi: {e}", icon=QMessageBox.Critical)
 
     # ------------------------------------------------------------------
     # Save
@@ -960,8 +1006,9 @@ class AccountDialog(QDialog):
                 errors.append("Alt klasör ismi geçersiz karakter veya üst dizin referansı (..) içeremez!")
 
         if errors:
-            QMessageBox.warning(self, "Validation Error",
-                                "Please fix the following:\n• " + "\n• ".join(errors))
+            self._show_styled_msg("Validation Error",
+                                  "Please fix the following:\n• " + "\n• ".join(errors),
+                                  icon=QMessageBox.Warning)
             return
 
         try:
@@ -1002,7 +1049,7 @@ class AccountDialog(QDialog):
                     update_data["password"] = password
 
                 self.engine.update_account(acc_id, **update_data)
-                QMessageBox.information(self, "Başarılı", "Hesap bilgileri ve sunucu yapılandırması güncellendi.")
+                self._show_styled_msg("Başarılı", "Hesap bilgileri ve sunucu yapılandırması güncellendi.", icon=QMessageBox.Information)
             else:
                 # Add new (or save copied account as new)
                 acc_id = self.engine.add_account(
@@ -1013,7 +1060,7 @@ class AccountDialog(QDialog):
                     account_group=account_group,
                 )
                 msg = f"Account added with ID: {acc_id}" if not self._is_copy else f"Account duplicated successfully with ID: {acc_id}"
-                QMessageBox.information(self, "Success", msg)
+                self._show_styled_msg("Success", msg, icon=QMessageBox.Information)
 
             # Save storage location assignment
             stor_name = self.combo_storage.currentData()
@@ -1038,7 +1085,7 @@ class AccountDialog(QDialog):
             self.accept()
 
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to save account:\n{exc}")
+            self._show_styled_msg("Error", f"Failed to save account:\n{exc}", icon=QMessageBox.Critical)
 
     # ------------------------------------------------------------------
     # Connection Test

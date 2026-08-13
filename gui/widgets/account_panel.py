@@ -249,6 +249,8 @@ class AccountPanel(QWidget):
         self.act_clean_start = self.actions_menu.addAction("🗑  Clean Start")
 
         self.actions_menu.addSeparator()
+        self.act_group_mgmt = self.actions_menu.addAction("🏷️  Grup / Domain Yönetimi")
+        self.act_group_mgmt.triggered.connect(self._open_group_management)
         self.act_batch_group = self.actions_menu.addAction("🏷️  Toplu Grup Değiştir")
         self.act_batch_group.triggered.connect(self._on_batch_change_group)
         self.act_batch_password = self.actions_menu.addAction("🔑  Toplu Şifre Güncelle")
@@ -256,6 +258,25 @@ class AccountPanel(QWidget):
 
         self.btn_actions.setMenu(self.actions_menu)
         tool_layout.addWidget(self.btn_actions)
+
+        # Direct Group Management Button in Toolbar
+        self.btn_group_mgmt = QPushButton("🏷️  Grup Yönetimi")
+        self.btn_group_mgmt.setToolTip("Grup / Domain ekleme, silme, düzenleme ve domain eşitleme penceresini açar")
+        self.btn_group_mgmt.setStyleSheet("""
+            QPushButton {
+                background-color: #2563eb !important;
+                color: #ffffff !important;
+                border: none !important;
+                font-weight: bold;
+                padding: 6px 14px;
+                border-radius: 6px;
+                font-size: 11px;
+                min-height: 24px;
+            }
+            QPushButton:hover { background-color: #1d4ed8 !important; }
+        """)
+        self.btn_group_mgmt.clicked.connect(self._open_group_management)
+        tool_layout.addWidget(self.btn_group_mgmt)
 
         # Excel-Style Inline Editing Toggle Button
         self.btn_excel_mode = QPushButton("⚡ Excel Tipi Canlı Düzenleme: Kapalı")
@@ -571,6 +592,15 @@ class AccountPanel(QWidget):
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
+
+    @Slot()
+    def _open_group_management(self):
+        from gui.dialogs.group_domain_dialog import GroupDomainDialog
+        dialog = GroupDomainDialog(self.engine, self.settings, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.refresh()
+        else:
+            self.refresh()
 
     @Slot()
     def _add_account(self):
@@ -1540,18 +1570,26 @@ class AccountPanel(QWidget):
             QLabel {
                 color: #1e293b;
                 font-size: 13px;
+                font-weight: 600;
             }
             QPushButton {
-                background-color: #4f46e5;
-                color: #ffffff;
-                border: 1px solid #4338ca;
-                border-radius: 4px;
-                padding: 6px 14px;
-                font-weight: bold;
-                min-width: 70px;
+                background-color: #2563eb !important;
+                color: #ffffff !important;
+                border: none !important;
+                border-radius: 6px !important;
+                padding: 8px 20px !important;
+                font-weight: 700 !important;
+                font-size: 12px !important;
+                min-width: 95px !important;
+                min-height: 28px !important;
             }
             QPushButton:hover {
-                background-color: #4338ca;
+                background-color: #1d4ed8 !important;
+                color: #ffffff !important;
+            }
+            QPushButton:pressed {
+                background-color: #1e40af !important;
+                color: #ffffff !important;
             }
         """)
         return msg.exec()

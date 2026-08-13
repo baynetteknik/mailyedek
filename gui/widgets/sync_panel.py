@@ -2910,7 +2910,7 @@ class SyncPanel(QWidget):
                 msg.setIcon(QMessageBox.Information)
                 msg.setWindowTitle("Filtre Ayarı Eksik")
                 msg.setText(f"'{acc_label}' hesabı için arşivleme filtreleri henüz ayarlanmamış.\n\nLütfen arşivlenecek klasörleri seçin.")
-                msg.setStyleSheet("QMessageBox { background-color: #f8fafc; } QLabel { color: #1e293b; }")
+                msg.setStyleSheet(GLOBAL_MSG_STYLE)
                 msg.exec()
                 
                 self._open_filters_dialog_for_account(acc_id, force_prompt=True)
@@ -3328,22 +3328,15 @@ class SyncPanel(QWidget):
             if name:
                 groups_status[name] = is_active
 
-        # 2. From database
+        # 2. From database account_group column
         try:
             with self.engine.db.get_conn() as conn:
-                rows = conn.execute("SELECT DISTINCT account_group FROM accounts").fetchall()
+                rows = conn.execute("SELECT DISTINCT account_group FROM accounts WHERE account_group IS NOT NULL AND account_group != ''").fetchall()
                 for r in rows:
                     if r["account_group"] and r["account_group"].strip():
                         name = r["account_group"].strip()
                         if name not in groups_status:
                             groups_status[name] = True
-                # Fallback email domains
-                rows_email = conn.execute("SELECT DISTINCT email FROM accounts").fetchall()
-                for r in rows_email:
-                    if r["email"] and "@" in r["email"]:
-                        domain = r["email"].split("@")[-1].strip()
-                        if domain and domain not in groups_status:
-                            groups_status[domain] = True
         except Exception as e:
             logger.error("Failed to query database groups: %s", e)
 

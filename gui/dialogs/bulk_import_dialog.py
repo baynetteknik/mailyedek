@@ -54,9 +54,117 @@ class BulkImportDialog(QDialog):
         self._setup_ui()
         self._is_loading = False
 
+    def _show_styled_msg(self, title: str, text: str, icon=QMessageBox.Information, buttons=QMessageBox.Ok):
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(title)
+        msg_box.setIcon(icon)
+        msg_box.setText(text)
+        msg_box.setStandardButtons(buttons)
+        msg_box.setStyleSheet("""
+            QMessageBox {
+                background-color: #ffffff;
+            }
+            QLabel {
+                color: #0f172a !important;
+                font-size: 13px !important;
+                font-weight: 600 !important;
+                background-color: transparent !important;
+            }
+            QPushButton {
+                background-color: #2563eb !important;
+                color: #ffffff !important;
+                font-weight: 700 !important;
+                font-size: 13px !important;
+                border: none !important;
+                border-radius: 6px !important;
+                padding: 8px 24px !important;
+                min-width: 95px !important;
+                min-height: 28px !important;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8 !important;
+                color: #ffffff !important;
+            }
+            QPushButton:pressed {
+                background-color: #1e40af !important;
+                color: #ffffff !important;
+            }
+        """)
+        ok_btn = msg_box.button(QMessageBox.Ok)
+        if ok_btn:
+            ok_btn.setText("Tamam")
+            ok_btn.setCursor(Qt.PointingHandCursor)
+        return msg_box.exec()
+
+    def _populate_sample_account_combo(self):
+        self.combo_sample_account.clear()
+        self.combo_sample_account.addItem("-- Varsayılan Örnek Şablon Verisi --", None)
+        try:
+            if self.engine:
+                accounts = self.engine.list_accounts()
+                for acc in accounts:
+                    lbl = acc.get("label") or f"Hesap #{acc.get('id')}"
+                    email = acc.get("email", "")
+                    display = f"⭐ {lbl} ({email})"
+                    self.combo_sample_account.addItem(display, acc["id"])
+        except Exception as e:
+            logger.warning("Could not list accounts for sample template combo: %s", e)
+
+    def _get_sample_account_data(self) -> Dict[str, str]:
+        """Return a dictionary of sample account fields for CSV/Excel template generation."""
+        acc_id = self.combo_sample_account.currentData()
+        if acc_id and self.engine:
+            try:
+                acc = self.engine.accounts.get(acc_id)
+                if acc:
+                    email_val = acc.get("email", "info@baynet.com.tr")
+                    username_val = email_val
+                    if "username_enc" in acc and acc["username_enc"]:
+                        try:
+                            username_val = self.engine.crypto.decrypt(acc["username_enc"])
+                        except Exception:
+                            pass
+                    
+                    password_val = "password123"
+                    if "password_enc" in acc and acc["password_enc"]:
+                        try:
+                            password_val = self.engine.crypto.decrypt(acc["password_enc"])
+                        except Exception:
+                            pass
+
+                    storage_loc = self.settings.account_storage(acc_id) or "local_storage"
+
+                    return {
+                        "label": acc.get("label", "Main Account"),
+                        "email": email_val,
+                        "imap_host": acc.get("imap_host", "imap.baynet.com.tr"),
+                        "imap_port": str(acc.get("imap_port", 993)),
+                        "use_ssl": "1" if acc.get("use_ssl", 1) else "0",
+                        "username": username_val,
+                        "password": password_val,
+                        "export_subfolder": acc.get("export_subfolder", "Baynet"),
+                        "storage": storage_loc,
+                        "account_group": acc.get("account_group", "Baynet"),
+                    }
+            except Exception as exc:
+                logger.warning("Failed to load sample account %s data: %s", acc_id, exc)
+
+        return {
+            "label": "Baynet Main",
+            "email": "info@baynet.com.tr",
+            "imap_host": "imap.baynet.com.tr",
+            "imap_port": "993",
+            "use_ssl": "1",
+            "username": "info@baynet.com.tr",
+            "password": "password123",
+            "export_subfolder": "Baynet",
+            "storage": "local_storage",
+            "account_group": "Baynet",
+        }
+
     def _setup_ui(self):
         self.setWindowTitle("Excel / CSV den Hesap Aktarımı")
-        self.resize(800, 680)
+        self.resize(880, 680)
         self.setStyleSheet("""
             QDialog {
                 background-color: #f8fafc;
@@ -92,35 +200,53 @@ class BulkImportDialog(QDialog):
                 border-color: #3b82f6;
             }
             QPushButton {
-                font-weight: bold;
-                font-size: 11px;
-                padding: 6px 14px;
-                border-radius: 4px;
+                background-color: #2563eb !important;
+                color: #ffffff !important;
+                font-weight: 700 !important;
+                font-size: 11px !important;
+                padding: 6px 14px !important;
+                border: none !important;
+                border-radius: 6px !important;
+                min-height: 24px !important;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8 !important;
+                color: #ffffff !important;
+            }
+            QPushButton:pressed {
+                background-color: #1e40af !important;
+                color: #ffffff !important;
+            }
+            QPushButton:disabled {
+                background-color: #94a3b8 !important;
+                color: #f8fafc !important;
             }
             QPushButton[outline="true"] {
-                background-color: #ffffff;
-                color: #1e293b;
-                border: 1px solid #cbd5e1;
+                background-color: #2563eb !important;
+                color: #ffffff !important;
+                border: none !important;
             }
             QPushButton[outline="true"]:hover {
-                background-color: #f1f5f9;
-                border-color: #94a3b8;
+                background-color: #1d4ed8 !important;
+                color: #ffffff !important;
             }
             QPushButton[success="true"] {
-                background-color: #10b981;
-                color: #ffffff;
-                border: 1px solid #059669;
+                background-color: #10b981 !important;
+                color: #ffffff !important;
+                border: none !important;
             }
             QPushButton[success="true"]:hover {
-                background-color: #059669;
+                background-color: #059669 !important;
+                color: #ffffff !important;
             }
             QPushButton[danger="true"] {
-                background-color: #ef4444;
-                color: #ffffff;
-                border: 1px solid #dc2626;
+                background-color: #dc2626 !important;
+                color: #ffffff !important;
+                border: none !important;
             }
             QPushButton[danger="true"]:hover {
-                background-color: #dc2626;
+                background-color: #b91c1c !important;
+                color: #ffffff !important;
             }
             QTableWidget {
                 background-color: #ffffff;
@@ -186,9 +312,14 @@ class BulkImportDialog(QDialog):
         file_row.addWidget(btn_browse)
         controls_layout.addLayout(file_row)
 
-        # Template Downloads Row
+        # Sample Account Selection & Template Downloads Row
         template_row = QHBoxLayout()
-        lbl_template = QLabel("Örnek Şablonları İndir:")
+        lbl_sample_acc = QLabel("Örnek Veri İçin Hesap:")
+        self.combo_sample_account = QComboBox()
+        self.combo_sample_account.setMinimumWidth(220)
+        self._populate_sample_account_combo()
+
+        lbl_template = QLabel("Şablon İndir:")
         btn_template_csv = QPushButton("Örnek CSV (.csv)")
         btn_template_csv.setProperty("outline", True)
         btn_template_csv.clicked.connect(self._download_template_csv)
@@ -197,6 +328,9 @@ class BulkImportDialog(QDialog):
         btn_template_xlsx.setProperty("outline", True)
         btn_template_xlsx.clicked.connect(self._download_template_xlsx)
         
+        template_row.addWidget(lbl_sample_acc)
+        template_row.addWidget(self.combo_sample_account)
+        template_row.addSpacing(10)
         template_row.addWidget(lbl_template)
         template_row.addWidget(btn_template_csv)
         template_row.addWidget(btn_template_xlsx)
@@ -348,14 +482,17 @@ class BulkImportDialog(QDialog):
         if not file_path:
             return
             
-        csv_content = "label,email,imap_host,imap_port,use_ssl,username,password,export_subfolder,storage,account_group\n" \
-                      "Baynet Main,info@baynet.com.tr,imap.baynet.com.tr,993,1,info@baynet.com.tr,password123,Baynet,local_storage,Baynet\n"
+        sample = self._get_sample_account_data()
+        headers = ["label", "email", "imap_host", "imap_port", "use_ssl", "username", "password", "export_subfolder", "storage", "account_group"]
+        
         try:
-            with open(file_path, "w", encoding="utf-8-sig") as f:
-                f.write(csv_content)
-            QMessageBox.information(self, "Başarılı", "CSV Şablonu başarıyla kaydedildi.")
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                writer.writerow([sample.get(h, "") for h in headers])
+            self._show_styled_msg("Başarılı", "CSV Şablonu seçilen hesap verisiyle başarıyla kaydedildi.")
         except Exception as e:
-            QMessageBox.critical(self, "Hata", f"Dosya kaydedilemedi:\n{e}")
+            self._show_styled_msg("Hata", f"Dosya kaydedilemedi:\n{e}", icon=QMessageBox.Critical)
 
     @Slot()
     def _download_template_xlsx(self):
@@ -365,98 +502,40 @@ class BulkImportDialog(QDialog):
         if not file_path:
             return
             
-        import base64
-        b64_data = (
-            "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"
-        )
+        sample = self._get_sample_account_data()
+        headers = ["label", "email", "imap_host", "imap_port", "use_ssl", "username", "password", "export_subfolder", "storage", "account_group"]
+        row_values = [sample.get(h, "") for h in headers]
+
         try:
-            with open(file_path, "wb") as f:
-                f.write(base64.b64decode(b64_data))
-            QMessageBox.information(self, "Başarılı", "Excel Şablonu başarıyla kaydedildi.")
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment
+
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Hesaplar"
+
+            header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+            header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+            header_align = Alignment(horizontal="center", vertical="center")
+
+            ws.append(headers)
+            for col_num in range(1, len(headers) + 1):
+                cell = ws.cell(row=1, column=col_num)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_align
+
+            ws.append(row_values)
+
+            for col in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in col)
+                col_letter = openpyxl.utils.get_column_letter(col[0].column)
+                ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
+
+            wb.save(file_path)
+            self._show_styled_msg("Başarılı", "Excel Şablonu seçilen hesap verisiyle başarıyla kaydedildi.")
         except Exception as e:
+            logger.warning("openpyxl template creation failed, falling back: %s", e)
             QMessageBox.critical(self, "Hata", f"Dosya kaydedilemedi:\n{e}")
 
     @Slot()
@@ -768,21 +847,28 @@ class BulkImportDialog(QDialog):
                     background-color: #ffffff;
                 }
                 QLabel {
-                    color: #1e3a8a;
-                    font-size: 12px;
-                    font-weight: bold;
+                    color: #0f172a !important;
+                    font-size: 13px !important;
+                    font-weight: 600 !important;
                 }
                 QPushButton {
-                    background-color: #3b82f6;
-                    color: #ffffff;
-                    font-weight: bold;
-                    border: 1px solid #2563eb;
-                    border-radius: 4px;
-                    padding: 6px 16px;
-                    min-width: 90px;
+                    background-color: #2563eb !important;
+                    color: #ffffff !important;
+                    font-weight: 700 !important;
+                    font-size: 12px !important;
+                    border: none !important;
+                    border-radius: 6px !important;
+                    padding: 8px 20px !important;
+                    min-height: 28px !important;
+                    min-width: 95px !important;
                 }
                 QPushButton:hover {
-                    background-color: #2563eb;
+                    background-color: #1d4ed8 !important;
+                    color: #ffffff !important;
+                }
+                QPushButton:pressed {
+                    background-color: #1e40af !important;
+                    color: #ffffff !important;
                 }
             """)
             
@@ -943,9 +1029,37 @@ class BulkImportDialog(QDialog):
         reply.setText(msg)
         reply.setIcon(QMessageBox.Information if not skipped else QMessageBox.Warning)
         reply.setStyleSheet("""
-            QMessageBox { min-width: 520px; }
-            QPushButton { padding: 4px 14px; font-weight: bold; }
+            QMessageBox {
+                min-width: 520px;
+                background-color: #ffffff;
+            }
+            QLabel {
+                color: #0f172a !important;
+                font-size: 12px !important;
+            }
+            QPushButton {
+                background-color: #2563eb !important;
+                color: #ffffff !important;
+                font-weight: 700 !important;
+                font-size: 12px !important;
+                border: none !important;
+                border-radius: 6px !important;
+                padding: 8px 20px !important;
+                min-height: 28px !important;
+                min-width: 95px !important;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8 !important;
+                color: #ffffff !important;
+            }
+            QPushButton:pressed {
+                background-color: #1e40af !important;
+                color: #ffffff !important;
+            }
         """)
+        ok_btn = reply.button(QMessageBox.Ok)
+        if ok_btn:
+            ok_btn.setText("Tamam")
         reply.exec()
 
         self.accept()

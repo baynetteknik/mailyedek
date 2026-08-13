@@ -53,7 +53,7 @@ class DatabaseManager:
     def get_conn(self) -> Generator[sqlite3.Connection, None, None]:
         """Provide a thread-local connection with WAL mode."""
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(str(self._db_path), timeout=60.0)
+            conn = sqlite3.connect(str(self._db_path), timeout=60.0, isolation_level=None)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=60000")
@@ -65,6 +65,10 @@ class DatabaseManager:
     def transaction(self) -> Generator[sqlite3.Connection, None, None]:
         """Provide a connection with an active transaction and lock retry logic."""
         with self.get_conn() as conn:
+            if conn.in_transaction:
+                yield conn
+                return
+
             max_retries = 8
             backoff = 0.2
             for attempt in range(max_retries):

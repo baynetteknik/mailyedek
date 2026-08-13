@@ -40,7 +40,7 @@ class GroupDomainDialog(QDialog):
                 subcontrol-origin: margin;
                 left: 12px;
                 padding: 0 5px;
-                color: #4361ee;
+                color: #1e3a8a;
             }
             QTableWidget {
                 background-color: #ffffff;
@@ -59,21 +59,22 @@ class GroupDomainDialog(QDialog):
                 font-size: 11px;
             }
             QPushButton {
-                background-color: #f1f5f9;
-                color: #0f172a;
-                border: 1px solid #cbd5e1;
-                border-radius: 4px;
-                padding: 6px 12px;
-                font-weight: bold;
-                font-size: 11px;
+                background-color: #2563eb !important;
+                color: #ffffff !important;
+                border: none !important;
+                border-radius: 6px !important;
+                padding: 6px 14px !important;
+                font-weight: 700 !important;
+                font-size: 11px !important;
+                min-height: 24px !important;
             }
             QPushButton:hover {
-                background-color: #e2e8f0;
-                border-color: #94a3b8;
+                background-color: #1d4ed8 !important;
+                color: #ffffff !important;
             }
             QPushButton:disabled {
-                background-color: #cbd5e1;
-                color: #94a3b8;
+                background-color: #cbd5e1 !important;
+                color: #94a3b8 !important;
             }
         """)
 
@@ -99,10 +100,9 @@ class GroupDomainDialog(QDialog):
         # Table
         self.tbl_groups = QTableWidget()
         self.tbl_groups.setColumnCount(2)
-        self.tbl_groups.setHorizontalHeaderLabels(["Grup / Domain", "Durum"])
+        self.tbl_groups.setHorizontalHeaderLabels(["Grup / Domain Adı", "Durum"])
         self.tbl_groups.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.tbl_groups.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.tbl_groups.verticalHeader().setVisible(False)
         self.tbl_groups.setSelectionBehavior(QTableWidget.SelectRows)
         self.tbl_groups.setSelectionMode(QTableWidget.SingleSelection)
         self.tbl_groups.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -117,7 +117,6 @@ class GroupDomainDialog(QDialog):
         actions_layout.setContentsMargins(0, 0, 0, 0)
 
         self.btn_add = QPushButton("➕ Yeni Ekle")
-        self.btn_add.setStyleSheet("background-color: #10b981; color: white; border: none;")
         self.btn_add.clicked.connect(self._add_group)
 
         self.btn_edit = QPushButton("✏️ Düzenle")
@@ -130,18 +129,22 @@ class GroupDomainDialog(QDialog):
 
         self.btn_delete = QPushButton("🗑 Sil")
         self.btn_delete.setEnabled(False)
-        self.btn_delete.setStyleSheet("background-color: #ef4444; color: white; border: none;")
+        self.btn_delete.setStyleSheet("background-color: #dc2626 !important; color: white !important;")
         self.btn_delete.clicked.connect(self._delete_group)
+
+        self.btn_auto_sync = QPushButton("⚡ Domainleri Eşitle")
+        self.btn_auto_sync.setToolTip("Sistemdeki tüm hesapların gruplarını e-posta domain adlarına göre otomatik günceller")
+        self.btn_auto_sync.clicked.connect(self._auto_sync_account_groups)
 
         self.btn_select = QPushButton("✔️ Seç")
         self.btn_select.setEnabled(False)
-        self.btn_select.setStyleSheet("background-color: #4361ee; color: white; border: none;")
         self.btn_select.clicked.connect(self._on_select_group)
 
         actions_layout.addWidget(self.btn_add)
         actions_layout.addWidget(self.btn_edit)
         actions_layout.addWidget(self.btn_toggle_active)
         actions_layout.addWidget(self.btn_delete)
+        actions_layout.addWidget(self.btn_auto_sync)
         actions_layout.addWidget(self.btn_select)
         actions_layout.addStretch()
 
@@ -153,8 +156,12 @@ class GroupDomainDialog(QDialog):
         self.button_box = QDialogButtonBox(QDialogButtonBox.Cancel)
         self.button_box.setStyleSheet("""
             QPushButton {
-                min-width: 80px;
-                padding: 6px 14px;
+                background-color: #2563eb !important;
+                color: #ffffff !important;
+                min-width: 90px;
+                padding: 6px 16px;
+                border-radius: 6px;
+                font-weight: bold;
             }
         """)
         self.button_box.rejected.connect(self.reject)
@@ -180,14 +187,14 @@ class GroupDomainDialog(QDialog):
         self._is_loading = True
         self.tbl_groups.setRowCount(0)
 
-        # Merge groups from settings and database
-        groups_dict = {} # name -> is_active
+        # Merge groups from settings, database account_groups AND email domains
+        groups_dict = {}  # name -> is_active
 
         # 1. From settings
         for g in self._get_groups_from_settings():
             groups_dict[g["name"]] = g["is_active"]
 
-        # 2. From database
+        # 2. From database account_group column
         try:
             with self.engine.db.get_conn() as conn:
                 rows = conn.execute("SELECT DISTINCT account_group FROM accounts WHERE account_group IS NOT NULL AND account_group != ''").fetchall()
@@ -297,6 +304,34 @@ class GroupDomainDialog(QDialog):
         QMessageBox.information(self, "Başarılı", f"'{old_name}' grubu '{new_name}' olarak güncellendi ve ilgili tüm hesaplar güncellendi.")
 
     @Slot()
+    def _auto_sync_account_groups(self):
+        """Automatically set account_group = email domain for all accounts."""
+        reply = QMessageBox.question(
+            self, "Domain Eşitleme Onayı",
+            "Tüm kayıtlı hesapların grup adları, e-posta adreslerinin domain uzantılarına (örn. ozmedmedikal.com.tr) göre otomatik güncellenecek.\n\nOnaylıyor musunuz?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        updated_count = 0
+        try:
+            with self.engine.db.get_conn() as conn:
+                accounts = conn.execute("SELECT id, email, account_group FROM accounts").fetchall()
+                for acc in accounts:
+                    email_str = (acc["email"] or "").strip().lower()
+                    if "@" in email_str:
+                        dom = email_str.split("@")[-1].strip()
+                        if dom and dom != acc["account_group"]:
+                            conn.execute("UPDATE accounts SET account_group = ? WHERE id = ?", (dom, acc["id"]))
+                            updated_count += 1
+            self._load_groups()
+            QMessageBox.information(self, "Başarılı", f"{updated_count} hesabın grup adı domain uzantısına göre başarıyla eşcellendi.")
+        except Exception as exc:
+            logger.error("Failed to auto-sync account groups: %s", exc)
+            QMessageBox.critical(self, "Hata", f"Domain eşitleme hatası:\n{exc}")
+
+    @Slot()
     def _toggle_active(self):
         row = self.tbl_groups.currentRow()
         if row < 0:
@@ -326,6 +361,7 @@ class GroupDomainDialog(QDialog):
         name = self.tbl_groups.item(row, 0).data(Qt.UserRole)
 
         # Check database usage
+        count = 0
         try:
             with self.engine.db.get_conn() as conn:
                 count_row = conn.execute("SELECT COUNT(*) as cnt FROM accounts WHERE account_group = ?", (name,)).fetchone()
@@ -334,11 +370,22 @@ class GroupDomainDialog(QDialog):
             count = 0
 
         if count > 0:
-            QMessageBox.warning(self, "Hata", f"'{name}' grubu şu an {count} hesap tarafından kullanılmaktadır. Silmeden önce bu hesapları düzenleyip grubunu değiştirmelisiniz.")
-            return
+            reply = QMessageBox.question(
+                self, "Grup Kullanımda",
+                f"'{name}' grubu şu an {count} hesap tarafından kullanılmaktadır.\n\n"
+                "Grubu silip bu hesapların grup bilgisini temizlemek istiyor musunuz?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+            try:
+                with self.engine.db.get_conn() as conn:
+                    conn.execute("UPDATE accounts SET account_group = '' WHERE account_group = ?", (name,))
+            except Exception as e:
+                logger.error("Failed to clear account_group on delete: %s", e)
 
         reply = QMessageBox.question(
-            self, "Onay",
+            self, "Silme Onayı",
             f"'{name}' grubunu silmek istediğinize emin misiniz?",
             QMessageBox.Yes | QMessageBox.No
         )
