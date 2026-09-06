@@ -81,12 +81,61 @@ class AppSettings:
                     p.mkdir(parents=True, exist_ok=True)
                     return p
             except OSError as exc:
-                logger.error("Configured data_path '%s' is not accessible, falling back to default: %s", raw, exc)
+                logger.debug("Configured data_path '%s' is not accessible, falling back to default: %s", raw, exc)
         return DEFAULT_SETTINGS_DIR
 
+    def is_configured_data_path_available(self) -> bool:
+        """Return True if the configured data_path is reachable and exists."""
+        raw = self._data.get("data_path")
+        if not raw:
+            return True
+        try:
+            p = Path(raw)
+            return p.exists()
+        except OSError:
+            return False
+
+    def configured_data_path_str(self) -> str:
+        """Return the raw string of the configured data_path."""
+        return self._data.get("data_path", "data")
+
+    def save_account_cache(self, accounts: List[Dict[str, Any]]):
+        """Cache account list locally for offline / missing-disk display."""
+        try:
+            cache_file = Path("data/account_cache.json")
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(accounts, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning("Failed to save account cache: %s", exc)
+
+    def load_account_cache(self) -> List[Dict[str, Any]]:
+        """Load locally cached accounts when main data disk is not connected."""
+        cache_file = Path("data/account_cache.json")
+        if cache_file.exists():
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as exc:
+                logger.warning("Failed to load account cache: %s", exc)
+        return []
 
     def set_data_path(self, path: Path):
         self._data["data_path"] = str(path.resolve())
+        self.save()
+
+    def data_disk_signature(self) -> Optional[Dict[str, Any]]:
+        """Return registered disk signature information."""
+        return self._data.get("data_disk_signature")
+
+    def set_data_disk_signature(self, sig: Dict[str, Any]):
+        """Persist registered disk signature information."""
+        self._data["data_disk_signature"] = sig
+        self.save()
+
+    def clear_data_disk_signature(self):
+        """Remove registered disk signature information."""
+        self._data.pop("data_disk_signature", None)
         self.save()
 
     def db_path(self) -> Path:
@@ -240,6 +289,74 @@ class AppSettings:
 
     def set_ssl_strict_mode(self, strict: bool):
         self._data["ssl_strict_mode"] = bool(strict)
+        self.save()
+
+    # ------------------------------------------------------------------
+    # Multi-Account Cloud Storage (Amazon S3 & Google Drive)
+    # ------------------------------------------------------------------
+
+    def cloud_accounts(self, provider: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Return all configured cloud storage accounts, optionally filtered by provider ('s3' or 'gdrive')."""
+        accounts = self._data.get("cloud_storage_accounts", [])
+        if provider:
+            p_clean = provider.strip().lower()
+            return [acc for acc in accounts if acc.get("provider", "").strip().lower() == p_clean]
+        return accounts
+
+    def save_cloud_account(self, account_data: Dict[str, Any]) -> str:
+        """Add or update a cloud storage account and persist settings."""
+        import uuid
+        accounts = self._data.get("cloud_storage_accounts", [])
+        acc_id = account_data.get("id")
+        if not acc_id:
+            provider = account_data.get("provider", "cloud").lower()
+            acc_id = f"{provider}_{uuid.uuid4().hex[:8]}"
+            account_data["id"] = acc_id
+
+        # If this is marked as default, unset other defaults for this provider
+        if account_data.get("is_default", False):
+            p = account_data.get("provider", "").lower()
+            for acc in accounts:
+                if acc.get("provider", "").lower() == p and acc.get("id") != acc_id:
+                    acc["is_default"] = False
+
+        # If first account of this provider, make it default automatically
+        provider_accounts = [a for a in accounts if a.get("provider", "").lower() == account_data.get("provider", "").lower()]
+        if not provider_accounts:
+            account_data["is_default"] = True
+
+        existing_idx = next((i for i, a in enumerate(accounts) if a.get("id") == acc_id), None)
+        if existing_idx is not None:
+            accounts[existing_idx] = account_data
+        else:
+            accounts.append(account_data)
+
+        self._data["cloud_storage_accounts"] = accounts
+        self.save()
+        return acc_id
+
+    def remove_cloud_account(self, account_id: str):
+        """Remove a cloud account by ID."""
+        accounts = self._data.get("cloud_storage_accounts", [])
+        self._data["cloud_storage_accounts"] = [a for a in accounts if a.get("id") != account_id]
+        self.save()
+
+    def get_cloud_account(self, account_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a cloud account by ID."""
+        accounts = self._data.get("cloud_storage_accounts", [])
+        return next((a for a in accounts if a.get("id") == account_id), None)
+
+    def set_default_cloud_account(self, account_id: str):
+        """Set specified account as the default for its provider."""
+        target = self.get_cloud_account(account_id)
+        if not target:
+            return
+        p = target.get("provider", "").lower()
+        accounts = self._data.get("cloud_storage_accounts", [])
+        for acc in accounts:
+            if acc.get("provider", "").lower() == p:
+                acc["is_default"] = (acc.get("id") == account_id)
+        self._data["cloud_storage_accounts"] = accounts
         self.save()
 
 

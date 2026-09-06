@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QLabel, QFrame,
     QPushButton, QCheckBox, QComboBox, QLineEdit, QSpinBox, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QFileDialog,
-    QGroupBox, QFormLayout, QSplitter, QStyle, QTextEdit
+    QGroupBox, QFormLayout, QSplitter, QStyle, QTextEdit, QInputDialog,
 )
 
 from core.settings import AppSettings, StorageLocation
@@ -99,6 +99,8 @@ class SettingsPanel(QWidget):
         self.tabs.setCornerWidget(self.btn_save_all, Qt.TopRightCorner)
 
         # Add Sub-Tabs
+        self.tabs.addTab(self._create_rbac_tab(), "👥 Kullanıcılar & Yetkiler (RBAC)")
+        self.tabs.addTab(self._create_smtp_tab(), "📧 E-Posta Bildirimleri (SMTP)")
         self.tabs.addTab(self._create_port_listener_tab(), "🔌 Port Dinleme & Trafik Analizörü")
         self.tabs.addTab(self._create_language_tab(), "🌍 Dil & Arayüz Ayarları")
         self.tabs.addTab(self._create_storage_tab(), "💾 Depolama & Veritabanı")
@@ -996,11 +998,33 @@ class SettingsPanel(QWidget):
     def _change_data_directory(self):
         new_dir = QFileDialog.getExistingDirectory(self, "Yeni Veri Dizini Seçin", str(self.settings.data_path()))
         if new_dir:
-            p = Path(new_dir)
+            p = Path(new_dir).resolve()
             self.settings.set_data_path(p)
             self.lbl_data_path_val.setText(str(p))
+
+            from infrastructure.disk_identifier import (
+                get_disk_signature,
+                stamp_disk_signature,
+            )
+
+            existing_sig = get_disk_signature(p)
+            if not existing_sig:
+                stamp_reply = QMessageBox.question(
+                    self,
+                    "Diski Resmi Yedek Diski Olarak İmzala",
+                    f"Seçtiğiniz bu yeni veri dizinini ({p}) sistemin her takıldığında otomatik tanıyacağı "
+                    f"'Resmi Yedekleme Diski' olarak imzalamak ve sisteme tanıtmak ister misiniz?\n\n"
+                    f"(Onaylarsanız diskin sürücü harfi değişse bile sistem diski tanıyacaktır).",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if stamp_reply == QMessageBox.Yes:
+                    sig = stamp_disk_signature(p, label=f"Resmi Yedek Diski ({p.name})")
+                    self.settings.set_data_disk_signature(sig)
+            else:
+                self.settings.set_data_disk_signature(existing_sig)
+
             self._update_disk_space_info()
-            QMessageBox.information(self, "Dizin Güncellendi", "Veri dizini başarıyla değiştirildi.")
+            QMessageBox.information(self, "Dizin Güncellendi", f"Veri dizini başarıyla '{p}' olarak değiştirildi.")
 
     @Slot()
     def _vacuum_database(self):
@@ -1071,3 +1095,331 @@ class SettingsPanel(QWidget):
 
         msg_box.setStyleSheet("QMessageBox { min-width: 550px; font-size: 12px; }")
         msg_box.exec()
+
+    # -----------------------------------------------------------------------
+    # TAB: RBAC & User Management
+    # -----------------------------------------------------------------------
+    def _create_rbac_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        # Users Table Group
+        users_box = QGroupBox("👥 Kayıtlı Kullanıcılar ve Yetki Rolleri")
+        users_box.setStyleSheet("font-weight: 600; font-size: 12px;")
+        u_layout = QVBoxLayout(users_box)
+
+        self.table_users = QTableWidget()
+        self.table_users.setColumnCount(7)
+        self.table_users.setHorizontalHeaderLabels(["ID", "Kullanıcı Adı", "Ad Soyad", "Yetki Rolü", "E-Posta", "Son Giriş", "İşlemler"])
+        self.table_users.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table_users.horizontalHeader().setStretchLastSection(True)
+        self.table_users.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table_users.setEditTriggers(QTableWidget.NoEditTriggers)
+        u_layout.addWidget(self.table_users)
+
+        layout.addWidget(users_box, stretch=2)
+
+        # Add New User Group
+        add_box = QGroupBox("➕ Yeni Kullanıcı Ekle")
+        add_box.setStyleSheet("font-weight: 600; font-size: 12px;")
+        form = QFormLayout(add_box)
+        form.setSpacing(8)
+
+        row1 = QHBoxLayout()
+        self.txt_new_user = QLineEdit()
+        self.txt_new_user.setPlaceholderText("Örn: ahmet.yilmaz")
+        self.txt_new_pass = QLineEdit()
+        self.txt_new_pass.setEchoMode(QLineEdit.Password)
+        self.txt_new_pass.setPlaceholderText("Güçlü şifre belirleyin")
+
+        row1.addWidget(QLabel("Kullanıcı Adı:"), 0)
+        row1.addWidget(self.txt_new_user, 2)
+        row1.addWidget(QLabel("Şifre:"), 0)
+        row1.addWidget(self.txt_new_pass, 2)
+        form.addRow(row1)
+
+        row2 = QHBoxLayout()
+        self.txt_new_fullname = QLineEdit()
+        self.txt_new_fullname.setPlaceholderText("Ad Soyad")
+        self.txt_new_email = QLineEdit()
+        self.txt_new_email.setPlaceholderText("kullanici@sirket.com")
+
+        self.combo_new_role = QComboBox()
+        self.combo_new_role.addItem("OPERATOR (Yedekleme & Geri Yükleme Yapabilir)", "OPERATOR")
+        self.combo_new_role.addItem("ADMIN (Tam Yetkili Yönetici)", "ADMIN")
+        self.combo_new_role.addItem("VIEWER (Sadece İzleme / Rapor)", "VIEWER")
+
+        row2.addWidget(QLabel("Ad Soyad:"), 0)
+        row2.addWidget(self.txt_new_fullname, 2)
+        row2.addWidget(QLabel("E-Posta:"), 0)
+        row2.addWidget(self.txt_new_email, 2)
+        row2.addWidget(QLabel("Yetki:"), 0)
+        row2.addWidget(self.combo_new_role, 2)
+        form.addRow(row2)
+
+        btn_row = QHBoxLayout()
+        self.btn_create_user = QPushButton("👤 Kullanıcıyı Kaydet")
+        self.btn_create_user.setStyleSheet("background-color: #2563eb; color: white; padding: 8px 20px; font-weight: bold;")
+        self.btn_create_user.clicked.connect(self._create_user_clicked)
+        btn_row.addWidget(self.btn_create_user)
+        btn_row.addStretch()
+        form.addRow("", btn_row)
+
+        layout.addWidget(add_box, stretch=1)
+        return widget
+
+    def _refresh_users(self):
+        if not self.engine:
+            return
+        users = self.engine.list_users()
+        self.table_users.setRowCount(len(users))
+        for i, u in enumerate(users):
+            self.table_users.setItem(i, 0, QTableWidgetItem(str(u.get("id", ""))))
+            self.table_users.setItem(i, 1, QTableWidgetItem(u.get("username", "")))
+            self.table_users.setItem(i, 2, QTableWidgetItem(u.get("full_name", "") or "-"))
+
+            role = u.get("role", "OPERATOR")
+            role_item = QTableWidgetItem(role)
+            if role == "ADMIN":
+                role_item.setForeground(QColor("#7c3aed"))
+                role_item.setFont(QFont("", -1, QFont.Bold))
+            elif role == "OPERATOR":
+                role_item.setForeground(QColor("#0284c7"))
+            else:
+                role_item.setForeground(QColor("#64748b"))
+            self.table_users.setItem(i, 3, role_item)
+
+            self.table_users.setItem(i, 4, QTableWidgetItem(u.get("email", "") or "-"))
+            self.table_users.setItem(i, 5, QTableWidgetItem(u.get("last_login_at", "")[:19] or "Hiç giriş yapmadı"))
+
+            # Actions
+            act_w = QWidget()
+            act_l = QHBoxLayout(act_w)
+            act_l.setContentsMargins(2, 2, 2, 2)
+            act_l.setSpacing(4)
+
+            btn_pass = QPushButton("🔑 Şifre")
+            btn_pass.setStyleSheet("background-color: #f59e0b; color: white; padding: 2px 6px; font-size: 11px;")
+            uid = u.get("id")
+            uname = u.get("username")
+            btn_pass.clicked.connect(lambda _, uid=uid, uname=uname: self._change_user_password(uid, uname))
+            act_l.addWidget(btn_pass)
+
+            if uname != "admin":
+                btn_del = QPushButton("🗑 Sil")
+                btn_del.setStyleSheet("background-color: #ef4444; color: white; padding: 2px 6px; font-size: 11px;")
+                btn_del.clicked.connect(lambda _, uid=uid, uname=uname: self._delete_user_clicked(uid, uname))
+                act_l.addWidget(btn_del)
+
+            self.table_users.setCellWidget(i, 6, act_w)
+
+    def _create_user_clicked(self):
+        username = self.txt_new_user.text().strip()
+        password = self.txt_new_pass.text()
+        full_name = self.txt_new_fullname.text().strip()
+        email = self.txt_new_email.text().strip()
+        role = self.combo_new_role.currentData()
+
+        if not username or not password:
+            QMessageBox.warning(self, "Eksik Bilgi", "Kullanıcı adı ve şifre zorunludur.")
+            return
+
+        ok, msg, uid = self.engine.create_user(username=username, password=password, role=role, full_name=full_name, email=email)
+        if ok:
+            QMessageBox.information(self, "Başarılı", f"Kullanıcı oluşturuldu (ID: {uid})")
+            self.txt_new_user.clear()
+            self.txt_new_pass.clear()
+            self.txt_new_fullname.clear()
+            self.txt_new_email.clear()
+            self._refresh_users()
+        else:
+            QMessageBox.warning(self, "Hata", msg)
+
+    def _change_user_password(self, user_id: int, username: str):
+        new_pass, ok = QInputDialog.getText(self, "Şifre Değiştir", f"'{username}' için yeni şifre girin:", QLineEdit.Password)
+        if ok and new_pass:
+            success, msg = self.engine.update_user_password(user_id, new_pass)
+            if success:
+                QMessageBox.information(self, "Başarılı", f"'{username}' kullanıcısının şifresi güncellendi.")
+            else:
+                QMessageBox.warning(self, "Hata", msg)
+
+    def _delete_user_clicked(self, user_id: int, username: str):
+        reply = QMessageBox.question(self, "Kullanıcı Sil", f"'{username}' kullanıcısını silmek istediğinize emin misiniz?", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            ok, msg = self.engine.delete_user(user_id)
+            if ok:
+                self._refresh_users()
+            else:
+                QMessageBox.warning(self, "Hata", msg)
+
+    # -----------------------------------------------------------------------
+    # TAB: SMTP Notifications
+    # -----------------------------------------------------------------------
+    def _create_smtp_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        box = QGroupBox("📧 SMTP E-Posta Bildirim Yapılandırması")
+        box.setStyleSheet("font-weight: 600; font-size: 12px;")
+        form = QFormLayout(box)
+        form.setSpacing(10)
+
+        self.chk_smtp_enabled = QCheckBox("E-Posta Bildirimlerini Etkinleştir (Yedekleme durum raporları gönderilsin)")
+        form.addRow(self.chk_smtp_enabled)
+
+        # Host, Port, TLS
+        server_row = QHBoxLayout()
+        self.txt_smtp_host = QLineEdit()
+        self.txt_smtp_host.setPlaceholderText("smtp.gmail.com veya mail.sirketiniz.com")
+        self.spin_smtp_port = QSpinBox()
+        self.spin_smtp_port.setRange(1, 65535)
+        self.spin_smtp_port.setValue(587)
+        self.chk_smtp_tls = QCheckBox("STARTTLS / SSL Kullan")
+        self.chk_smtp_tls.setChecked(True)
+
+        server_row.addWidget(QLabel("SMTP Sunucu:"), 0)
+        server_row.addWidget(self.txt_smtp_host, 3)
+        server_row.addWidget(QLabel("Port:"), 0)
+        server_row.addWidget(self.spin_smtp_port, 1)
+        server_row.addWidget(self.chk_smtp_tls, 1)
+        form.addRow(server_row)
+
+        # Auth
+        auth_row = QHBoxLayout()
+        self.txt_smtp_user = QLineEdit()
+        self.txt_smtp_user.setPlaceholderText("bildirim@sirketiniz.com")
+        self.txt_smtp_pass = QLineEdit()
+        self.txt_smtp_pass.setEchoMode(QLineEdit.Password)
+        self.txt_smtp_pass.setPlaceholderText("SMTP Şifresi veya App Password")
+
+        auth_row.addWidget(QLabel("Kullanıcı Adı:"), 0)
+        auth_row.addWidget(self.txt_smtp_user, 2)
+        auth_row.addWidget(QLabel("Şifre:"), 0)
+        auth_row.addWidget(self.txt_smtp_pass, 2)
+        form.addRow(auth_row)
+
+        # From & To
+        self.txt_smtp_from = QLineEdit()
+        self.txt_smtp_from.setPlaceholderText("Yedekleme Sistemi <bildirim@sirketiniz.com>")
+        form.addRow("Gönderen Adresi (From):", self.txt_smtp_from)
+
+        self.txt_smtp_to = QLineEdit()
+        self.txt_smtp_to.setPlaceholderText("admin@sirketiniz.com, bilgi-islem@sirketiniz.com (Virgülle ayırın)")
+        form.addRow("Alıcı E-Postalar (To):", self.txt_smtp_to)
+
+        # Triggers
+        trig_row = QHBoxLayout()
+        self.chk_notify_success = QCheckBox("Başarılı Yedeklemelerde Rapor Gönder")
+        self.chk_notify_success.setChecked(True)
+        self.chk_notify_failure = QCheckBox("Hata & Başarısız Yedeklemelerde Acil Uyarı Gönder")
+        self.chk_notify_failure.setChecked(True)
+        trig_row.addWidget(self.chk_notify_success)
+        trig_row.addWidget(self.chk_notify_failure)
+        trig_row.addStretch()
+        form.addRow("Bildirim Koşulları:", trig_row)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.btn_test_smtp = QPushButton("📨 Test E-Postası Gönder")
+        self.btn_test_smtp.setStyleSheet("background-color: #0284c7; color: white; padding: 8px 18px; font-weight: bold;")
+        self.btn_test_smtp.clicked.connect(self._test_smtp_clicked)
+
+        self.btn_save_smtp = QPushButton("💾 SMTP Ayarlarını Kaydet")
+        self.btn_save_smtp.setStyleSheet("background-color: #16a34a; color: white; padding: 8px 20px; font-weight: bold;")
+        self.btn_save_smtp.clicked.connect(self._save_smtp_settings)
+
+        btn_row.addWidget(self.btn_test_smtp)
+        btn_row.addWidget(self.btn_save_smtp)
+        btn_row.addStretch()
+        form.addRow("", btn_row)
+
+        layout.addWidget(box)
+        layout.addStretch()
+        return widget
+
+    def _load_smtp_settings(self):
+        if not self.engine:
+            return
+        cfg = self.engine.get_smtp_settings()
+        self.chk_smtp_enabled.setChecked(cfg.get("enabled", False))
+        self.txt_smtp_host.setText(cfg.get("host", ""))
+        self.spin_smtp_port.setValue(cfg.get("port", 587))
+        self.chk_smtp_tls.setChecked(cfg.get("use_tls", True))
+        self.txt_smtp_user.setText(cfg.get("username", ""))
+        self.txt_smtp_pass.setText(cfg.get("password", ""))
+        self.txt_smtp_from.setText(cfg.get("from_address", ""))
+        to_list = cfg.get("to_addresses", [])
+        self.txt_smtp_to.setText(", ".join(to_list) if isinstance(to_list, list) else str(to_list))
+        self.chk_notify_success.setChecked(cfg.get("notify_on_success", True))
+        self.chk_notify_failure.setChecked(cfg.get("notify_on_failure", True))
+
+    def _save_smtp_settings(self):
+        if not self.engine:
+            return
+        to_raw = [x.strip() for x in self.txt_smtp_to.text().split(",") if x.strip()]
+        cfg = {
+            "enabled": self.chk_smtp_enabled.isChecked(),
+            "host": self.txt_smtp_host.text().strip(),
+            "port": self.spin_smtp_port.value(),
+            "use_tls": self.chk_smtp_tls.isChecked(),
+            "username": self.txt_smtp_user.text().strip(),
+            "password": self.txt_smtp_pass.text(),
+            "from_address": self.txt_smtp_from.text().strip() or self.txt_smtp_user.text().strip(),
+            "to_addresses": to_raw,
+            "notify_on_success": self.chk_notify_success.isChecked(),
+            "notify_on_failure": self.chk_notify_failure.isChecked(),
+        }
+        self.engine.save_smtp_settings(cfg)
+        QMessageBox.information(self, "Başarılı", "SMTP Bildirim Ayarları başarıyla kaydedildi.")
+
+    def _test_smtp_clicked(self):
+        if not self.engine:
+            return
+        to_raw = [x.strip() for x in self.txt_smtp_to.text().split(",") if x.strip()]
+        recipient = to_raw[0] if to_raw else self.txt_smtp_user.text().strip()
+        if not recipient:
+            QMessageBox.warning(self, "Alıcı Gerekli", "Lütfen bir alıcı e-posta adresi belirtin.")
+            return
+
+        cfg = {
+            "enabled": True,
+            "host": self.txt_smtp_host.text().strip(),
+            "port": self.spin_smtp_port.value(),
+            "use_tls": self.chk_smtp_tls.isChecked(),
+            "username": self.txt_smtp_user.text().strip(),
+            "password": self.txt_smtp_pass.text(),
+            "from_address": self.txt_smtp_from.text().strip() or self.txt_smtp_user.text().strip(),
+            "to_addresses": [recipient],
+        }
+
+        self.btn_test_smtp.setEnabled(False)
+        self.btn_test_smtp.setText("Gönderiliyor...")
+
+        try:
+            ok, msg = self.engine.test_smtp_connection(cfg, recipient=recipient)
+            if ok:
+                QMessageBox.information(self, "Test Başarılı", f"Test e-postası başarıyla '{recipient}' adresine gönderildi!")
+            else:
+                QMessageBox.warning(self, "Test Başarısız", f"E-posta gönderilemedi:\n{msg}")
+        finally:
+            self.btn_test_smtp.setEnabled(True)
+            self.btn_test_smtp.setText("📨 Test E-Postası Gönder")
+
+    def refresh(self):
+        """Refresh users, SMTP config, and storage stats."""
+        self._refresh_users()
+        self._load_smtp_settings()
+        self._update_disk_space_info()
+
+    def apply_permissions(self, role: str):
+        """Restrict RBAC tab and settings depending on role."""
+        is_admin = (role.upper() == "ADMIN")
+        self.btn_create_user.setEnabled(is_admin)
+        self.btn_save_smtp.setEnabled(is_admin)
+        self.btn_save_all.setEnabled(is_admin)
+

@@ -1,0 +1,172 @@
+=== gui\app.py ===
+=== gui\main_window.py ===
+  - Sistem Sa?l???
+  - Ayarlar & Depolama
+  - Hesap Y?netimi
+  - Sistem ve Ar?iv Raporlar?
+  - Sistem Sa?l???
+  - Uygulama Ayarlar? ve Port Te?his Paneli
+  - Mail Ar?ivleme Sistemi
+  - panels
+=== gui\__init__.py ===
+=== gui\dialogs\account_dialog.py ===
+  - Profil Ad? (?rn: Yandex Mail, Eski cPanel):
+=== gui\dialogs\archive_optimizer_dialog.py ===
+  - ? Optimizasyon i?lemi ba?lat?ld?...
+=== gui\dialogs\bulk_import_dialog.py ===
+  - S?TUN E?LE?T?RME AYARLARI
+=== gui\dialogs\export_dialog.py ===
+=== gui\dialogs\group_domain_dialog.py ===
+=== gui\dialogs\portable_import_dialog.py ===
+  - Sistem Durumu
+=== gui\dialogs\report_preview_dialog.py ===
+=== gui\dialogs\__init__.py ===
+=== gui\templates\three_panel_workspace.py ===
+  - 
+
+    panel_toggled = Signal(str, bool)  # panel_name (
+  - ? Sol Panel
+  - Sol filtre panelini g?ster/gizle
+  - Sa? Panel ?
+  - Sa? i?lem panelini g?ster/gizle
+  - ? Filtreleme ve Gruplama
+  - ? ??lem & Aksiyon Paneli
+=== gui\widgets\account_panel.py ===
+  - ??  Grup / Domain Y?netimi
+  - ??  Grup Y?netimi
+  - Grid Layout:
+  - ? Grup / Domain Filtresi
+  - grid_active_profile
+  - Toplu / H?zl? Grup De?i?tir
+  - H?zl? ?ifre G?ncelleme
+  - grid_active_profile
+  - Failed to query database groups in account_panel: %s
+  - grid_active_profile
+  - grid_profiles
+  - grid_profiles
+  - grid_profiles
+  - grid_profiles
+  - grid_active_profile
+  - grid_profiles
+  - grid_profiles
+  - grid_active_profile
+  - Save Grid Layout Profile
+  - grid_profiles
+  - grid_profiles
+  - grid_active_profile
+  - grid_active_profile
+  - grid_profiles
+  - grid_profiles
+  - grid_active_profile
+=== gui\widgets\audit_panel.py ===
+  - Audit trail viewer panel.
+=== gui\widgets\backup_panel.py ===
+  - 
+backup_panel.py ? Cloud backup panel (S3 & Google Drive).
+
+  - Cloud backup panel with S3 and Google Drive tabs.
+=== gui\widgets\export_panel.py ===
+  - D??a Aktar?m ve Sunucu E?le?tirme Ayarlar?
+  - Hedef Bi?im ve Sunucu Ayarlar?
+  - Tarih Filtresi ve Klas?r Se?imi
+  - Kaynak Sunucu Filtresi:
+  - ? Domain Filtresi:
+  - ? Grup Filtresi:
+  - ? Filtreleri S?f?rla
+  - Aksiyonlar
+  - Export ayarlar? ba?ar?yla g?ncellendi.
+=== gui\widgets\health_panel.py ===
+  - 
+health_panel.py ? System health check panel.
+
+  - System health monitoring panel.
+=== gui\widgets\mail_viewer_panel.py ===
+  - Left panel: account > folder tree from database.
+  - Center panel: mail list for selected folder with paging.
+  - Grup / Domain filtresine g?re hesaplar? ve klas?rleri s?z?n
+=== gui\widgets\pro_grid_widget.py ===
+  - default_grid
+  - ? Tabloda H?zl? Arama...
+  - grid_state_{self.grid_id}
+  - Grid D?zeni Kaydedildi
+  - grid_state_{self.grid_id}
+  - grid_state_{self.grid_id}
+  - Grid S?f?rland?
+=== gui\widgets\report_panel.py ===
+  - 
+
+
+class ReportPanel(QWidget):
+    
+  - Tarih Filtresi Aktif
+  - ? Filtreleri Temizle
+  - Sistem Metri?i
+  - Sa?l?k / Durum Filtresi:
+  - Sistem Metri?i
+  - Filtre / Rapor Se?ilmedi
+=== gui\widgets\restore_panel.py ===
+  - 
+restore_panel.py ? Restore from cloud backup panel.
+
+  - Restore panel with S3 and Google Drive tabs.
+=== gui\widgets\schedule_panel.py ===
+  - 
+schedule_panel.py ? Task scheduler panel.
+
+  - Task scheduler management panel.
+=== gui\widgets\search_panel.py ===
+  - 
+
+
+class SearchPanel(QWidget):
+    
+  - ? Detayl? E-Posta Arama Paneli
+  - ? Sol Filtre Paneli
+  - ? Sa? ?nizleme Paneli
+  - ? Domain & Filtre Se?enekleri
+  - ? Domain Filtresi:
+  - ? Grup Filtresi:
+  - ? Klas?r Filtresi (A??l?r ?oklu Se?im):
+  - ? Filtreleri S?f?rla
+  - search_{panel_name}_visible
+=== gui\widgets\settings_panel.py ===
+  - Main Settings and Diagnostic Workspace Panel.
+  - ? T?m Ayarlar? Kaydet
+  - ? Dil & Aray?z Ayarlar?
+  - ? Versiyon & Git Y?netimi
+  - cPanel SSL (2096)
+  - ? Depolama ve Veritaban? Y?netimi
+  - ? Sol Disk Paneli
+  - ?? Sa? Veritaban? Paneli
+  - storage_{panel_name}_visible
+  - ? Disk & Depolama Y?netimi
+  - ?? Git & Versiyon Y?netimi Paneli
+  - ? Versiyon Paneli
+  - Git Remote Sunucu & Repository Ayarlar?
+  - ? Git Ayarlar?n? Kaydet
+  - Git remote ve branch ayarlar? ba?ar?yla kaydedildi.
+  - Ayarlar Kaydedildi
+  - T?m uygulama ve a? ayarlar? ba?ar?yla kaydedildi.
+=== gui\widgets\sync_panel.py ===
+  - Ar?ivleme Filtreleri: {account_label}
+  - Geli?mi? Ar?ivleme Filtreleri
+  - Email synchronization panel with detailed logging.
+  - ?? ??lem Paneli ?
+  - Sa? taraftaki i?lem butonlar?n? gizle/g?ster
+  - Grup / Domain Filtresi
+  - Sistemdeki t?m hesaplar? senkronize eder
+  - Ar?iv klas?rlerini ve filtreleri ayarlar
+  - Aktif ar?iv i?lemlerini duraklat?r
+  - Aktif ar?iv i?lemlerini iptal eder
+  - )}] Filtreler kaydedildi: {len(new_f_data[
+  - ?? ??lem Paneli ?
+  - ?? ??lem Paneli ?
+  - ?? Klas?r & Filtre Ayarlar?...
+  - Filtre Ayar? Eksik
+  - [{acc_label}] Klas?r e?le?tirme/filtre ayar? iptal edildi.
+  - grid_state_sync_account_table
+  - Grid D?zeni Kaydedildi
+  - grid_state_sync_account_table
+  - grid_state_sync_account_table
+  - Grid S?f?rland?
+=== gui\widgets\__init__.py ===

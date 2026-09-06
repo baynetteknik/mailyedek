@@ -1,57 +1,61 @@
 """
-sync_panel.py — Email synchronization panel with detailed logging.
+sync_panel.py — Email synchronization panel with detailed logging,
+asynchronous (lazy load) disk & database scanner, multi-account background workers,
+live row progress bars, and comprehensive reporting.
 """
 
 import logging
 import threading
 import re
-from typing import Optional
+from typing import Optional, Any, Dict, List
 from datetime import datetime
+from pathlib import Path
 
-from PySide6.QtCore import Qt, Slot, Signal, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QDate, QObject, QEventLoop, QThread, QPoint, QTimer
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtCore import (
+    Qt, Slot, Signal, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
+    QDate, QObject, QEventLoop, QThread, QPoint, QTimer, QSize
+)
+from PySide6.QtGui import QFont, QColor, QIcon, QAction, QCursor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
     QGroupBox, QMessageBox, QListWidget, QListWidgetItem,
     QAbstractItemView, QFrame, QTableView, QComboBox, QLineEdit,
     QDialog, QDialogButtonBox, QCheckBox, QDateEdit, QTextEdit,
-    QSpinBox, QMenu,
+    QSpinBox, QMenu, QScrollArea, QApplication, QInputDialog
 )
 
 from core.mail_engine import MailEngine
 from core.settings import AppSettings
-from gui.widgets.pro_grid_widget import ProHeaderView
+from gui.widgets.view_profile_widget import ViewProfileWidget, SaveLayoutProfileDialog, ColumnManagerDialog
+from gui.widgets.account_group_sidebar_widget import AccountGroupSidebarWidget, CollapsibleSection
+from gui.widgets.sync_right_sidebar_widget import SyncRightSidebarWidget
 
 logger = logging.getLogger(__name__)
 
 GLOBAL_MSG_STYLE = """
     QMessageBox, QDialog, QProgressDialog {
         background-color: #f8fafc;
-    }
-    QLabel {
         color: #0f172a;
-        font-weight: 600;
+    }
+    QMessageBox QLabel, QInputDialog QLabel, QProgressDialog QLabel {
+        color: #0f172a;
+        font-weight: 500;
         font-size: 13px;
     }
-    QPushButton {
-        background-color: #2563eb !important;
-        color: #ffffff !important;
-        font-weight: 700;
+    QMessageBox QPushButton, QDialog QPushButton {
+        background-color: #2563eb;
+        color: #ffffff;
+        font-weight: 600;
         font-size: 12px;
         border: none;
         border-radius: 6px;
-        padding: 8px 20px;
-        min-width: 95px;
+        padding: 6px 16px;
+        min-width: 85px;
         min-height: 28px;
     }
-    QPushButton:hover {
-        background-color: #1d4ed8 !important;
-        color: #ffffff !important;
-    }
-    QPushButton:pressed {
-        background-color: #1e40af !important;
-        color: #ffffff !important;
+    QMessageBox QPushButton:hover, QDialog QPushButton:hover {
+        background-color: #1d4ed8;
     }
 """
 
@@ -71,7 +75,7 @@ class LogEntry:
 
 
 class LogTableModel(QAbstractTableModel):
-    COLUMNS = ["Time", "Level", "Source", "Message"]
+    COLUMNS = ["Saat", "Seviye", "Kaynak", "Mesaj"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -157,7 +161,7 @@ class LogFilterProxy(QSortFilterProxyModel):
                 for col in range(model.columnCount()):
                     idx = model.index(source_row, col, source_parent)
                     val = idx.data(Qt.DisplayRole) or ""
-                    if self._filter_text.lower() in val.lower():
+                    if self._filter_text.lower() in str(val).lower():
                         found = True
                         break
                 if not found:
@@ -170,35 +174,80 @@ class LogFilterProxy(QSortFilterProxyModel):
 # ---------------------------------------------------------------------------
 
 class StatCard(QFrame):
-    def __init__(self, title: str, value: str = "\u2014", parent=None):
+    def __init__(self, title: str, value: str = "—", icon: str = "", parent=None):
         super().__init__(parent)
         self.setStyleSheet("""
             StatCard {
                 background: #ffffff;
-                border: 1.5px solid #d0d3d8;
+                border: 1px solid #e2e8f0;
                 border-radius: 8px;
-                padding: 6px;
+                padding: 4px;
             }
         """)
-        self.setMinimumHeight(80)
+        self.setMinimumHeight(64)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(4)
-        self.title_label = QLabel(title)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(2)
+        
+        self.title_label = QLabel(f"{icon} {title}" if icon else title)
         self.title_label.setStyleSheet(
-            "font-size:11px;color:#6b7280;font-weight:500;border:none;"
+            "font-size: 10.5px; color: #64748b; font-weight: 600; border: none;"
         )
         self.title_label.setAlignment(Qt.AlignCenter)
+        
         self.value_label = QLabel(value)
         self.value_label.setStyleSheet(
-            "font-size:20px;font-weight:700;color:#1a1a2e;border:none;"
+            "font-size: 14px; font-weight: 700; color: #1e293b; border: none;"
         )
         self.value_label.setAlignment(Qt.AlignCenter)
+        self.value_label.setWordWrap(True)
+        
         layout.addWidget(self.title_label)
         layout.addWidget(self.value_label)
 
     def set_value(self, val: str):
         self.value_label.setText(val)
+
+
+# ---------------------------------------------------------------------------
+# Asynchronous Lazy Load Worker for Database Stats
+# ---------------------------------------------------------------------------
+
+class SyncDataLoaderWorker(QThread):
+    """Background worker to query folder and email statistics without freezing GUI."""
+    progress_signal = Signal(int, int)  # current, total
+    account_loaded_signal = Signal(int, int, int)  # account_id, mails_cnt, folders_cnt
+    finished_signal = Signal(object)  # all stats dict
+
+    def __init__(self, engine: MailEngine, account_ids: List[int], parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.account_ids = account_ids
+
+    def run(self):
+        results = {}
+        total = len(self.account_ids)
+        try:
+            with self.engine.db.get_conn() as conn:
+                for idx, aid in enumerate(self.account_ids):
+                    self.progress_signal.emit(idx + 1, total)
+                    try:
+                        row_m = conn.execute(
+                            "SELECT COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (aid,)
+                        ).fetchone()
+                        m_cnt = row_m["cnt"] if row_m else 0
+                        row_f = conn.execute(
+                            "SELECT COUNT(DISTINCT folder) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (aid,)
+                        ).fetchone()
+                        f_cnt = row_f["cnt"] if row_f else 0
+                        results[aid] = {"mails": m_cnt, "folders": f_cnt}
+                        self.account_loaded_signal.emit(aid, m_cnt, f_cnt)
+                    except Exception:
+                        results[aid] = {"mails": 0, "folders": 0}
+        except Exception as e:
+            logger.debug("SyncDataLoaderWorker DB read exception: %s", e)
+        finally:
+            self.finished_signal.emit(results)
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +258,7 @@ class ReportsDialog(QDialog):
     def __init__(self, reports: list, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Senkronizasyon Sonuç Raporları")
-        self.resize(880, 520)
+        self.resize(920, 560)
         self.setStyleSheet("""
             QDialog {
                 background-color: #f8fafc;
@@ -219,49 +268,46 @@ class ReportsDialog(QDialog):
             }
             QFrame {
                 background-color: #ffffff;
-                border: 1px solid #e2e8f0;
+                border: 1px solid #cbd5e1;
                 border-radius: 8px;
             }
             QTableWidget {
                 color: #1e293b;
                 background-color: #ffffff;
-                border: 1px solid #e2e8f0;
+                border: 1px solid #cbd5e1;
                 gridline-color: #f1f5f9;
                 border-radius: 6px;
             }
             QHeaderView::section {
-                background-color: #f8fafc;
-                color: #475569;
+                background-color: #1e3a8a;
+                color: #ffffff !important;
                 font-weight: bold;
-                padding: 10px;
-                border: none;
-                border-bottom: 2px solid #e2e8f0;
+                padding: 8px;
+                border: 1px solid #1e40af;
                 font-size: 11px;
             }
             QPushButton {
-                background-color: #4361ee;
+                background-color: #2563eb;
                 color: white;
                 font-weight: 600;
-                padding: 6px 16px;
-                border-radius: 4px;
-                min-height: 20px;
+                padding: 8px 20px;
+                border-radius: 6px;
+                min-height: 24px;
             }
             QPushButton:hover {
-                background-color: #3a56d4;
+                background-color: #1d4ed8;
             }
         """)
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(12)
         
-        # Header Title
-        header_title = QLabel("📊 E-Posta Arşivleme Raporu")
-        header_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
-        header_title.setStyleSheet("color: #1e293b; padding-bottom: 4px;")
+        header_title = QLabel("📊 E-Posta Arşivleme ve Senkronizasyon Raporu")
+        header_title.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        header_title.setStyleSheet("color: #0f172a;")
         layout.addWidget(header_title)
         
-        # Calculate Totals for Summary Cards
         total_accounts = len(reports)
         total_fetched = 0
         total_archived = 0
@@ -280,16 +326,15 @@ class ReportsDialog(QDialog):
             total_errors += g("errors", 0)
             total_bytes += g("total_bytes", 0)
             
-        # Horizontal layout for summary cards
         summary_layout = QHBoxLayout()
         summary_layout.setSpacing(10)
         
         cards_data = [
-            ("Toplam Hesap", str(total_accounts), "#4361ee"),
+            ("Toplam Hesap", str(total_accounts), "#2563eb"),
             ("Çekilen İletiler", str(total_fetched), "#10b981"),
             ("Mükerrer (Kopya)", str(total_duplicates), "#f59e0b"),
             ("Hatalar", str(total_errors), "#ef4444" if total_errors > 0 else "#64748b"),
-            ("Toplam Boyut", self._fmt_bytes(total_bytes), "#7209b7")
+            ("Toplam Boyut", self._fmt_bytes(total_bytes), "#7c3aed")
         ]
         
         for label_text, val_text, color in cards_data:
@@ -314,15 +359,13 @@ class ReportsDialog(QDialog):
             
         layout.addLayout(summary_layout)
         
-        # Detailed Table
         table = QTableWidget()
         table.setColumnCount(8)
         table.setHorizontalHeaderLabels([
-            "Hesap Adı", "Çekilen E-Posta", "Zaten Arşivlenmiş", "Güncellenmiş", 
+            "Hesap Adı", "Çekilen E-Posta", "Mevcut / Güncel", "Güncellenmiş", 
             "Mükerrer (Kopya)", "Hatalar", "Veri Boyutu", "Süre"
         ])
         
-        # Column resizing behavior
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for col in range(1, 8):
             table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
@@ -332,17 +375,15 @@ class ReportsDialog(QDialog):
         table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
         table.setRowCount(len(reports))
+        
         for i, r in enumerate(reports):
             def g(k, d=None):
                 return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
                 
-            # Account Label (left aligned, bold)
             item_lbl = QTableWidgetItem(str(g("account_label", "")))
             item_lbl.setFont(QFont("Segoe UI", 10, QFont.Bold))
-            item_lbl.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             table.setItem(i, 0, item_lbl)
             
-            # Fetched (green if > 0)
             fetched = g("mails_fetched", 0)
             item_fetched = QTableWidgetItem(str(fetched))
             if fetched > 0:
@@ -351,17 +392,14 @@ class ReportsDialog(QDialog):
             item_fetched.setTextAlignment(Qt.AlignCenter)
             table.setItem(i, 1, item_fetched)
             
-            # Already Archived
             item_archived = QTableWidgetItem(str(g("mails_already_archived", 0)))
             item_archived.setTextAlignment(Qt.AlignCenter)
             table.setItem(i, 2, item_archived)
             
-            # Updated
             item_updated = QTableWidgetItem(str(g("mails_updated", 0)))
             item_updated.setTextAlignment(Qt.AlignCenter)
             table.setItem(i, 3, item_updated)
             
-            # Duplicates (orange/yellow if > 0)
             dupes = g("duplicates_found", 0)
             item_dupes = QTableWidgetItem(str(dupes))
             if dupes > 0:
@@ -370,7 +408,6 @@ class ReportsDialog(QDialog):
             item_dupes.setTextAlignment(Qt.AlignCenter)
             table.setItem(i, 4, item_dupes)
             
-            # Errors (red if > 0)
             errors = g("errors", 0)
             item_errors = QTableWidgetItem(str(errors))
             if errors > 0:
@@ -379,13 +416,11 @@ class ReportsDialog(QDialog):
             item_errors.setTextAlignment(Qt.AlignCenter)
             table.setItem(i, 5, item_errors)
             
-            # Data bytes
             bv = g("total_bytes", 0)
             item_bytes = QTableWidgetItem(self._fmt_bytes(bv))
             item_bytes.setTextAlignment(Qt.AlignCenter)
             table.setItem(i, 6, item_bytes)
             
-            # Duration
             dur = g("duration_seconds", 0)
             item_dur = QTableWidgetItem(f"{dur:.1f}s")
             item_dur.setTextAlignment(Qt.AlignCenter)
@@ -393,7 +428,6 @@ class ReportsDialog(QDialog):
             
         layout.addWidget(table)
 
-        # Collect error details
         all_error_details = []
         for r in reports:
             def g(k, d=None):
@@ -416,7 +450,7 @@ class ReportsDialog(QDialog):
 
             err_box = QTextEdit()
             err_box.setReadOnly(True)
-            err_box.setMaximumHeight(120)
+            err_box.setMaximumHeight(100)
             err_box.setStyleSheet("""
                 QTextEdit {
                     background-color: #fef2f2;
@@ -430,7 +464,7 @@ class ReportsDialog(QDialog):
             if all_error_details:
                 err_box.setPlainText("\n".join(f"• {e}" for e in all_error_details))
             else:
-                err_box.setPlainText(f"• Toplam {total_errors} adet senkronizasyon hatası oluştu. Ayrıntılar için sunucu bağlantınızı ve klasör izinlerini kontrol edin.")
+                err_box.setPlainText(f"• Toplam {total_errors} adet senkronizasyon hatası oluştu.")
             layout.addWidget(err_box)
         
         btn_box = QDialogButtonBox(QDialogButtonBox.Close)
@@ -454,25 +488,25 @@ class DetailedReportDialog(QDialog):
     def __init__(self, engine: MailEngine, parent=None):
         super().__init__(parent)
         self.engine = engine
-        self.setWindowTitle("Detailed Diagnostics & Folder Report")
-        self.resize(720, 500)
+        self.setWindowTitle("Detaylı Sistem ve Klasör Teşhis Raporu")
+        self.resize(780, 540)
         self.setStyleSheet("""
             QDialog {
                 background-color: #f8fafc;
             }
             QLabel {
-                color: #1e293b;
+                color: #0f172a;
             }
             QTextEdit {
                 background-color: #ffffff;
-                border: 1.5px solid #d0d3d8;
+                border: 1px solid #cbd5e1;
                 border-radius: 6px;
                 font-family: Consolas, Monaco, monospace;
-                font-size: 11px;
-                color: #334155;
+                font-size: 11.5px;
+                color: #1e293b;
             }
             QPushButton {
-                background-color: #4361ee;
+                background-color: #2563eb;
                 color: white;
                 font-weight: 600;
                 padding: 8px 18px;
@@ -480,7 +514,7 @@ class DetailedReportDialog(QDialog):
                 font-size: 12px;
             }
             QPushButton:hover {
-                background-color: #3a56d4;
+                background-color: #1d4ed8;
             }
         """)
         
@@ -488,8 +522,8 @@ class DetailedReportDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
         
-        info_label = QLabel("<b>System Diagnostics & Detailed Folder Report</b>")
-        info_label.setStyleSheet("color: #1a1a2e; font-size: 13px;")
+        info_label = QLabel("<b>Sistem Teşhisi & Klasör İstatistik Raporu</b>")
+        info_label.setStyleSheet("color: #0f172a; font-size: 13px;")
         layout.addWidget(info_label)
         
         self.text_edit = QTextEdit()
@@ -498,12 +532,11 @@ class DetailedReportDialog(QDialog):
         layout.addWidget(self.text_edit)
         
         btn_layout = QHBoxLayout()
-        self.btn_copy = QPushButton("📋 Copy Diagnostics to Clipboard")
-        self.btn_copy.setStyleSheet(self._btn_style("#2563eb", "#1d4ed8"))
+        self.btn_copy = QPushButton("📋 Raporu Panoya Kopyala")
         self.btn_copy.clicked.connect(self._copy_to_clipboard)
         
-        self.btn_close = QPushButton("Close")
-        self.btn_close.setStyleSheet(self._btn_style("#64748b", "#475569"))
+        self.btn_close = QPushButton("Kapat")
+        self.btn_close.setStyleSheet("background-color: #64748b;")
         self.btn_close.clicked.connect(self.accept)
         
         btn_layout.addWidget(self.btn_copy)
@@ -514,31 +547,30 @@ class DetailedReportDialog(QDialog):
         self._generate_report()
 
     def _generate_report(self):
-        # 1. Gather stats
         stats = self.engine.get_stats()
         accounts = self.engine.list_accounts()
         db_path = self.engine.db._db_path
         
         report_lines = []
         report_lines.append("# MAIL ARCHIVE DIAGNOSTICS REPORT")
-        report_lines.append(f"Generated At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report_lines.append(f"Oluşturulma Zamanı: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         report_lines.append("---")
-        report_lines.append("## 1. System Info & Database Paths")
-        report_lines.append(f"- **Database Path:** {db_path}")
-        report_lines.append(f"- **Database File Size:** {self._fmt_size(db_path.stat().st_size) if db_path.exists() else 'N/A'}")
-        report_lines.append(f"- **Attachments Folder:** {db_path.parent / 'attachments'}")
+        report_lines.append("## 1. Sistem ve Veritabanı Yolları")
+        report_lines.append(f"- Veritabanı Dosyası: {db_path}")
+        report_lines.append(f"- Veritabanı Boyutu: {self._fmt_size(db_path.stat().st_size) if db_path.exists() else 'N/A'}")
+        report_lines.append(f"- Ek Dosyalar Klasörü: {db_path.parent / 'attachments'}")
         
-        report_lines.append("\n## 2. Database Stats")
-        report_lines.append(f"- **Total Accounts:** {stats.get('total_accounts', len(accounts))}")
-        report_lines.append(f"- **Total Emails Archived:** {stats.get('total_emails', 0)}")
-        report_lines.append(f"- **Total Attachments:** {stats.get('total_attachments', 0)}")
-        report_lines.append(f"- **Total Size of Archived Emails:** {self._fmt_size(stats.get('total_size_bytes', 0))}")
+        report_lines.append("\n## 2. Genel İstatistikler")
+        report_lines.append(f"- Toplam Hesap: {stats.get('total_accounts', len(accounts))}")
+        report_lines.append(f"- Arşivlenmiş Toplam E-Posta: {stats.get('total_emails', 0):,}")
+        report_lines.append(f"- Toplam Ek Dosya Sayısı: {stats.get('total_attachments', 0):,}")
+        report_lines.append(f"- Arşiv Boyutu: {self._fmt_size(stats.get('total_size_bytes', 0))}")
         
-        report_lines.append("\n## 3. Account & Folder Detailed Listing")
+        report_lines.append("\n## 3. Hesap ve Klasör Dağılımı")
         for acc in accounts:
-            report_lines.append(f"\n### Account: {acc.get('label', '?')} ({acc.get('email', '?')})")
-            report_lines.append(f"- **IMAP Host:** {acc.get('imap_host', '?')}:{acc.get('imap_port', 993)}")
-            report_lines.append(f"- **Active Status:** {'Active' if acc.get('is_active', 1) else 'Inactive'}")
+            report_lines.append(f"\n### Hesap: {acc.get('label', '?')} ({acc.get('email', '?')})")
+            report_lines.append(f"- Sunucu: {acc.get('imap_host', '?')}:{acc.get('imap_port', 993)}")
+            report_lines.append(f"- Durum: {'Aktif' if acc.get('is_active', 1) else 'Pasif'}")
             
             try:
                 with self.engine.db.get_conn() as conn:
@@ -557,16 +589,16 @@ class DetailedReportDialog(QDialog):
             except Exception as e:
                 folder_states = []
                 folder_counts = {}
-                report_lines.append(f"- *Error reading local database folders: {e}*")
+                report_lines.append(f"- Klasörler okunamadı: {e}")
             
             if folder_states:
-                report_lines.append("| Folder Name | Archived Count | Last UID | UID Validity | Last Sync At |")
+                report_lines.append("| Klasör Adı | Arşivlenmiş Adet | Son UID | UID Geçerlilik | Son Senkronizasyon |")
                 report_lines.append("| --- | --- | --- | --- | --- |")
                 for folder, last_uid, uid_validity, last_sync_at in folder_states:
                     count = folder_counts.get(folder, 0)
                     report_lines.append(f"| {folder} | {count} | {last_uid} | {uid_validity} | {last_sync_at} |")
             else:
-                report_lines.append("- *No folders synchronized yet or folder states empty in database.*")
+                report_lines.append("- Henüz senkronize edilmiş klasör bulunmuyor.")
         
         self.text_edit.setPlainText("\n".join(report_lines))
 
@@ -581,14 +613,8 @@ class DetailedReportDialog(QDialog):
         from PySide6.QtGui import QGuiApplication
         clipboard = QGuiApplication.clipboard()
         clipboard.setText(self.text_edit.toPlainText())
-        QMessageBox.information(self, "Copied", "Detailed Diagnostics Report copied to clipboard!")
+        QMessageBox.information(self, "Kopyalandı", "Teşhis raporu panoya kopyalandı!")
 
-
-# ---------------------------------------------------------------------------
-# Confirmation dialog
-# ---------------------------------------------------------------------------
-
-from PySide6.QtGui import QColor, QFont, QAction, QBrush, QPixmap, QPainter
 
 # ---------------------------------------------------------------------------
 # Folders & Advanced Filters Dialog (Pop-up)
@@ -607,16 +633,15 @@ class FiltersDialog(QDialog):
         
         self.setWindowTitle(f"Arşivleme Filtreleri: {account_label}")
         self.resize(920, 600)
-        self.setStyleSheet("QDialog { background-color: #f8fafc; }")
+        self.setStyleSheet("QDialog { background-color: #f8fafc; color: #0f172a; }")
         
-        # Connect signal for background folder refreshes
         self._refresh_done_signal.connect(self._on_refresh_done_gui)
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
         
-        # Header Info Displaying Account
+        # Header Info
         header_frame = QFrame()
         header_frame.setStyleSheet("""
             QFrame {
@@ -632,16 +657,18 @@ class FiltersDialog(QDialog):
         info_icon.setStyleSheet("font-size: 24px;")
         header_layout.addWidget(info_icon)
         
-        info_text = QLabel(f"<b>Hesap:</b> {account_label}<br/><span style='color: #64748b; font-size: 11px;'>Bu pencerede yapılacak filtre ayarları yalnızca bu hesaba uygulanacaktır.</span>")
+        info_text = QLabel(
+            f"<b>Hesap:</b> <span style='color:#2563eb;'>{account_label}</span><br/>"
+            f"<span style='color: #64748b; font-size: 11.5px;'>Bu pencerede yapılacak filtre ayarları yalnızca bu hesaba uygulanacaktır.</span>"
+        )
         info_text.setStyleSheet("color: #1e293b; font-size: 13px;")
         header_layout.addWidget(info_text, stretch=1)
         layout.addWidget(header_frame)
         
-        # Main body splitter/horizontal layout
         body_layout = QHBoxLayout()
         body_layout.setSpacing(14)
         
-        # LEFT COLUMN: Folders Group Box (2/3 width)
+        # LEFT COLUMN: Folders
         folders_group = QGroupBox("Arşivlenecek Klasörleri Seçin")
         folders_group.setStyleSheet("""
             QGroupBox {
@@ -650,8 +677,8 @@ class FiltersDialog(QDialog):
                 border-radius: 8px;
                 margin-top: 10px;
                 font-weight: bold;
-                font-size: 11px;
-                color: #4361ee;
+                font-size: 11.5px;
+                color: #1e3a8a;
             }
         """)
         fg_layout = QVBoxLayout(folders_group)
@@ -666,7 +693,7 @@ class FiltersDialog(QDialog):
                 border: 1px solid #cbd5e1;
                 border-radius: 6px;
                 font-size: 12px;
-                color: #1e293b;
+                color: #0f172a;
             }
             QListWidget::item {
                 padding: 6px 8px;
@@ -684,7 +711,6 @@ class FiltersDialog(QDialog):
             
         fg_layout.addWidget(self.folder_list)
         
-        # Control Buttons under Folder List
         btns_folder = QHBoxLayout()
         btn_sel_all = QPushButton("Tümünü Seç")
         btn_sel_all.setStyleSheet(self._filter_btn_style())
@@ -698,10 +724,10 @@ class FiltersDialog(QDialog):
         self.btn_refresh_server.setStyleSheet("""
             QPushButton {
                 background: #f1f5f9;
-                color: #4361ee;
+                color: #2563eb;
                 border: 1px solid #cbd5e1;
                 font-weight: 600;
-                padding: 4px 12px;
+                padding: 5px 12px;
                 border-radius: 4px;
                 font-size: 11px;
             }
@@ -719,22 +745,22 @@ class FiltersDialog(QDialog):
         
         body_layout.addWidget(folders_group, stretch=2)
         
-        # RIGHT COLUMN: Advanced Filters Group Box (1/3 width)
+        # RIGHT COLUMN: Advanced Filters
         filters_group = QGroupBox("Gelişmiş Arşivleme Filtreleri")
         filters_group.setStyleSheet(folders_group.styleSheet())
         filters_layout = QVBoxLayout(filters_group)
-        filters_layout.setContentsMargins(12, 16, 12, 12)
-        filters_layout.setSpacing(10)
+        filters_layout.setContentsMargins(14, 18, 14, 14)
+        filters_layout.setSpacing(12)
         
         self.chk_archive_unread = QCheckBox("Okunmamış iletileri de arşivle")
         self.chk_archive_unread.setChecked(archive_unread)
-        self.chk_archive_unread.setStyleSheet("color: #1e293b; font-size: 12px;")
+        self.chk_archive_unread.setStyleSheet("color: #0f172a; font-size: 12px; font-weight: 500;")
         filters_layout.addWidget(self.chk_archive_unread)
         
         since_layout = QVBoxLayout()
         self.chk_since_date = QCheckBox("Şu tarihten yeni iletiler:")
         self.chk_since_date.setChecked(since_date_enabled)
-        self.chk_since_date.setStyleSheet("color: #1e293b; font-size: 12px;")
+        self.chk_since_date.setStyleSheet("color: #0f172a; font-size: 12px; font-weight: 500;")
         self.date_edit_since = QDateEdit()
         self.date_edit_since.setCalendarPopup(True)
         self.date_edit_since.setDate(since_date)
@@ -747,7 +773,7 @@ class FiltersDialog(QDialog):
         before_layout = QVBoxLayout()
         self.chk_before_date = QCheckBox("Şu tarihten eski iletiler:")
         self.chk_before_date.setChecked(before_date_enabled)
-        self.chk_before_date.setStyleSheet("color: #1e293b; font-size: 12px;")
+        self.chk_before_date.setStyleSheet("color: #0f172a; font-size: 12px; font-weight: 500;")
         self.date_edit_before = QDateEdit()
         self.date_edit_before.setCalendarPopup(True)
         self.date_edit_before.setDate(before_date)
@@ -757,47 +783,21 @@ class FiltersDialog(QDialog):
         before_layout.addWidget(self.date_edit_before)
         filters_layout.addLayout(before_layout)
         
-        timeout_layout = QHBoxLayout()
-        self.lbl_timeout = QLabel("Zaman Aşımı:")
-        self.lbl_timeout.setStyleSheet("color: #1e293b; font-size: 12px;")
+        timeout_layout = QVBoxLayout()
+        lbl_timeout = QLabel("Zaman Aşımı Süresi (Saniye):")
+        lbl_timeout.setStyleSheet("color: #0f172a; font-size: 11.5px; font-weight: 500;")
         self.spin_timeout = QSpinBox()
-        self.spin_timeout.setRange(10, 3600)
+        self.spin_timeout.setRange(30, 3600)
         self.spin_timeout.setValue(timeout)
-        self.spin_timeout.setSuffix(" saniye")
-        self.spin_timeout.setStyleSheet("color: #1e293b; font-size: 12px;")
-        timeout_layout.addWidget(self.lbl_timeout)
+        timeout_layout.addWidget(lbl_timeout)
         timeout_layout.addWidget(self.spin_timeout)
-        timeout_layout.addStretch()
         filters_layout.addLayout(timeout_layout)
-        filters_layout.addStretch()
         
+        filters_layout.addStretch()
         body_layout.addWidget(filters_group, stretch=1)
         layout.addLayout(body_layout)
         
-        # OK / Cancel (Kaydet / Vazgeç) Buttons
         btn_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        btn_box.button(QDialogButtonBox.Save).setText("Kaydet")
-        btn_box.button(QDialogButtonBox.Cancel).setText("Vazgeç")
-        
-        btn_box.setStyleSheet("""
-            QPushButton {
-                background: #4361ee;
-                color: white;
-                font-weight: 600;
-                padding: 8px 20px;
-                border-radius: 6px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background: #3a56d4;
-            }
-            QPushButton[text="Vazgeç"] {
-                background: #64748b;
-            }
-            QPushButton[text="Vazgeç"]:hover {
-                background: #475569;
-            }
-        """)
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self.reject)
         layout.addWidget(btn_box)
@@ -825,8 +825,6 @@ class FiltersDialog(QDialog):
         self.btn_refresh_server.setEnabled(False)
         self.btn_refresh_server.setText("⏳ Yükleniyor...")
         
-        import threading
-        
         def task():
             try:
                 acc = self.engine.accounts.get(self.account_id)
@@ -838,7 +836,6 @@ class FiltersDialog(QDialog):
                 from infrastructure.imap_client import ImapClient
                 
                 provider = ProviderRegistry().get_mail_provider(acc.get("provider_type", "imap")) or ImapClient()
-                
                 username = self.engine.crypto.decrypt(acc["username_enc"])
                 password = self.engine.crypto.decrypt(acc["password_enc"])
                 
@@ -898,7 +895,7 @@ class FiltersDialog(QDialog):
                 background: #e2e8f0;
                 color: #334155;
                 font-weight: 600;
-                padding: 4px 10px;
+                padding: 5px 10px;
                 border-radius: 4px;
                 font-size: 11px;
             }
@@ -906,6 +903,7 @@ class FiltersDialog(QDialog):
                 background: #cbd5e1;
             }
         """
+
 
 # ---------------------------------------------------------------------------
 # Background Dry Run Worker
@@ -926,8 +924,6 @@ class DryRunWorker(QThread):
     def run(self):
         previews = []
         try:
-            from pathlib import Path
-            import re
             for acc_id in self.ids:
                 if self.is_cancelled:
                     break
@@ -944,7 +940,6 @@ class DryRunWorker(QThread):
                             base_path = Path(loc.path)
                             break
                             
-                # Check group/domain
                 group_val = acc.get("account_group", "").strip()
                 if not group_val and "@" in acc.get("email", ""):
                     group_val = acc["email"].split("@")[-1]
@@ -1029,304 +1024,337 @@ class DryRunWorker(QThread):
                         "folders_list": [],
                     })
         except Exception as e:
-            logger.exception("DryRunWorker run method crashed: %s", e)
+            logger.exception("DryRunWorker error: %s", e)
         finally:
             self.finished_signal.emit(previews)
 
+
 # ---------------------------------------------------------------------------
-# Confirmation dialog
+# High Contrast, Modern Sync Confirmation Dialog
 # ---------------------------------------------------------------------------
 
 class SyncConfirmDialog(QDialog):
     def __init__(self, account_previews: list, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("İşlem Aktarma Raporu")
-        self.resize(800, 500)
-        self.setMinimumSize(700, 400)
-        self.setStyleSheet("QDialog { background-color: #f8fafc; }")
+        self.setWindowTitle("Senkronizasyon & Arşivleme Önizleme Raporu")
+        self.resize(980, 620)
+        self.setMinimumSize(850, 520)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8fafc;
+            }
+            QLabel {
+                color: #0f172a;
+            }
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+            }
+            QTableWidget {
+                color: #0f172a;
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                gridline-color: #f1f5f9;
+                border-radius: 6px;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #1e3a8a;
+                color: #ffffff !important;
+                font-weight: 700;
+                padding: 8px 10px;
+                border: 1px solid #1e40af;
+                font-size: 11.5px;
+            }
+        """)
         
         self.previews = account_previews
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(12)
         
-        # 1. Header Banner
+        # 1. Header Frame
         header_frame = QFrame()
         header_frame.setStyleSheet("""
             QFrame {
                 background-color: #ffffff;
-                border: 1px solid #e2e8f0;
+                border: 1.5px solid #cbd5e1;
                 border-radius: 8px;
-                padding: 15px;
             }
         """)
-        header_layout = QVBoxLayout(header_frame)
-        header_layout.setContentsMargins(10, 10, 10, 10)
-        header_layout.setSpacing(4)
+        header_layout = QHBoxLayout(header_frame)
+        header_layout.setContentsMargins(16, 10, 16, 10)
+        header_layout.setSpacing(12)
         
-        title_lbl = QLabel("İŞLEM AKTARMA RAPOR")
-        title_lbl.setAlignment(Qt.AlignCenter)
-        title_lbl.setStyleSheet("font-size: 20px; font-weight: bold; color: #4361ee; letter-spacing: 1px;")
+        header_icon = QLabel("🚀")
+        header_icon.setStyleSheet("font-size: 28px; background: transparent; border: none;")
+        header_layout.addWidget(header_icon)
         
-        subtitle_lbl = QLabel("Bu ayarların tamamı Configure Filters (Filtre Ayarları) ekranından alınmıştır.")
-        subtitle_lbl.setAlignment(Qt.AlignCenter)
-        subtitle_lbl.setStyleSheet("font-size: 12px; color: #64748b;")
+        header_text_vbox = QVBoxLayout()
+        header_text_vbox.setSpacing(2)
         
-        header_layout.addWidget(title_lbl)
-        header_layout.addWidget(subtitle_lbl)
+        title_lbl = QLabel("SENKRONİZASYON & ARŞİVLEME ÖNİZLEME RAPORU")
+        title_lbl.setStyleSheet("font-size: 15px; font-weight: 800; color: #1e3a8a; background: transparent; border: none;")
+        
+        subtitle_lbl = QLabel("Aşağıdaki hesap ve klasör ayarları sunucu ile eşleştirilecek ve yeni e-postalar yerel arşive indirilecektir.")
+        subtitle_lbl.setStyleSheet("font-size: 11.5px; color: #64748b; background: transparent; border: none;")
+        
+        header_text_vbox.addWidget(title_lbl)
+        header_text_vbox.addWidget(subtitle_lbl)
+        header_layout.addLayout(header_text_vbox, stretch=1)
         layout.addWidget(header_frame)
         
-        # 2. Account Selector (Visible only if > 1 accounts are being synced)
-        self.selector_layout = QHBoxLayout()
-        if len(self.previews) > 1:
-            lbl_sel = QLabel("<b>Hesap Seçin:</b>")
-            lbl_sel.setStyleSheet("color: #334155; font-size: 13px;")
-            self.combo_accounts = QComboBox()
-            self.combo_accounts.setStyleSheet("""
-                QComboBox {
-                    padding: 6px 12px;
+        # 2. Summary KPI Cards
+        total_accounts = len(self.previews)
+        total_estimated_mails = sum(p.get("new_mails", 0) for p in self.previews)
+        total_folders = sum(len(p.get("folders_list", [])) or p.get("folder_count", 0) for p in self.previews)
+        
+        kpi_layout = QHBoxLayout()
+        kpi_layout.setSpacing(10)
+        
+        kpi_data = [
+            ("Seçilen Hesap", f"{total_accounts} Adet", "#2563eb", "👥"),
+            ("Taranacak Klasör", f"{total_folders} Klasör", "#0284c7", "📁"),
+            ("Tahmini Yeni Mail", f"{total_estimated_mails:,} E-Posta", "#10b981", "✉️"),
+        ]
+        
+        for k_title, k_val, k_color, k_icon in kpi_data:
+            card = QFrame()
+            card.setStyleSheet("""
+                QFrame {
+                    background-color: #ffffff;
                     border: 1px solid #cbd5e1;
-                    border-radius: 6px;
-                    background-color: white;
-                    min-width: 250px;
+                    border-radius: 8px;
                 }
             """)
-            for idx, p in enumerate(self.previews):
-                self.combo_accounts.addItem(p.get("label", f"Hesap #{idx+1}"), idx)
-            self.combo_accounts.currentIndexChanged.connect(self._on_account_changed)
-            self.selector_layout.addWidget(lbl_sel)
-            self.selector_layout.addWidget(self.combo_accounts)
-            self.selector_layout.addStretch()
-            layout.addLayout(self.selector_layout)
+            c_lyt = QVBoxLayout(card)
+            c_lyt.setContentsMargins(12, 8, 12, 8)
+            c_lyt.setSpacing(2)
             
-        # 3. Main Body Horizontal Layout
-        body_layout = QHBoxLayout()
-        body_layout.setSpacing(15)
+            lbl_t = QLabel(f"{k_icon} {k_title.upper()}")
+            lbl_t.setStyleSheet("font-size: 10.5px; font-weight: 700; color: #64748b; background: transparent; border: none;")
+            lbl_t.setAlignment(Qt.AlignCenter)
+            
+            lbl_v = QLabel(k_val)
+            lbl_v.setStyleSheet(f"font-size: 16px; font-weight: 800; color: {k_color}; background: transparent; border: none;")
+            lbl_v.setAlignment(Qt.AlignCenter)
+            
+            c_lyt.addWidget(lbl_t)
+            c_lyt.addWidget(lbl_v)
+            kpi_layout.addWidget(card)
+            
+        layout.addLayout(kpi_layout)
         
-        # Left Panel - Folder List
-        left_group = QGroupBox("Seçilmiş Olan Klasörler")
-        left_group.setStyleSheet("""
+        # 3. Main Body Splitter Layout
+        body_layout = QHBoxLayout()
+        body_layout.setSpacing(12)
+        
+        left_box = QGroupBox(f"Hesap Listesi ({len(self.previews)})")
+        left_box.setStyleSheet("""
             QGroupBox {
                 font-weight: bold;
-                color: #334155;
-                font-size: 13px;
+                color: #1e3a8a;
+                font-size: 12px;
                 border: 1px solid #cbd5e1;
                 border-radius: 8px;
-                margin-top: 12px;
-                padding-top: 15px;
+                margin-top: 10px;
+                padding-top: 14px;
+                background-color: #ffffff;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 10px;
-                padding: 0 5px;
+                padding: 0 4px;
             }
         """)
-        left_layout = QVBoxLayout(left_group)
-        self.folder_list_widget = QListWidget()
-        self.folder_list_widget.setStyleSheet("""
+        left_layout = QVBoxLayout(left_box)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        
+        self.account_list_widget = QListWidget()
+        self.account_list_widget.setStyleSheet("""
             QListWidget {
-                border: none;
-                background-color: transparent;
-                font-size: 12px;
-                color: #1e293b;
+                border: 1px solid #e2e8f0;
+                background-color: #f8fafc;
+                border-radius: 6px;
+                color: #0f172a;
             }
             QListWidget::item {
                 padding: 8px 10px;
-                border-bottom: 1px solid #f1f5f9;
+                border-bottom: 1px solid #e2e8f0;
+                border-radius: 4px;
+                margin-bottom: 2px;
             }
             QListWidget::item:hover {
-                background-color: #f1f5f9;
-                border-radius: 4px;
+                background-color: #e0e7ff;
             }
-        """)
-        left_layout.addWidget(self.folder_list_widget)
-        body_layout.addWidget(left_group, stretch=2)
-        
-        # Right Panel - Stats Panel
-        right_group = QGroupBox("Aktarılacak Klasör ve Mail Sayısı")
-        right_group.setStyleSheet("""
-            QGroupBox {
+            QListWidget::item:selected {
+                background-color: #2563eb;
+                color: #ffffff !important;
                 font-weight: bold;
-                color: #334155;
-                font-size: 13px;
-                border: 1px solid #cbd5e1;
-                border-radius: 8px;
-                margin-top: 12px;
-                padding-top: 15px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
             }
         """)
-        right_layout = QVBoxLayout(right_group)
-        right_layout.setSpacing(18)
-        right_layout.setContentsMargins(15, 20, 15, 20)
         
-        # Labels for stats
-        self.lbl_account_name = QLabel("HESAP: -")
-        self.lbl_account_name.setStyleSheet("font-size: 12px; color: #64748b; font-weight: 600;")
+        for idx, p in enumerate(self.previews):
+            lbl_text = p.get("label", f"Hesap #{idx+1}")
+            new_cnt = p.get("new_mails", 0)
+            item = QListWidgetItem(f"👤 {lbl_text} ({new_cnt} yeni)")
+            item.setData(Qt.UserRole, idx)
+            self.account_list_widget.addItem(item)
+            
+        self.account_list_widget.currentRowChanged.connect(self._load_preview)
+        left_layout.addWidget(self.account_list_widget)
+        body_layout.addWidget(left_box, stretch=1)
         
-        self.lbl_folder_count = QLabel("0 KLASÖR")
-        self.lbl_folder_count.setStyleSheet("font-size: 22px; font-weight: bold; color: #4361ee;")
+        right_box = QGroupBox("Seçili Hesap Klasör ve Hedef Detayları")
+        right_box.setStyleSheet(left_box.styleSheet())
+        right_layout = QVBoxLayout(right_box)
+        right_layout.setContentsMargins(10, 10, 10, 10)
+        right_layout.setSpacing(8)
         
-        self.lbl_mail_count = QLabel("0 MAİL")
-        self.lbl_mail_count.setStyleSheet("font-size: 22px; font-weight: bold; color: #10b981;")
+        info_bar = QFrame()
+        info_bar.setStyleSheet("background-color: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px;")
+        info_bar_lyt = QVBoxLayout(info_bar)
+        info_bar_lyt.setContentsMargins(8, 6, 8, 6)
+        info_bar_lyt.setSpacing(4)
         
-        # Date range section
-        date_header = QLabel("AKTARILMA TARİH ARALIĞI")
-        date_header.setStyleSheet("font-size: 11px; font-weight: bold; color: #94a3b8; letter-spacing: 0.5px; margin-top: 10px;")
+        self.lbl_acc_name_details = QLabel("<b>Hesap:</b> —")
+        self.lbl_acc_name_details.setStyleSheet("font-size: 12px; color: #1e293b; background: transparent; border: none;")
         
-        self.lbl_date_range = QLabel("Tüm Zamanlar")
-        self.lbl_date_range.setStyleSheet("font-size: 14px; font-weight: 600; color: #4361ee;")
+        self.lbl_date_range_details = QLabel("<b>Tarih Filtresi:</b> Tüm Zamanlar   •   <b>Okunmamış:</b> Dahil")
+        self.lbl_date_range_details.setStyleSheet("font-size: 11.5px; color: #334155; background: transparent; border: none;")
         
-        # Add stats elements to layout
-        right_layout.addWidget(self.lbl_account_name)
+        self.lbl_target_path_details = QLabel("<b>Yedekleme Dizini:</b> —")
+        self.lbl_target_path_details.setStyleSheet("font-size: 11.5px; color: #334155; background: transparent; border: none;")
+        self.lbl_target_path_details.setWordWrap(True)
         
-        # Horizontal line
-        line1 = QFrame()
-        line1.setFrameShape(QFrame.HLine)
-        line1.setStyleSheet("background-color: #e2e8f0; max-height: 1px;")
-        right_layout.addWidget(line1)
+        info_bar_lyt.addWidget(self.lbl_acc_name_details)
+        info_bar_lyt.addWidget(self.lbl_date_range_details)
+        info_bar_lyt.addWidget(self.lbl_target_path_details)
+        right_layout.addWidget(info_bar)
         
-        right_layout.addWidget(self.lbl_folder_count)
-        right_layout.addWidget(self.lbl_mail_count)
+        self.folders_table = QTableWidget()
+        self.folders_table.setColumnCount(3)
+        self.folders_table.setHorizontalHeaderLabels(["Klasör Adı", "Tahmini Yeni Mail", "Durum"])
+        self.folders_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.folders_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.folders_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.folders_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.folders_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.folders_table.setAlternatingRowColors(True)
+        self.folders_table.verticalHeader().setVisible(False)
+        right_layout.addWidget(self.folders_table)
         
-        line2 = QFrame()
-        line2.setFrameShape(QFrame.HLine)
-        line2.setStyleSheet("background-color: #e2e8f0; max-height: 1px;")
-        right_layout.addWidget(line2)
-        
-        right_layout.addWidget(date_header)
-        right_layout.addWidget(self.lbl_date_range)
-        
-        # Target directory section
-        dir_header = QLabel("YEDEKLEME HEDEF DİZİNİ")
-        dir_header.setStyleSheet("font-size: 11px; font-weight: bold; color: #94a3b8; letter-spacing: 0.5px; margin-top: 10px;")
-        
-        self.lbl_target_dir = QLabel("-")
-        self.lbl_target_dir.setStyleSheet("font-size: 12px; font-weight: 600; color: #334155;")
-        self.lbl_target_dir.setWordWrap(True)
-        
-        right_layout.addWidget(dir_header)
-        right_layout.addWidget(self.lbl_target_dir)
-        
-        right_layout.addStretch()
-        
-        body_layout.addWidget(right_group, stretch=1)
+        body_layout.addWidget(right_box, stretch=2)
         layout.addLayout(body_layout)
         
         # 4. Footer Buttons
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
+        footer_layout = QHBoxLayout()
+        footer_layout.setContentsMargins(0, 4, 0, 0)
+        footer_layout.setSpacing(10)
         
-        btn_cancel = QPushButton("Vazgeç")
+        btn_cancel = QPushButton("✕ Vazgeç")
+        btn_cancel.setCursor(Qt.PointingHandCursor)
         btn_cancel.setStyleSheet("""
             QPushButton {
-                background: #64748b;
-                color: white;
-                font-weight: 600;
-                padding: 10px 25px;
+                background-color: #64748b;
+                color: #ffffff;
+                font-weight: 700;
+                padding: 9px 22px;
                 border-radius: 6px;
-                font-size: 13px;
+                font-size: 12px;
+                border: none;
             }
             QPushButton:hover {
-                background: #475569;
+                background-color: #475569;
             }
         """)
         btn_cancel.clicked.connect(self.reject)
         
-        btn_ok = QPushButton("İşlemi Başlat")
+        btn_ok = QPushButton("⚡ Senkronizasyonu Başlat")
+        btn_ok.setCursor(Qt.PointingHandCursor)
         btn_ok.setStyleSheet("""
             QPushButton {
-                background: #4361ee;
-                color: white;
-                font-weight: 600;
-                padding: 10px 25px;
+                background-color: #16a34a;
+                color: #ffffff;
+                font-weight: 800;
+                padding: 9px 28px;
                 border-radius: 6px;
-                font-size: 13px;
+                font-size: 12.5px;
+                border: none;
             }
             QPushButton:hover {
-                background: #3a56d4;
+                background-color: #15803d;
             }
         """)
         btn_ok.clicked.connect(self.accept)
         
-        btn_layout.addWidget(btn_cancel)
-        btn_layout.addWidget(btn_ok)
-        layout.addLayout(btn_layout)
+        footer_layout.addStretch()
+        footer_layout.addWidget(btn_cancel)
+        footer_layout.addWidget(btn_ok)
+        layout.addLayout(footer_layout)
         
-        # Load first preview by default
-        self._load_preview(0)
-        
-    def _on_account_changed(self, idx):
-        if idx >= 0:
-            self._load_preview(idx)
+        if self.previews:
+            self.account_list_widget.setCurrentRow(0)
+            self._load_preview(0)
             
-    def _load_preview(self, idx):
+    def _load_preview(self, idx: int):
         if idx < 0 or idx >= len(self.previews):
             return
             
         p = self.previews[idx]
+        acc_label = p.get("label", "?")
+        email = p.get("email", "")
         
-        # Set account label
-        self.lbl_account_name.setText(f"<b>HESAP:</b> {p.get('label', '?')}")
-        
-        self.folder_list_widget.clear()
-        
-        folders_list = p.get("folders_list", [])
-        if folders_list:
-            for f in folders_list:
-                folder_name = f.get('folder', '?')
-                new_cnt = f.get('new_mails', 0)
-                self.folder_list_widget.addItem(f"📁 {folder_name} ({new_cnt} yeni e-posta)")
-        else:
-            self.folder_list_widget.addItem("📁 (Filtrelenen klasör yok)")
-                
-        folder_count = len(folders_list) if folders_list else p.get("folder_count", 0)
-        self.lbl_folder_count.setText(f"<b>{folder_count} KLASÖR</b>")
-        
-        new_mails = p.get("new_mails", 0)
-        self.lbl_mail_count.setText(f"<b>{new_mails} MAİL</b>")
+        self.lbl_acc_name_details.setText(f"<b>Hesap:</b> <span style='color:#2563eb;'>{acc_label}</span> ({email})")
         
         since_d = p.get("since_date")
         before_d = p.get("before_date")
+        unread = "Dahil" if p.get("archive_unread", True) else "Yalnızca Okunmuş"
         
-        def fmt_dt(d_str):
-            if not d_str:
-                return ""
-            try:
-                dt = datetime.strptime(d_str, "%Y-%m-%d")
-                return dt.strftime("%d.%m.%Y")
-            except Exception:
-                return d_str
-                
-        since_f = fmt_dt(since_d)
-        before_f = fmt_dt(before_d)
-        
-        if since_f and before_f:
-            self.lbl_date_range.setText(f"{since_f} - {before_f}")
-        elif since_f:
-            self.lbl_date_range.setText(f"{since_f} tarihinden yeni")
-        elif before_f:
-            self.lbl_date_range.setText(f"{before_f} tarihinden eski")
-        else:
-            self.lbl_date_range.setText("Tüm Zamanlar")
+        date_str = "Tüm Zamanlar"
+        if since_d and before_d:
+            date_str = f"{since_d} ile {before_d} Arası"
+        elif since_d:
+            date_str = f"{since_d} Sonrası"
+        elif before_d:
+            date_str = f"{before_d} Öncesi"
             
-        target_dir = p.get("target_dir", "")
-        self.lbl_target_dir.setText(target_dir)
+        self.lbl_date_range_details.setText(f"<b>Tarih Filtresi:</b> {date_str}   •   <b>Okunmamış Mailler:</b> {unread}")
+        self.lbl_target_path_details.setText(f"<b>Yedekleme Dizini:</b> <span style='color:#0f172a;'>{p.get('attachments_dir') or p.get('target_dir') or 'Varsayılan Depolama Alanı'}</span>")
+        
+        folders_list = p.get("folders_list", [])
+        self.folders_table.setRowCount(len(folders_list))
+        
+        for row, f in enumerate(folders_list):
+            f_name = f.get("folder", "?")
+            new_cnt = f.get("new_mails", 0)
+            
+            it_name = QTableWidgetItem(f"📁 {f_name}")
+            it_name.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            self.folders_table.setItem(row, 0, it_name)
+            
+            it_cnt = QTableWidgetItem(f"{new_cnt} Yeni Mail" if new_cnt > 0 else "0 (Güncel)")
+            if new_cnt > 0:
+                it_cnt.setForeground(QColor("#16a34a"))
+                it_cnt.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            else:
+                it_cnt.setForeground(QColor("#64748b"))
+            it_cnt.setTextAlignment(Qt.AlignCenter)
+            self.folders_table.setItem(row, 1, it_cnt)
+            
+            status_str = "Aktarılacak" if new_cnt > 0 else "Tamamı Yedekli"
+            it_status = QTableWidgetItem(status_str)
+            it_status.setTextAlignment(Qt.AlignCenter)
+            self.folders_table.setItem(row, 2, it_status)
 
 
 class SyncFinishedDialog(QDialog):
-    """Interactive dialog shown when all sync tasks finish.
-    Displays a 5-second countdown timer on the Yes button.
-    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("İşlem Tamamlandı")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(440)
         self.setStyleSheet(GLOBAL_MSG_STYLE)
 
         self._remaining_seconds = 5
@@ -1335,54 +1363,32 @@ class SyncFinishedDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(14)
 
-        # Header Title
         lbl_title = QLabel("✅ E-Posta Arşivleme İşlemi Tamamlandı!")
         lbl_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
         lbl_title.setStyleSheet("color: #10b981;")
         layout.addWidget(lbl_title)
 
-        # Message
         lbl_msg = QLabel("Detaylı senkronizasyon raporunu görüntülemek ister misiniz?")
         lbl_msg.setWordWrap(True)
         lbl_msg.setStyleSheet("color: #1e293b; font-size: 12px;")
         layout.addWidget(lbl_msg)
 
-        # Buttons layout
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(10)
 
         self.btn_no = QPushButton("Hayır (Kapat)")
-        self.btn_no.setStyleSheet("""
-            QPushButton {
-                background-color: #64748b !important;
-                color: #ffffff !important;
-                font-weight: bold;
-                padding: 8px 16px;
-                border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #475569 !important; }
-        """)
+        self.btn_no.setStyleSheet("background-color: #64748b; color: white; font-weight: bold; border-radius: 6px; padding: 6px 14px;")
         self.btn_no.clicked.connect(self._on_no_clicked)
         btn_layout.addWidget(self.btn_no)
 
         self.btn_yes = QPushButton(f"Evet ({self._remaining_seconds}sn sonra otomatik açılacak)")
         self.btn_yes.setDefault(True)
-        self.btn_yes.setStyleSheet("""
-            QPushButton {
-                background-color: #2563eb !important;
-                color: #ffffff !important;
-                font-weight: bold;
-                padding: 8px 20px;
-                border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #1d4ed8 !important; }
-        """)
+        self.btn_yes.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; border-radius: 6px; padding: 6px 16px;")
         self.btn_yes.clicked.connect(self._on_yes_clicked)
         btn_layout.addWidget(self.btn_yes)
 
         layout.addLayout(btn_layout)
 
-        # QTimer setup (1 second interval)
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._on_timer_tick)
@@ -1406,14 +1412,14 @@ class SyncFinishedDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Main SyncPanel
+# Main SyncPanel (Default 88px row height & Async Lazy Load)
 # ---------------------------------------------------------------------------
 
 _LOG_PARSE_RE = re.compile(r'^\[(\d+:\d+:\d+)\]\s*(.*)')
 
 
 class SyncPanel(QWidget):
-    """Email synchronization panel with detailed logging."""
+    """Email synchronization panel with detailed logging, lazy loading, and ergonomic UX."""
 
     _log_signal = Signal(str)
     _folders_signal = Signal(list)
@@ -1428,489 +1434,449 @@ class SyncPanel(QWidget):
         self.settings = settings or AppSettings()
         self._reports: list = []
         self._all_selected_flag = False
+        self._current_row_height = 88  # Default 88px as requested
+        self._is_refreshing = False
+        self._selected_group = "__ALL__"
+        self._data_loader: Optional[SyncDataLoaderWorker] = None
+        self._stats_labels_map: Dict[int, QLabel] = {}
 
         self._log_model = LogTableModel(self)
         self._log_proxy = LogFilterProxy(self)
         self._log_proxy.setSourceModel(self._log_model)
         
         self._active_syncs = {}  # account_id -> {cancel_event, pause_event, thread, status}
-        self._accounts_ui = {}  # account_id -> {chk, lbl_status, progress_bar, btn_start, etc.}
-
-        # Filter settings (stored in panel, configured via pop-up)
-        self._filter_folders = None  # None means all folders
-        self._filter_archive_unread = True
-        self._filter_since_date_enabled = False
-        self._filter_since_date = QDate.currentDate().addYears(-1)
-        self._filter_before_date_enabled = False
-        self._filter_before_date = QDate.currentDate()
-        self._filter_timeout = 300
+        self._accounts_ui = {}   # account_id -> {chk, lbl_status, progress_bar, btn_start, etc.}
 
         self._setup_ui()
+        self._connect_signals()
         
-        # Signals
+        # Internal Signals
         self._log_signal.connect(self._on_log_message)
         self._account_progress_signal.connect(self._on_account_progress)
         self._account_sync_done_signal.connect(self._on_account_sync_done)
         self._account_sync_error_signal.connect(self._on_account_sync_error)
         self._account_dry_run_done_signal.connect(self._on_account_dry_run_done)
 
+        self.refresh()
+
     def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 14, 18, 14)
-        layout.setSpacing(10)
+        main_vbox = QVBoxLayout(self)
+        main_vbox.setContentsMargins(8, 6, 8, 6)
+        main_vbox.setSpacing(6)
 
         # ----------------------------------------------------------------
-        # Top Control Bar (Toolbar & Panel Toggles)
+        # 1. TOP TOOLBAR: Minimalist, Search & Quick Stats
         # ----------------------------------------------------------------
-        top_bar = QHBoxLayout()
-        top_bar.setSpacing(8)
-
-        lbl_title = QLabel("📧 E-Mail Synchronization")
-        lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #0f172a;")
-        top_bar.addWidget(lbl_title)
-        top_bar.addStretch()
-
-        self.btn_toggle_stats = QPushButton("📊 İstatistikler")
-        self.btn_toggle_stats.setToolTip("İstatistik kartlarını gizle/göster")
-        self.btn_toggle_stats.setCursor(Qt.PointingHandCursor)
-        self.btn_toggle_stats.setStyleSheet(self._blue_btn_style(bg="#4b5563", hover="#374151", py=5, px=12, fs=11))
-        self.btn_toggle_stats.clicked.connect(self._toggle_stats)
-        top_bar.addWidget(self.btn_toggle_stats)
-
-        self.btn_toggle_log = QPushButton("📋 Log Kutusu")
-        self.btn_toggle_log.setToolTip("Sync log kutusunu gizle/göster")
-        self.btn_toggle_log.setCursor(Qt.PointingHandCursor)
-        self.btn_toggle_log.setStyleSheet(self._blue_btn_style(bg="#4b5563", hover="#374151", py=5, px=12, fs=11))
-        top_bar.addWidget(self.btn_toggle_log)
-
-        self.btn_toggle_drawer = QPushButton("⚙️ İşlem Paneli ◀")
-        self.btn_toggle_drawer.setToolTip("Sağ taraftaki işlem butonlarını gizle/göster")
-        self.btn_toggle_drawer.setCursor(Qt.PointingHandCursor)
-        self.btn_toggle_drawer.setStyleSheet(self._blue_btn_style(bg="#2563eb", hover="#1d4ed8", py=5, px=14, fs=11))
-        self.btn_toggle_drawer.clicked.connect(self._toggle_drawer)
-        top_bar.addWidget(self.btn_toggle_drawer)
-
-        layout.addLayout(top_bar)
-
-        # ----------------------------------------------------------------
-        # Collapsible Stat cards row
-        # ----------------------------------------------------------------
-        self.stats_widget = QWidget()
-        stats_row = QHBoxLayout(self.stats_widget)
-        stats_row.setContentsMargins(0, 0, 0, 0)
-        stats_row.setSpacing(10)
-        self.card_account = StatCard("Current Account", "—")
-        self.card_server = StatCard("Server Emails", "—")
-        self.card_folders = StatCard("Folders", "—")
-        self.card_current = StatCard("Current Folder", "—")
-        self.card_remaining = StatCard("Remaining", "—")
-        self.card_progress = StatCard("Progress", "—")
-        self.card_eta = StatCard("ETA", "—")
-        stats_row.addWidget(self.card_account)
-        stats_row.addWidget(self.card_server)
-        stats_row.addWidget(self.card_folders)
-        stats_row.addWidget(self.card_current)
-        stats_row.addWidget(self.card_remaining)
-        stats_row.addWidget(self.card_progress)
-        stats_row.addWidget(self.card_eta)
-        layout.addWidget(self.stats_widget)
-
-        # ----------------------------------------------------------------
-        # Main Body Split (Accounts Table + Collapsible Right Action Drawer)
-        # ----------------------------------------------------------------
-        body_split_layout = QHBoxLayout()
-        body_split_layout.setSpacing(10)
-
-        # Left/Center: Accounts Table Area
-        accounts_group = QGroupBox("Hesap Listesi & Senkronizasyon Durumu")
-        accounts_group.setStyleSheet("""
-            QGroupBox {
+        self.top_bar = QFrame()
+        self.top_bar.setStyleSheet("""
+            QFrame {
                 background: #ffffff;
-                border: 1.5px solid #cbd5e1;
+                border: 1px solid #cbd5e1;
                 border-radius: 8px;
-                margin-top: 2px;
-                font-weight: bold;
-                font-size: 12px;
-                color: #1e293b;
+                padding: 2px;
             }
         """)
-        ag_layout = QVBoxLayout(accounts_group)
-        ag_layout.setContentsMargins(10, 10, 10, 10)
+        top_layout = QHBoxLayout(self.top_bar)
+        top_layout.setContentsMargins(8, 4, 8, 4)
+        top_layout.setSpacing(8)
 
-        # DataGrid Top Control Bar (Tablo Üstü Araç Çubuğu)
-        table_top_bar = QHBoxLayout()
-        table_top_bar.setSpacing(8)
+        # Left Sidebar Toggle Button
+        self.btn_toggle_left = QPushButton("◀ Grupları Gizle")
+        self.btn_toggle_left.setToolTip("Sol Grup/Domain filtre panelini gizler/gösterir")
+        self.btn_toggle_left.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_left.setStyleSheet(self._toggle_btn_style())
+        self.btn_toggle_left.clicked.connect(self._toggle_left_sidebar)
+        top_layout.addWidget(self.btn_toggle_left)
 
-        self.btn_top_select_all = QPushButton("☑️ Tümünü Seç")
-        self.btn_top_select_all.setToolTip("Tablodaki tüm hesapları seçer veya seçimleri kaldırır")
-        self.btn_top_select_all.setStyleSheet(self._blue_btn_style(py=5, px=12, fs=11, bg="#475569", hover="#334155"))
-        self.btn_top_select_all.clicked.connect(self._toggle_select_all)
-        table_top_bar.addWidget(self.btn_top_select_all)
-
-        self.btn_top_sync_selected = QPushButton("⚡ Seçilenleri Başlat")
-        self.btn_top_sync_selected.setToolTip("Seçili kutucuğu işaretli tüm hesapların senkronizasyonunu başlatır")
-        self.btn_top_sync_selected.setStyleSheet(self._blue_btn_style(py=5, px=12, fs=11, bg="#2563eb", hover="#1d4ed8"))
-        self.btn_top_sync_selected.clicked.connect(self._sync_selected)
-        table_top_bar.addWidget(self.btn_top_sync_selected)
-
-        self.btn_top_sync_group = QPushButton("🚀 Grubu Senkronize Et")
-        self.btn_top_sync_group.setToolTip("Seçili olan grubun/domain'in tüm hesaplarını senkronize eder")
-        self.btn_top_sync_group.setStyleSheet(self._blue_btn_style(py=5, px=12, fs=11, bg="#10b981", hover="#059669"))
-        self.btn_top_sync_group.clicked.connect(self._sync_current_group)
-        table_top_bar.addWidget(self.btn_top_sync_group)
-
-        self.lbl_selection_count = QLabel("0 / 0 Hesap Seçili")
-        self.lbl_selection_count.setStyleSheet("color: #475569; font-size: 11px; padding-left: 6px;")
-        table_top_bar.addWidget(self.lbl_selection_count)
-
-        table_top_bar.addStretch()
-
-        self.input_account_search = QLineEdit()
-        self.input_account_search.setPlaceholderText("🔍 Tabloda Hesap / E-Posta Ara...")
-        self.input_account_search.setMinimumWidth(200)
-        self.input_account_search.setStyleSheet("""
+        # Search Input
+        self.txt_search_sync = QLineEdit()
+        self.txt_search_sync.setPlaceholderText("🔍 Hesap Adı, E-Posta veya Domain Grubu Ara...")
+        self.txt_search_sync.setClearButtonEnabled(True)
+        self.txt_search_sync.setStyleSheet("""
             QLineEdit {
-                border: 1px solid #cbd5e1;
+                border: 1.5px solid #cbd5e1;
                 border-radius: 6px;
                 padding: 4px 8px;
-                font-size: 11px;
+                background-color: #f8fafc;
+                color: #0f172a;
+                font-size: 11.5px;
+            }
+            QLineEdit:focus {
+                border-color: #2563eb;
                 background-color: #ffffff;
             }
-            QLineEdit:focus { border-color: #2563eb; }
         """)
-        self.input_account_search.textChanged.connect(self._on_account_search_changed)
-        table_top_bar.addWidget(self.input_account_search)
+        self.txt_search_sync.textChanged.connect(self._filter_table_rows)
+        top_layout.addWidget(self.txt_search_sync, stretch=1)
 
-        ag_layout.addLayout(table_top_bar)
+        # Statistics Badges
+        self.lbl_stat_total = QLabel("📊 0 Hesap")
+        self.lbl_stat_total.setStyleSheet(self._badge_style(bg="#e0e7ff", fg="#1e3a8a"))
+        top_layout.addWidget(self.lbl_stat_total)
 
-        main_h_layout = QHBoxLayout()
-        main_h_layout.setSpacing(6)
-        main_h_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_stat_selected = QLabel("☑️ 0 Seçili")
+        self.lbl_stat_selected.setStyleSheet(self._badge_style(bg="#fef3c7", fg="#b45309"))
+        top_layout.addWidget(self.lbl_stat_selected)
 
-        # Group/Domain Sidebar widget
-        self.sidebar_widget = QWidget()
-        self.sidebar_widget.setFixedWidth(180)
-        sidebar_layout = QVBoxLayout(self.sidebar_widget)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.setSpacing(6)
+        self.lbl_stat_active = QLabel("🟢 0 Çalışıyor")
+        self.lbl_stat_active.setStyleSheet(self._badge_style(bg="#dcfce7", fg="#15803d"))
+        top_layout.addWidget(self.lbl_stat_active)
 
-        lbl_groups = QLabel("Grup / Domain Filtresi")
-        lbl_groups.setStyleSheet("font-weight: bold; color: #4361ee; font-size: 11px;")
-
-        self.group_filter_list = QListWidget()
-        self.group_filter_list.setStyleSheet("""
-            QListWidget {
+        # Refresh button
+        self.btn_refresh = QPushButton("🔄 Yenile")
+        self.btn_refresh.setCursor(Qt.PointingHandCursor)
+        self.btn_refresh.setStyleSheet("""
+            QPushButton {
                 background-color: #ffffff;
+                color: #1e3a8a;
                 border: 1px solid #cbd5e1;
                 border-radius: 6px;
-                font-size: 11px;
-                color: #1e293b;
-            }
-            QListWidget::item {
-                padding: 6px 10px;
-                border-bottom: 1px solid #f1f5f9;
-            }
-            QListWidget::item:selected {
-                background-color: #e0e7ff;
-                color: #4361ee;
+                padding: 4px 10px;
+                font-size: 11.5px;
                 font-weight: bold;
             }
+            QPushButton:hover { background-color: #f1f5f9; border-color: #2563eb; }
         """)
-        self.group_filter_list.itemSelectionChanged.connect(self._on_group_filter_changed)
+        self.btn_refresh.clicked.connect(self._check_disk_and_refresh)
+        top_layout.addWidget(self.btn_refresh)
 
-        sidebar_layout.addWidget(lbl_groups)
-        sidebar_layout.addWidget(self.group_filter_list)
+        # Right Sidebar Toggle Button
+        self.btn_toggle_right = QPushButton("⚙️ İşlemler ▶")
+        self.btn_toggle_right.setToolTip("Sağ işlem ve ayar çekmecesini gizler/gösterir")
+        self.btn_toggle_right.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_right.setStyleSheet(self._toggle_btn_style())
+        self.btn_toggle_right.clicked.connect(self._toggle_right_sidebar)
+        top_layout.addWidget(self.btn_toggle_right)
 
-        self.btn_toggle_sidebar = QPushButton("◀")
-        self.btn_toggle_sidebar.setToolTip("Grup Listesini Gizle/Göster")
-        self.btn_toggle_sidebar.setCursor(Qt.PointingHandCursor)
-        self.btn_toggle_sidebar.setFixedWidth(16)
-        self.btn_toggle_sidebar.setStyleSheet("""
+        main_vbox.addWidget(self.top_bar)
+
+        # ----------------------------------------------------------------
+        # 2. 3-COLUMN SPLIT LAYOUT
+        # ----------------------------------------------------------------
+        split_layout = QHBoxLayout()
+        split_layout.setSpacing(2)
+        split_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 1. Left Sidebar: Account Group Widget
+        self.left_sidebar = AccountGroupSidebarWidget(self)
+        self.left_sidebar.setFixedWidth(230)
+        split_layout.addWidget(self.left_sidebar)
+
+        # Middle Arrow Toggle for Left Sidebar
+        self.btn_middle_toggle_left = QPushButton("◀")
+        self.btn_middle_toggle_left.setToolTip("Sol Filtre Panelini Gizle / Göster")
+        self.btn_middle_toggle_left.setFixedWidth(16)
+        self.btn_middle_toggle_left.setCursor(Qt.PointingHandCursor)
+        self.btn_middle_toggle_left.setStyleSheet("""
             QPushButton {
-                background-color: #f1f5f9;
-                color: #475569;
+                background-color: #e2e8f0;
+                color: #334155;
                 border: 1px solid #cbd5e1;
-                border-radius: 4px;
+                border-left: none;
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+                border-top-left-radius: 0px;
+                border-bottom-left-radius: 0px;
                 font-weight: bold;
                 font-size: 10px;
                 padding: 0px;
-                min-height: 100px;
+                min-height: 50px;
+                max-height: 50px;
             }
             QPushButton:hover {
-                background-color: #cbd5e1;
+                background-color: #2563eb;
+                color: #ffffff;
+                border-color: #1d4ed8;
             }
         """)
-        self.btn_toggle_sidebar.clicked.connect(self._toggle_sidebar)
+        self.btn_middle_toggle_left.clicked.connect(self._toggle_left_sidebar)
+        split_layout.addWidget(self.btn_middle_toggle_left)
 
+        # 2. Center: DBGrid Container + Stats Header + Ergonomic Action Buttons + Table + Collapsible Log
+        center_container = QGroupBox("🔄 E-Posta Senkronizasyon & Arşivleme Havuzu")
+        center_container.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #1e3a8a;
+                border: 1.5px solid #cbd5e1;
+                border-radius: 8px;
+                margin-top: 8px;
+                padding-top: 12px;
+                background-color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 12px;
+                padding: 2px 8px;
+                background-color: #1e3a8a;
+                color: #ffffff !important;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        center_layout = QVBoxLayout(center_container)
+        center_layout.setContentsMargins(6, 6, 6, 6)
+        center_layout.setSpacing(6)
+
+        # Top Live Stats Cards
+        stats_frame = QFrame()
+        stats_frame.setStyleSheet("background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px;")
+        stats_lyt = QHBoxLayout(stats_frame)
+        stats_lyt.setContentsMargins(6, 4, 6, 4)
+        stats_lyt.setSpacing(6)
+
+        self.card_account = StatCard("Mevcut Hesap", "—", "👤")
+        self.card_current = StatCard("Mevcut Klasör", "—", "📁")
+        self.card_remaining = StatCard("Kalan E-Posta", "—", "⏳")
+        self.card_progress = StatCard("İlerleme", "—", "📈")
+        self.card_eta = StatCard("Tahmini Süre", "—", "⏱️")
+        self.card_server = StatCard("Yerel Arşiv", "—", "💾")
+
+        stats_lyt.addWidget(self.card_account)
+        stats_lyt.addWidget(self.card_current)
+        stats_lyt.addWidget(self.card_remaining)
+        stats_lyt.addWidget(self.card_progress)
+        stats_lyt.addWidget(self.card_eta)
+        stats_lyt.addWidget(self.card_server)
+        center_layout.addWidget(stats_frame)
+
+        # Quick Action Buttons Bar directly under Current Account stats
+        actions_bar = QFrame()
+        actions_bar.setStyleSheet("""
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 2px;
+            }
+        """)
+        actions_bar_lyt = QHBoxLayout(actions_bar)
+        actions_bar_lyt.setContentsMargins(6, 4, 6, 4)
+        actions_bar_lyt.setSpacing(6)
+
+        self.btn_sync = QPushButton("⚡ Seçilenleri Başlat")
+        self.btn_sync.setToolTip("Seçili kutucuğu işaretli tüm hesapların senkronizasyonunu başlatır")
+        self.btn_sync.setCursor(Qt.PointingHandCursor)
+        self.btn_sync.setStyleSheet(self._blue_btn_style(bg="#2563eb", hover="#1d4ed8", py=5, px=10, fs=11))
+        self.btn_sync.clicked.connect(self._sync_selected)
+        actions_bar_lyt.addWidget(self.btn_sync)
+
+        self.btn_sync_all = QPushButton("🚀 Tümünü Başlat")
+        self.btn_sync_all.setToolTip("Sistemdeki tüm hesapları senkronize eder")
+        self.btn_sync_all.setCursor(Qt.PointingHandCursor)
+        self.btn_sync_all.setStyleSheet(self._blue_btn_style(bg="#059669", hover="#047857", py=5, px=10, fs=11))
+        self.btn_sync_all.clicked.connect(self._sync_all)
+        actions_bar_lyt.addWidget(self.btn_sync_all)
+
+        self.btn_pause = QPushButton("⏸️ Duraklat")
+        self.btn_pause.setToolTip("Aktif arşiv işlemlerini duraklatır")
+        self.btn_pause.setCursor(Qt.PointingHandCursor)
+        self.btn_pause.setStyleSheet(self._blue_btn_style(bg="#f59e0b", hover="#d97706", py=5, px=10, fs=11))
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.clicked.connect(self._toggle_pause_sync)
+        actions_bar_lyt.addWidget(self.btn_pause)
+
+        self.btn_cancel = QPushButton("⏹️ İptal Et")
+        self.btn_cancel.setToolTip("Aktif arşiv işlemlerini iptal eder")
+        self.btn_cancel.setCursor(Qt.PointingHandCursor)
+        self.btn_cancel.setStyleSheet(self._blue_btn_style(bg="#dc2626", hover="#b91c1c", py=5, px=10, fs=11))
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self._cancel_sync)
+        actions_bar_lyt.addWidget(self.btn_cancel)
+
+        self.btn_dry_run = QPushButton("🔍 Kuru Çalıştırma")
+        self.btn_dry_run.setToolTip("Sunucuya bağlanıp taranacak tahmini mail sayısını hesaplar")
+        self.btn_dry_run.setCursor(Qt.PointingHandCursor)
+        self.btn_dry_run.setStyleSheet(self._blue_btn_style(bg="#475569", hover="#334155", py=5, px=10, fs=11))
+        self.btn_dry_run.clicked.connect(self._dry_run)
+        actions_bar_lyt.addWidget(self.btn_dry_run)
+
+        self.btn_filters = QPushButton("⚙️ Klasör & Filtreler...")
+        self.btn_filters.setToolTip("Hesap için arşivlenecek klasörleri ve filtreleri ayarlar")
+        self.btn_filters.setCursor(Qt.PointingHandCursor)
+        self.btn_filters.setStyleSheet(self._blue_btn_style(bg="#0284c7", hover="#0369a1", py=5, px=10, fs=11))
+        self.btn_filters.clicked.connect(self._open_filters_dialog)
+        actions_bar_lyt.addWidget(self.btn_filters)
+
+        self.btn_reports = QPushButton("📊 Raporlar")
+        self.btn_reports.setToolTip("Senkronizasyon sonuç raporlarını görüntüler")
+        self.btn_reports.setCursor(Qt.PointingHandCursor)
+        self.btn_reports.setStyleSheet(self._blue_btn_style(bg="#7c3aed", hover="#6d28d9", py=5, px=10, fs=11))
+        self.btn_reports.clicked.connect(self._show_reports)
+        actions_bar_lyt.addWidget(self.btn_reports)
+
+        actions_bar_lyt.addStretch()
+
+        # Log toggle button
+        self.btn_toggle_log = QPushButton("📋 Log Kutusu")
+        self.btn_toggle_log.setToolTip("Senkronizasyon canlı log tablosunu gizler/gösterir")
+        self.btn_toggle_log.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_log.setStyleSheet(self._blue_btn_style(bg="#334155", hover="#1e293b", py=5, px=10, fs=11))
+        self.btn_toggle_log.clicked.connect(self._toggle_log_visibility)
+        actions_bar_lyt.addWidget(self.btn_toggle_log)
+
+        center_layout.addWidget(actions_bar)
+
+        # Disk Connection Banner with Loading indicator
+        self.disk_status_banner = QFrame()
+        self.disk_status_banner.setObjectName("diskStatusBanner")
+        self.disk_status_banner.setStyleSheet("""
+            QFrame#diskStatusBanner {
+                background-color: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 2px;
+            }
+        """)
+        banner_layout = QHBoxLayout(self.disk_status_banner)
+        banner_layout.setContentsMargins(8, 4, 8, 4)
+        banner_layout.setSpacing(6)
+
+        self.lbl_disk_status_icon = QLabel("💾")
+        self.lbl_disk_status_icon.setStyleSheet("font-size: 14px; background: transparent;")
+        banner_layout.addWidget(self.lbl_disk_status_icon)
+
+        self.lbl_disk_status_text = QLabel("Yedekleme diski durumu kontrol ediliyor...")
+        self.lbl_disk_status_text.setStyleSheet("font-size: 11px; font-weight: 600; color: #1e293b; background: transparent;")
+        banner_layout.addWidget(self.lbl_disk_status_text, stretch=1)
+
+        self.btn_disk_reconnect = QPushButton("🔄 Yeniden Tara")
+        self.btn_disk_reconnect.setCursor(Qt.PointingHandCursor)
+        self.btn_disk_reconnect.setStyleSheet("""
+            QPushButton {
+                background-color: #ffffff;
+                color: #1e293b;
+                border: 1px solid #cbd5e1;
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-size: 10.5px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background-color: #f1f5f9; }
+        """)
+        self.btn_disk_reconnect.clicked.connect(self._check_disk_and_refresh)
+        banner_layout.addWidget(self.btn_disk_reconnect)
+        center_layout.addWidget(self.disk_status_banner)
+
+        # Main Table: Select Accounts
         self.account_table = QTableWidget()
         self.account_table.setColumnCount(4)
-        header = ProHeaderView(Qt.Horizontal, self.account_table)
-        header.setSectionsMovable(True)
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.save_requested.connect(self._save_grid_state)
-        header.reset_requested.connect(self._reset_grid_state)
-        self.account_table.setHorizontalHeader(header)
         self.account_table.setHorizontalHeaderLabels([
-            "Sync", "Account Details", "Archiving Status & Progress", "Actions"
+            "☑️ Seç", "Hesap Bilgileri & Domain", "Arşiv Durumu & İlerleme", "İşlemler"
         ])
-        self.account_table.setColumnWidth(0, 70)
-        self.account_table.setColumnWidth(1, 400)
-        self.account_table.setColumnWidth(2, 320)
-        self.account_table.setColumnWidth(3, 150)
-        self.account_table.verticalHeader().setDefaultSectionSize(92)
-        self.account_table.verticalHeader().setVisible(False)
+        self.account_table.setAlternatingRowColors(True)
         self.account_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.account_table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.account_table.customContextMenuRequested.connect(self._on_account_table_context_menu)
+        self.account_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.account_table.verticalHeader().setVisible(False)
+        self.account_table.verticalHeader().setDefaultSectionSize(self._current_row_height)
+
+        self.account_table.setColumnWidth(0, 55)
+        self.account_table.setColumnWidth(1, 420)
+        self.account_table.setColumnWidth(2, 340)
+        self.account_table.setColumnWidth(3, 150)
+        self.account_table.horizontalHeader().setStretchLastSection(False)
+        self.account_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+
         self.account_table.setStyleSheet("""
             QTableWidget {
                 background-color: #ffffff;
-                gridline-color: #f1f5f9;
-                border: none;
-            }
-            QHeaderView::section {
-                background-color: #f8fafc;
-                color: #475569;
-                font-weight: bold;
-                border: none;
-                border-bottom: 1px solid #cbd5e1;
-                padding: 6px;
-            }
-        """)
-        self.account_table.itemSelectionChanged.connect(self._on_table_row_click)
-
-        main_h_layout.addWidget(self.sidebar_widget)
-        main_h_layout.addWidget(self.btn_toggle_sidebar)
-        main_h_layout.addWidget(self.account_table, stretch=1)
-        ag_layout.addLayout(main_h_layout)
-
-        body_split_layout.addWidget(accounts_group, stretch=1)
-
-        # ----------------------------------------------------------------
-        # Right Side Collapsible Action Drawer (Açılır Kapanır Sağ İşlem Paneli)
-        # ----------------------------------------------------------------
-        self.action_drawer = QGroupBox("⚙️ İşlemler")
-        self.action_drawer.setFixedWidth(220)
-        self.action_drawer.setStyleSheet("""
-            QGroupBox {
-                background: #ffffff;
-                border: 1.5px solid #cbd5e1;
-                border-radius: 8px;
-                margin-top: 2px;
-                font-weight: bold;
-                font-size: 12px;
-                color: #1e293b;
-            }
-        """)
-        drawer_layout = QVBoxLayout(self.action_drawer)
-        drawer_layout.setContentsMargins(10, 14, 10, 10)
-        drawer_layout.setSpacing(8)
-
-        lbl_sec1 = QLabel("⚡ SENKRONİZASYON")
-        lbl_sec1.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748b; letter-spacing: 0.5px;")
-        drawer_layout.addWidget(lbl_sec1)
-
-        self.btn_sync = QPushButton("🔄 Sync Selected")
-        self.btn_sync.setToolTip("Seçili olan tüm hesapların senkronizasyonunu başlatır")
-        self.btn_sync.setStyleSheet(self._blue_btn_style())
-        self.btn_sync.setMinimumHeight(34)
-        drawer_layout.addWidget(self.btn_sync)
-
-        self.btn_sync_all = QPushButton("⚡ Sync All")
-        self.btn_sync_all.setToolTip("Sistemdeki tüm hesapları senkronize eder")
-        self.btn_sync_all.setStyleSheet(self._blue_btn_style())
-        self.btn_sync_all.setMinimumHeight(34)
-        drawer_layout.addWidget(self.btn_sync_all)
-
-        self.btn_dry_run = QPushButton("🔍 Dry Run")
-        self.btn_dry_run.setToolTip("Sunucuya bağlanıp taranacak mail sayısını hesaplar")
-        self.btn_dry_run.setStyleSheet(self._blue_btn_style())
-        self.btn_dry_run.setMinimumHeight(34)
-        drawer_layout.addWidget(self.btn_dry_run)
-
-        drawer_layout.addSpacing(6)
-        lbl_sec2 = QLabel("⚙️ YAPIŞTIRMA & FİLTRE")
-        lbl_sec2.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748b; letter-spacing: 0.5px;")
-        drawer_layout.addWidget(lbl_sec2)
-
-        self.btn_filters = QPushButton("⚙️ Configure Filters...")
-        self.btn_filters.setToolTip("Arşiv klasörlerini ve filtreleri ayarlar")
-        self.btn_filters.setStyleSheet(self._blue_btn_style())
-        self.btn_filters.setMinimumHeight(34)
-        drawer_layout.addWidget(self.btn_filters)
-
-        lbl_folder_lang = QLabel("🌐 KLASÖR İSİM DİLİ")
-        lbl_folder_lang.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748b; letter-spacing: 0.5px;")
-        drawer_layout.addWidget(lbl_folder_lang)
-
-        self.combo_folder_lang = QComboBox()
-        self.combo_folder_lang.addItem("Orijinal Dilinde Bırak", "original")
-        self.combo_folder_lang.addItem("Türkçeleştir (TR)", "tr")
-        self.combo_folder_lang.addItem("İngilizceye Çevir (EN)", "en")
-        self.combo_folder_lang.setToolTip("Sunucudan çekilen Rusça veya yabancı klasör isimlerinin dönüştürülme modu")
-        self.combo_folder_lang.setStyleSheet("""
-            QComboBox {
-                padding: 6px 10px;
+                alternate-background-color: #f8fafc;
+                gridline-color: #e2e8f0;
                 border: 1px solid #cbd5e1;
                 border-radius: 6px;
-                background-color: #ffffff;
-                font-size: 11px;
-                font-weight: bold;
-                color: #1e293b;
+                color: #0f172a;
+                selection-background-color: #2563eb;
+                selection-color: #ffffff;
+                font-size: 11.5px;
+            }
+            QTableWidget::item {
+                padding: 4px 8px;
+                border-bottom: 1px solid #f1f5f9;
+                color: #0f172a;
+            }
+            QTableWidget::item:selected {
+                background-color: #2563eb;
+                color: #ffffff !important;
+            }
+            QHeaderView::section {
+                background-color: #1e3a8a;
+                color: #ffffff !important;
+                font-weight: 700;
+                font-size: 11.5px;
+                border: 1px solid #1e40af;
+                padding: 6px 8px;
+                min-height: 30px;
             }
         """)
-        # Set initial value from settings
-        current_sync_lang = self.settings.folder_translation_sync()
-        idx = self.combo_folder_lang.findData(current_sync_lang)
-        if idx >= 0:
-            self.combo_folder_lang.setCurrentIndex(idx)
-        self.combo_folder_lang.currentIndexChanged.connect(self._on_folder_lang_changed)
-        drawer_layout.addWidget(self.combo_folder_lang)
 
-        self.btn_select_all = QPushButton("☑️ Select All")
-        self.btn_select_all.setToolTip("Tüm hesapların seçim kutularını işaretler/temizler")
-        self.btn_select_all.setStyleSheet(self._blue_btn_style())
-        self.btn_select_all.setMinimumHeight(34)
-        drawer_layout.addWidget(self.btn_select_all)
+        self.account_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.account_table.customContextMenuRequested.connect(self._show_toya_grid_context_menu)
+        self.account_table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.account_table.horizontalHeader().customContextMenuRequested.connect(self._show_toya_grid_context_menu)
+        self.account_table.horizontalHeader().sectionResized.connect(self._auto_save_current_layout)
+        self.account_table.itemChanged.connect(self._on_table_item_changed)
+        self.account_table.itemSelectionChanged.connect(self._on_table_row_click)
 
-        drawer_layout.addSpacing(6)
-        lbl_sec3 = QLabel("📊 RAPOR & DİAGNOSTİK")
-        lbl_sec3.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748b; letter-spacing: 0.5px;")
-        drawer_layout.addWidget(lbl_sec3)
+        center_layout.addWidget(self.account_table, stretch=2)
 
-        self.btn_reports = QPushButton("📊 Reports")
-        self.btn_reports.setToolTip("Oturum raporlarını görüntüler")
-        self.btn_reports.setStyleSheet(self._blue_btn_style())
-        self.btn_reports.setMinimumHeight(34)
-        drawer_layout.addWidget(self.btn_reports)
-
-        self.btn_detailed_report = QPushButton("🔬 Diagnostics")
-        self.btn_detailed_report.setToolTip("Detaylı diagnostik raporunu gösterir")
-        self.btn_detailed_report.setStyleSheet(self._blue_btn_style())
-        self.btn_detailed_report.setMinimumHeight(34)
-        drawer_layout.addWidget(self.btn_detailed_report)
-
-        drawer_layout.addSpacing(6)
-        lbl_sec4 = QLabel("⏹️ AKIŞ KONTROLÜ")
-        lbl_sec4.setStyleSheet("font-size: 10px; font-weight: bold; color: #64748b; letter-spacing: 0.5px;")
-        drawer_layout.addWidget(lbl_sec4)
-
-        self.btn_pause = QPushButton("⏸️ Pause All")
-        self.btn_pause.setToolTip("Aktif arşiv işlemlerini duraklatır")
-        self.btn_pause.setStyleSheet(
-            "QPushButton{background:#f39c12;color:white;font-weight:600;padding:8px 14px;border-radius:6px;font-size:12px; border: none;}"
-            "QPushButton:hover{background:#d35400;}"
-            "QPushButton:disabled{background:#cbd5e1;color:#94a3b8;}"
-        )
-        self.btn_pause.setEnabled(False)
-        self.btn_pause.setMinimumHeight(34)
-        drawer_layout.addWidget(self.btn_pause)
-
-        self.btn_cancel = QPushButton("⏹️ Cancel All")
-        self.btn_cancel.setToolTip("Aktif arşiv işlemlerini iptal eder")
-        self.btn_cancel.setStyleSheet(
-            "QPushButton{background:#e74c3c;color:white;font-weight:600;padding:8px 14px;border-radius:6px;font-size:12px; border: none;}"
-            "QPushButton:hover{background:#c0392b;}"
-            "QPushButton:disabled{background:#cbd5e1;color:#94a3b8;}"
-        )
-        self.btn_cancel.setEnabled(False)
-        self.btn_cancel.setMinimumHeight(34)
-        drawer_layout.addWidget(self.btn_cancel)
-
-        drawer_layout.addStretch()
-
-        body_split_layout.addWidget(self.action_drawer)
-        layout.addLayout(body_split_layout, stretch=2)
-
-        # ----------------------------------------------------------------
-        # Legacy/Hidden controls (preserved to prevent breaking references)
-        # ----------------------------------------------------------------
-        self.account_list = QListWidget()  # Kept as fallback, hidden
-        self.account_list.setVisible(False)
-        self.folder_list = QListWidget()  # Kept as fallback, hidden
-        self.folder_list.setVisible(False)
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        self.label_status = QLabel("")
-        self.label_status.setProperty("status", True)
-        self.label_status.setVisible(False)
-        layout.addWidget(self.label_status)
-
-    @Slot(int)
-    def _on_folder_lang_changed(self, index: int):
-        mode = self.combo_folder_lang.itemData(index)
-        if mode:
-            self.settings.set_folder_translation_sync(mode)
-            logger.info("Sync folder translation mode set to: %s", mode)
-
-
-        # ----------------------------------------------------------------
-        # Log table with filter + pagination
-        # ----------------------------------------------------------------
-        self.log_box = QGroupBox("Sync Log")
+        # 3. Collapsible Live Log Box
+        self.log_box = QGroupBox("📋 Senkronizasyon Canlı Logu")
         self.log_box.setStyleSheet("""
             QGroupBox {
                 background: #ffffff;
                 border: 1.5px solid #cbd5e1;
                 border-radius: 8px;
-                margin-top: 6px;
+                margin-top: 4px;
                 font-weight: bold;
-                font-size: 12px;
+                font-size: 11.5px;
                 color: #1e293b;
             }
         """)
         log_layout = QVBoxLayout(self.log_box)
-        log_layout.setContentsMargins(12, 16, 12, 12)
+        log_layout.setContentsMargins(8, 12, 8, 8)
+        log_layout.setSpacing(6)
 
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
+        log_toolbar = QHBoxLayout()
+        log_toolbar.setSpacing(6)
 
         self.filter_input = QLineEdit()
-        self.filter_input.setPlaceholderText("Filter log...")
-        self.filter_input.setMinimumWidth(200)
+        self.filter_input.setPlaceholderText("🔍 Log içinde filtrele...")
+        self.filter_input.setMinimumWidth(180)
         self.filter_input.setStyleSheet("""
             QLineEdit {
-                border: 1.5px solid #cbd5e1;
+                border: 1px solid #cbd5e1;
                 border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 12px;
+                padding: 3px 8px;
+                font-size: 11px;
             }
         """)
 
         self.combo_page_size = QComboBox()
-        self.combo_page_size.addItems(["25", "50", "100", "200", "All"])
+        self.combo_page_size.addItems(["25", "50", "100", "200", "Tümü"])
         self.combo_page_size.setCurrentIndex(1)
-        self.combo_page_size.setStyleSheet("""
-            QComboBox {
-                border: 1.5px solid #cbd5e1;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 12px;
-            }
-        """)
+        self.combo_page_size.setStyleSheet("font-size: 11px; padding: 2px 6px;")
 
-        self.btn_prev_page = QPushButton("\u25C0 Prev")
-        self.btn_prev_page.setStyleSheet(self._blue_btn_style(py=4, px=10, fs=11))
-        self.btn_next_page = QPushButton("Next \u25B6")
-        self.btn_next_page.setStyleSheet(self._blue_btn_style(py=4, px=10, fs=11))
-        self.label_page = QLabel("Page 1 / 1")
-        self.label_page.setStyleSheet("font-size:12px;color:#4b5563;")
+        self.btn_prev_page = QPushButton("◀ Önceki")
+        self.btn_prev_page.setStyleSheet(self._blue_btn_style(py=3, px=8, fs=10))
+        self.btn_next_page = QPushButton("Sonraki ▶")
+        self.btn_next_page.setStyleSheet(self._blue_btn_style(py=3, px=8, fs=10))
+        self.label_page = QLabel("Sayfa 1 / 1")
+        self.label_page.setStyleSheet("font-size:11px;color:#4b5563;")
 
-        self.btn_clear_log = QPushButton("Clear Log")
-        self.btn_clear_log.setStyleSheet(self._blue_btn_style(py=4, px=10, fs=11))
+        self.btn_clear_log = QPushButton("🧹 Temizle")
+        self.btn_clear_log.setStyleSheet(self._blue_btn_style(py=3, px=8, fs=10, bg="#ef4444", hover="#dc2626"))
 
-        toolbar.addWidget(self.filter_input)
-        toolbar.addStretch()
-        toolbar.addWidget(QLabel("Rows:"))
-        toolbar.addWidget(self.combo_page_size)
-        toolbar.addWidget(self.btn_prev_page)
-        toolbar.addWidget(self.label_page)
-        toolbar.addWidget(self.btn_next_page)
-        toolbar.addWidget(self.btn_clear_log)
-        log_layout.addLayout(toolbar)
+        log_toolbar.addWidget(self.filter_input)
+        log_toolbar.addStretch()
+        log_toolbar.addWidget(QLabel("Satır:"))
+        log_toolbar.addWidget(self.combo_page_size)
+        log_toolbar.addWidget(self.btn_prev_page)
+        log_toolbar.addWidget(self.label_page)
+        log_toolbar.addWidget(self.btn_next_page)
+        log_toolbar.addWidget(self.btn_clear_log)
+        log_layout.addLayout(log_toolbar)
 
         self.log_table = QTableView()
         self.log_table.setAlternatingRowColors(True)
@@ -1919,65 +1885,168 @@ class SyncPanel(QWidget):
         self.log_table.setShowGrid(False)
         self.log_table.verticalHeader().setVisible(False)
         self.log_table.horizontalHeader().setStretchLastSection(True)
+        self.log_table.setMaximumHeight(150)
         self.log_table.setStyleSheet("""
             QTableView {
                 background: #1a1a2e;
                 color: #a8d8ea;
                 font-family: 'Consolas','Courier New',monospace;
-                font-size: 11px;
+                font-size: 10.5px;
                 border: 1px solid #2d2d44;
                 border-radius: 4px;
                 padding: 2px;
                 gridline-color: #2d2d44;
             }
-            QTableView::item { padding: 3px 6px; }
+            QTableView::item { padding: 2px 4px; }
             QTableView::item:alternate { background: #1f1f36; }
             QHeaderView::section {
                 background: #252542;
                 color: #c4b5e3;
                 font-weight: 600;
-                font-size: 11px;
-                padding: 4px 6px;
+                font-size: 10.5px;
+                padding: 3px 4px;
                 border: none;
                 border-bottom: 1px solid #2d2d44;
             }
         """)
-
         self.log_table.setModel(self._log_proxy)
         self.log_table.setColumnHidden(1, True)
         self.log_table.setColumnHidden(2, True)
-
         log_layout.addWidget(self.log_table)
-        layout.addWidget(self.log_box, stretch=1)
 
-        # ----------------------------------------------------------------
-        # Connections
-        # ----------------------------------------------------------------
-        self.btn_sync.clicked.connect(self._sync_selected)
-        self.btn_sync_all.clicked.connect(self._sync_all)
-        self.btn_dry_run.clicked.connect(self._dry_run)
-        self.btn_filters.clicked.connect(self._open_filters_dialog)
-        self.btn_select_all.clicked.connect(self._toggle_select_all)
-        self.btn_reports.clicked.connect(self._show_reports)
-        self.btn_detailed_report.clicked.connect(self._show_detailed_report)
-        self.btn_cancel.clicked.connect(self._cancel_sync)
-        self.btn_pause.clicked.connect(self._toggle_pause_sync)
-        self.btn_toggle_log.clicked.connect(self._toggle_log_visibility)
-        
+        center_layout.addWidget(self.log_box, stretch=1)
+        split_layout.addWidget(center_container, stretch=1)
+
+        # Middle Arrow Toggle for Right Sidebar
+        self.btn_middle_toggle_right = QPushButton("▶")
+        self.btn_middle_toggle_right.setToolTip("Sağ İşlem Çekmecesini Gizle / Göster")
+        self.btn_middle_toggle_right.setFixedWidth(16)
+        self.btn_middle_toggle_right.setCursor(Qt.PointingHandCursor)
+        self.btn_middle_toggle_right.setStyleSheet("""
+            QPushButton {
+                background-color: #e2e8f0;
+                color: #334155;
+                border: 1px solid #cbd5e1;
+                border-right: none;
+                border-top-left-radius: 6px;
+                border-bottom-left-radius: 6px;
+                border-top-right-radius: 0px;
+                border-bottom-right-radius: 0px;
+                font-weight: bold;
+                font-size: 10px;
+                padding: 0px;
+                min-height: 50px;
+                max-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+                color: #ffffff;
+                border-color: #1d4ed8;
+            }
+        """)
+        self.btn_middle_toggle_right.clicked.connect(self._toggle_right_sidebar)
+        split_layout.addWidget(self.btn_middle_toggle_right)
+
+        # 3. Right Sidebar: Actions & Profile Drawer
+        self.right_sidebar = SyncRightSidebarWidget(self)
+        self.right_sidebar.setFixedWidth(260)
+        split_layout.addWidget(self.right_sidebar)
+
+        main_vbox.addLayout(split_layout, stretch=1)
+
+        # Alias properties for external compatibility
+        self.btn_sync_all = self.right_sidebar.btn_sync_all
+        self.btn_sync_group = self.right_sidebar.btn_sync_group
+        self.btn_select_all = self.right_sidebar.btn_select_all
+        self.btn_export_excel = self.right_sidebar.btn_export_excel
+        self.btn_copy_all_emails = self.right_sidebar.btn_copy_all_emails
+        self.combo_folder_lang = self.right_sidebar.combo_folder_lang
+        self.btn_detailed_report = self.right_sidebar.btn_detailed_report
+        self.view_profile_widget = self.right_sidebar.view_profile_widget
+
+    def _connect_signals(self):
+        # Left sidebar signals
+        self.left_sidebar.group_selected.connect(self._on_group_filter_changed)
+        self.left_sidebar.group_mgmt_requested.connect(self._open_group_management)
+
+        # Right sidebar signals
+        self.right_sidebar.sync_selected_requested.connect(self._sync_selected)
+        self.right_sidebar.sync_all_requested.connect(self._sync_all)
+        self.right_sidebar.dry_run_requested.connect(self._dry_run)
+        self.right_sidebar.sync_group_requested.connect(self._sync_current_group)
+        self.right_sidebar.select_all_requested.connect(self._toggle_select_all)
+        self.right_sidebar.export_excel_requested.connect(self._export_grid_to_csv)
+        self.right_sidebar.copy_emails_requested.connect(self._copy_all_emails)
+        self.right_sidebar.filters_requested.connect(self._open_filters_dialog)
+        self.right_sidebar.folder_lang_changed.connect(self._on_folder_lang_changed)
+        self.right_sidebar.reports_requested.connect(self._show_reports)
+        self.right_sidebar.detailed_report_requested.connect(self._show_detailed_report)
+        self.right_sidebar.toggle_log_requested.connect(self._toggle_log_visibility)
+        self.right_sidebar.pause_requested.connect(self._toggle_pause_sync)
+        self.right_sidebar.cancel_requested.connect(self._cancel_sync)
+        self.right_sidebar.row_height_changed.connect(lambda h: self.set_row_height(h, auto_save=True))
+
+        # View profiles
+        self.right_sidebar.profile_selected.connect(self._on_grid_profile_selected)
+        self.right_sidebar.save_profile_requested.connect(self._save_grid_profile)
+        self.right_sidebar.columns_requested.connect(self._open_column_manager_dialog)
+
+        # Log table toolbar
         self.filter_input.textChanged.connect(self._on_filter_changed)
         self.combo_page_size.currentIndexChanged.connect(self._on_page_size_changed)
         self.btn_prev_page.clicked.connect(self._prev_page)
         self.btn_next_page.clicked.connect(self._next_page)
         self.btn_clear_log.clicked.connect(self._clear_log)
 
+    @Slot(QTableWidgetItem)
+    def _on_table_item_changed(self, item: QTableWidgetItem):
+        if item and item.column() == 0:
+            self._update_selection_count()
+
     @staticmethod
-    def _blue_btn_style(py=8, px=14, fs=12, bg="#4361ee", hover="#3a56d4"):
+    def _blue_btn_style(py=6, px=12, fs=11, bg="#2563eb", hover="#1d4ed8", text_color="#ffffff", border="none"):
+        border_css = f"border: 1px solid {border};" if border != "none" else "border: none;"
         return (
-            f"QPushButton{{background:{bg};color:white;font-weight:600;"
-            f"padding:{py}px {px}px;border-radius:6px;font-size:{fs}px; border: none;}}"
-            f"QPushButton:hover{{background:{hover};}}"
-            f"QPushButton:disabled{{background:#cbd5e1;color:#94a3b8;}}"
+            f"QPushButton {{ background-color: {bg}; color: {text_color}; font-weight: 700; "
+            f"padding: {py}px {px}px; border-radius: 6px; font-size: {fs}px; {border_css} }}"
+            f"QPushButton:hover {{ background-color: {hover}; }}"
+            f"QPushButton:disabled {{ background-color: #cbd5e1; color: #94a3b8; border: none; }}"
         )
+
+    @staticmethod
+    def _toggle_btn_style(active: bool = False) -> str:
+        bg = "#e0e7ff" if active else "#ffffff"
+        border = "#2563eb" if active else "#cbd5e1"
+        fg = "#1e3a8a" if active else "#334155"
+        return f"""
+            QPushButton {{
+                background-color: {bg};
+                color: {fg};
+                border: 1.5px solid {border};
+                border-radius: 6px;
+                padding: 5px 12px;
+                font-size: 11.5px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{
+                background-color: #f1f5f9;
+                border-color: #2563eb;
+                color: #1e3a8a;
+            }}
+        """
+
+    @staticmethod
+    def _badge_style(bg: str = "#e2e8f0", fg: str = "#1e293b") -> str:
+        return f"""
+            QLabel {{
+                background-color: {bg};
+                color: {fg};
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+        """
 
     @staticmethod
     def _action_btn_style(bg_color: str, hover_color: str):
@@ -1988,8 +2057,8 @@ class SyncPanel(QWidget):
                 border: none;
                 border-radius: 4px;
                 padding: 4px;
-                min-width: 28px;
-                min-height: 24px;
+                min-width: 26px;
+                min-height: 22px;
                 font-weight: bold;
                 font-size: 11px;
             }}
@@ -2001,6 +2070,235 @@ class SyncPanel(QWidget):
                 color: #cbd5e1;
             }}
         """
+
+    # -------------------------------------------------------------
+    # Sidebar Toggles & Helpers
+    # -------------------------------------------------------------
+
+    def _toggle_left_sidebar(self):
+        is_hidden = self.left_sidebar.isHidden()
+        self.left_sidebar.setHidden(not is_hidden)
+        
+        if not is_hidden:
+            self.btn_toggle_left.setText("▶ Grupları Aç")
+            self.btn_middle_toggle_left.setText("▶")
+            self.btn_toggle_left.setStyleSheet(self._toggle_btn_style(active=True))
+        else:
+            self.btn_toggle_left.setText("◀ Grupları Gizle")
+            self.btn_middle_toggle_left.setText("◀")
+            self.btn_toggle_left.setStyleSheet(self._toggle_btn_style(active=False))
+
+    def _toggle_right_sidebar(self):
+        is_hidden = self.right_sidebar.isHidden()
+        self.right_sidebar.setHidden(not is_hidden)
+        self.btn_toggle_right.setText("⚙️ İşlemleri Aç ▶" if not is_hidden else "⚙️ İşlemleri Gizle ◀")
+        self.btn_middle_toggle_right.setText("▶" if not is_hidden else "◀")
+
+    @Slot()
+    def _filter_table_rows(self):
+        query = self.txt_search_sync.text().strip().lower()
+        for i in range(self.account_table.rowCount()):
+            if not query:
+                self.account_table.setRowHidden(i, False)
+                continue
+            
+            info_widget = self.account_table.cellWidget(i, 1)
+            row_text = ""
+            if info_widget:
+                for lbl in info_widget.findChildren(QLabel):
+                    row_text += " " + lbl.text().lower()
+            
+            self.account_table.setRowHidden(i, query not in row_text)
+        self._update_selection_count()
+
+    def _open_group_management(self):
+        from gui.dialogs.group_domain_dialog import GroupDomainDialog
+        dialog = GroupDomainDialog(self.engine, self.settings, self)
+        dialog.exec()
+        self.refresh()
+
+    # -------------------------------------------------------------
+    # Grid Layout Profile & Row Height Managers
+    # -------------------------------------------------------------
+
+    def set_row_height(self, height: int, auto_save: bool = True):
+        self._current_row_height = max(24, min(140, height))
+        self.account_table.verticalHeader().setDefaultSectionSize(self._current_row_height)
+        for r in range(self.account_table.rowCount()):
+            self.account_table.setRowHeight(r, self._current_row_height)
+        if auto_save:
+            self._auto_save_current_layout()
+
+    def _prompt_custom_row_height(self):
+        val, ok = QInputDialog.getInt(
+            self, "Satır Yüksekliği Ayarla",
+            "Lütfen satır yüksekliğini piksel (px) cinsinden girin (24 - 140):",
+            self._current_row_height, 24, 140, 1
+        )
+        if ok:
+            self.set_row_height(val, auto_save=True)
+
+    def _toggle_column_visibility(self, col: int, visible: bool):
+        self.account_table.setColumnHidden(col, not visible)
+        self._auto_save_current_layout()
+
+    def _open_column_manager_dialog(self):
+        columns = [self.account_table.horizontalHeaderItem(col).text() for col in range(self.account_table.columnCount())]
+        hidden = [col for col in range(self.account_table.columnCount()) if self.account_table.isColumnHidden(col)]
+        dlg = ColumnManagerDialog(columns, hidden, parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            new_hidden = set(dlg.get_hidden_columns())
+            for col in range(self.account_table.columnCount()):
+                self.account_table.setColumnHidden(col, col in new_hidden)
+            self._auto_save_current_layout()
+
+    def _get_current_layout_state(self) -> dict:
+        return {
+            "hidden_columns": [c for c in range(self.account_table.columnCount()) if self.account_table.isColumnHidden(c)],
+            "column_widths": [self.account_table.columnWidth(c) for c in range(self.account_table.columnCount())],
+            "row_height": self._current_row_height,
+        }
+
+    def _auto_save_current_layout(self, *args):
+        if self._is_refreshing or not hasattr(self, 'right_sidebar') or not hasattr(self.right_sidebar, 'view_profile_widget'):
+            return
+        active_profile = self.right_sidebar.view_profile_widget.get_current_profile_name()
+        state = self._get_current_layout_state()
+        self.right_sidebar.view_profile_widget.manager.save_profile(active_profile, state, set_active=True)
+
+    def _save_grid_profile(self, profile_name: str):
+        state = self._get_current_layout_state()
+        self.right_sidebar.view_profile_widget.manager.save_profile(profile_name, state, set_active=True)
+        self.right_sidebar.view_profile_widget.reload_profiles()
+        QMessageBox.information(self, "Profil Kaydedildi", f"'{profile_name}' görünüm düzeni başarıyla kaydedildi.")
+
+    def _save_current_layout_dialog(self):
+        current_name = self.right_sidebar.view_profile_widget.get_current_profile_name()
+        existing_names = self.right_sidebar.view_profile_widget.manager.get_profile_names()
+        dialog = SaveLayoutProfileDialog(
+            existing_profiles=existing_names,
+            current_profile=current_name,
+            parent=self
+        )
+        if dialog.exec() == QDialog.Accepted and dialog.selected_profile_name:
+            chosen_name = dialog.selected_profile_name
+            self._save_grid_profile(chosen_name)
+            self.right_sidebar.view_profile_widget.reload_profiles()
+            idx = self.right_sidebar.view_profile_widget.combo_profiles.findText(chosen_name)
+            if idx >= 0:
+                self.right_sidebar.view_profile_widget.combo_profiles.setCurrentIndex(idx)
+
+    def _apply_named_profile(self, name: str):
+        state = self.right_sidebar.view_profile_widget.manager.get_profile(name)
+        if state:
+            hidden = state.get("hidden_columns", [])
+            widths = state.get("column_widths", [])
+            row_h = state.get("row_height", 88)
+            for c in range(self.account_table.columnCount()):
+                if c < len(widths) and widths[c] > 10:
+                    self.account_table.setColumnWidth(c, widths[c])
+                self.account_table.setColumnHidden(c, c in hidden)
+            self.set_row_height(row_h, auto_save=False)
+            idx = self.right_sidebar.view_profile_widget.combo_profiles.findText(name)
+            if idx >= 0:
+                self.right_sidebar.view_profile_widget.combo_profiles.setCurrentIndex(idx)
+
+    @Slot(str, dict)
+    def _on_grid_profile_selected(self, name: str, state: dict):
+        if state:
+            hidden = state.get("hidden_columns", [])
+            widths = state.get("column_widths", [])
+            row_h = state.get("row_height", 88)
+            for c in range(self.account_table.columnCount()):
+                if c < len(widths) and widths[c] > 10:
+                    self.account_table.setColumnWidth(c, widths[c])
+                self.account_table.setColumnHidden(c, c in hidden)
+            self.set_row_height(row_h, auto_save=False)
+        elif name == "Kompakt Düzen":
+            self.set_row_height(40, auto_save=True)
+        elif name == "Geniş Görünüm":
+            self.set_row_height(110, auto_save=True)
+        elif name == "Varsayılan":
+            self.set_row_height(88, auto_save=True)
+            self.account_table.setColumnWidth(0, 55)
+            self.account_table.setColumnWidth(1, 420)
+            self.account_table.setColumnWidth(2, 340)
+            self.account_table.setColumnWidth(3, 150)
+            for c in range(self.account_table.columnCount()):
+                self.account_table.setColumnHidden(c, False)
+
+    def _reset_grid_layout_to_default(self):
+        for c in range(self.account_table.columnCount()):
+            self.account_table.setColumnHidden(c, False)
+        self.account_table.setColumnWidth(0, 55)
+        self.account_table.setColumnWidth(1, 420)
+        self.account_table.setColumnWidth(2, 340)
+        self.account_table.setColumnWidth(3, 150)
+        self.set_row_height(88, auto_save=True)
+        QMessageBox.information(self, "Grid Sıfırlandı", "Tablo sütunları ve satır yüksekliği varsayılan düzene (88px) sıfırlandı.")
+
+    @Slot(str)
+    def _on_folder_lang_changed(self, mode: str):
+        if mode:
+            self.settings.set_folder_translation_sync(mode)
+            logger.info("Sync folder translation mode set to: %s", mode)
+
+    @Slot()
+    def _export_grid_to_csv(self):
+        import csv
+        from PySide6.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Hesap Listesini Excel / CSV Olarak Kaydet",
+            "eposta_hesap_listesi.csv", "CSV Dosyaları (*.csv);;Tüm Dosyalar (*.*)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f, delimiter=";")
+                writer.writerow(["ID", "Hesap Adı", "E-Posta Adresi", "Grup / Domain", "Durum"])
+                for i in range(self.account_table.rowCount()):
+                    if self.account_table.isRowHidden(i):
+                        continue
+                    item = self.account_table.item(i, 0)
+                    acc_id = item.data(Qt.UserRole) if item else ""
+
+                    info_widget = self.account_table.cellWidget(i, 1)
+                    label_text, email_text = "", ""
+                    if info_widget:
+                        labels = info_widget.findChildren(QLabel)
+                        if len(labels) >= 1:
+                            label_text = labels[0].text().replace("<b>", "").replace("</b>", "").strip()
+                        if len(labels) >= 2:
+                            email_text = labels[1].text().replace("✉️", "").strip()
+
+                    ui = self._accounts_ui.get(acc_id, {})
+                    status_text = ui.get("lbl_status", QLabel("Idle")).text() if ui else "Idle"
+                    writer.writerow([acc_id, label_text, email_text, "", status_text])
+
+            QMessageBox.information(self, "Dışa Aktarma Başarılı", f"Hesap tablosu başarıyla dışa aktarıldı:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Dışa aktarma sırasında hata oluştu:\n{e}")
+
+    @Slot()
+    def _copy_all_emails(self):
+        emails = []
+        for i in range(self.account_table.rowCount()):
+            if not self.account_table.isRowHidden(i):
+                info_widget = self.account_table.cellWidget(i, 1)
+                if info_widget:
+                    labels = info_widget.findChildren(QLabel)
+                    if len(labels) >= 2:
+                        em = labels[1].text().replace("✉️", "").strip()
+                        if em:
+                            emails.append(em)
+        if emails:
+            QApplication.clipboard().setText("\n".join(emails))
+            QMessageBox.information(self, "Kopyalandı", f"{len(emails)} adet e-posta adresi panoya kopyalandı.")
+        else:
+            QMessageBox.warning(self, "Bulunamadı", "Tabloda kopyalanacak e-posta adresi bulunamadı.")
 
     # ------------------------------------------------------------------
     # Filters Pop-up Dialog
@@ -2024,10 +2322,6 @@ class SyncPanel(QWidget):
             msg.setIcon(QMessageBox.Warning)
             msg.setWindowTitle("Hesap Seçilmedi")
             msg.setText("Lütfen filtrelerini düzenlemek istediğiniz hesabı tabloda seçin veya solundaki kutucuğu işaretleyin.")
-            msg.setStandardButtons(QMessageBox.Ok)
-            ok_btn = msg.button(QMessageBox.Ok)
-            if ok_btn:
-                ok_btn.setText("Tamam")
             msg.setStyleSheet(GLOBAL_MSG_STYLE)
             msg.exec()
             return
@@ -2111,23 +2405,18 @@ class SyncPanel(QWidget):
             self._log_callback(f"[{acc.get('label')}] Filtreler kaydedildi: {len(new_f_data['folders'])} klasör seçildi.")
 
     # ------------------------------------------------------------------
-    # Stat card updates
+    # Stat card updates & UI toggles
     # ------------------------------------------------------------------
 
-    def _update_stats(self, account="\u2014", server_emails="\u2014",
-                      folders="\u2014", current="\u2014",
-                      remaining="\u2014", progress="\u2014", eta="\u2014"):
+    def _update_stats(self, account="—", server_emails="—",
+                      folders="—", current="—",
+                      remaining="—", progress="—", eta="—"):
         self.card_account.set_value(str(account))
         self.card_server.set_value(str(server_emails))
-        self.card_folders.set_value(str(folders))
         self.card_current.set_value(str(current))
         self.card_remaining.set_value(str(remaining))
         self.card_progress.set_value(str(progress))
         self.card_eta.set_value(str(eta))
-
-    # ------------------------------------------------------------------
-    # Log Toggling
-    # ------------------------------------------------------------------
 
     @Slot()
     def _toggle_log_visibility(self):
@@ -2137,34 +2426,6 @@ class SyncPanel(QWidget):
             self.btn_toggle_log.setText("📋 Log Kutusu (Gizli)")
         else:
             self.btn_toggle_log.setText("📋 Log Kutusu")
-
-    @Slot()
-    def _toggle_stats(self):
-        is_visible = self.stats_widget.isVisible()
-        self.stats_widget.setVisible(not is_visible)
-        if is_visible:
-            self.btn_toggle_stats.setText("📊 İstatistikler (Gizli)")
-        else:
-            self.btn_toggle_stats.setText("📊 İstatistikler")
-
-    @Slot()
-    def _toggle_drawer(self):
-        is_visible = self.action_drawer.isVisible()
-        self.action_drawer.setVisible(not is_visible)
-        if is_visible:
-            self.btn_toggle_drawer.setText("⚙️ İşlem Paneli ▶")
-        else:
-            self.btn_toggle_drawer.setText("⚙️ İşlem Paneli ◀")
-
-    @Slot()
-    def _toggle_sidebar(self):
-        is_visible = self.sidebar_widget.isVisible()
-        self.sidebar_widget.setVisible(not is_visible)
-        if is_visible:
-            self.btn_toggle_sidebar.setText("▶")
-        else:
-            self.btn_toggle_sidebar.setText("◀")
-
 
     # ------------------------------------------------------------------
     # Account selection helpers
@@ -2182,14 +2443,6 @@ class SyncPanel(QWidget):
             active_id = self._get_active_row_account_id()
             if active_id is not None:
                 ids.append(active_id)
-        if not ids:
-            for i in range(self.account_table.rowCount()):
-                if not self.account_table.isRowHidden(i):
-                    item = self.account_table.item(i, 0)
-                    if item:
-                        acc_id = item.data(Qt.UserRole)
-                        if acc_id is not None:
-                            ids.append(acc_id)
         return ids
 
     def _toggle_select_all(self):
@@ -2199,8 +2452,6 @@ class SyncPanel(QWidget):
                 if item:
                     item.setCheckState(Qt.Unchecked)
             self.btn_select_all.setText("☑️ Tümünü Seç")
-            if hasattr(self, 'btn_top_select_all'):
-                self.btn_top_select_all.setText("☑️ Tümünü Seç")
             self._all_selected_flag = False
         else:
             for i in range(self.account_table.rowCount()):
@@ -2208,33 +2459,15 @@ class SyncPanel(QWidget):
                 if item:
                     item.setCheckState(Qt.Checked)
             self.btn_select_all.setText("🔳 Seçimleri Kaldır")
-            if hasattr(self, 'btn_top_select_all'):
-                self.btn_top_select_all.setText("🔳 Seçimleri Kaldır")
             self._all_selected_flag = True
         self._update_selection_count()
 
     def _update_selection_count(self):
         total = self.account_table.rowCount()
         selected = len(self._get_selected_account_ids())
-        if hasattr(self, 'lbl_selection_count'):
-            self.lbl_selection_count.setText(f"<b>{selected}</b> / {total} Hesap Seçili")
-
-    @Slot(str)
-    def _on_account_search_changed(self, text: str):
-        text = text.strip().lower()
-        for i in range(self.account_table.rowCount()):
-            widget = self.account_table.cellWidget(i, 1)
-            match = True
-            if text:
-                match = False
-                if widget:
-                    labels = widget.findChildren(QLabel)
-                    for lbl in labels:
-                        if text in lbl.text().lower():
-                            match = True
-                            break
-            self.account_table.setRowHidden(i, not match)
-        self._update_selection_count()
+        self.lbl_stat_total.setText(f"📊 {total} Hesap")
+        self.lbl_stat_selected.setText(f"☑️ {selected} Seçili")
+        self.lbl_stat_active.setText(f"🟢 {len(self._active_syncs)} Çalışıyor")
 
     def _get_active_row_account_id(self) -> Optional[int]:
         row = self.account_table.currentRow()
@@ -2254,50 +2487,52 @@ class SyncPanel(QWidget):
         if not ui:
             return
             
-        # Update stat cards from last cached stats
         status = ui["lbl_status"].text()
         progress_val = ui["progress_bar"].value()
         progress_max = ui["progress_bar"].maximum()
         
-        prog_text = "\u2014"
+        prog_text = "—"
         if progress_max > 0:
             prog_text = f"{int((progress_val / progress_max) * 100)}%"
-        elif "Done" in status:
+        elif "Done" in status or "Tamamlandı" in status:
             prog_text = "100%"
             
-        local_mails_cnt = 0
-        folders_cnt = 0
-        try:
-            with self.engine.db.get_conn() as conn:
-                row_mails = conn.execute("SELECT COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (acc_id,)).fetchone()
-                local_mails_cnt = row_mails["cnt"] if row_mails else 0
-                row_folders = conn.execute("SELECT COUNT(DISTINCT folder) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (acc_id,)).fetchone()
-                folders_cnt = row_folders["cnt"] if row_folders else 0
-        except Exception:
-            pass
-
-        # Parse account label name
         widget = self.account_table.cellWidget(self.account_table.currentRow(), 1)
-        account_name = "\u2014"
+        account_name = "—"
+        stats_text = ""
         if widget:
-            lbl = widget.findChild(QLabel)
-            if lbl:
-                account_name = lbl.text().replace("<b>", "").replace("</b>", "")
+            lbls = widget.findChildren(QLabel)
+            if len(lbls) >= 1:
+                account_name = lbls[0].text().replace("<b>", "").replace("</b>", "")
+            if len(lbls) >= 3:
+                stats_text = lbls[2].text()
 
         self._update_stats(
             account=account_name,
             current=status,
             progress=prog_text,
-            folders=str(folders_cnt),
-            server_emails=f"{local_mails_cnt} (Local)",
-            remaining=str(progress_max - progress_val) if progress_max > 0 else "\u2014",
+            folders="—",
+            server_emails=stats_text or "—",
+            remaining=str(progress_max - progress_val) if progress_max > 0 else "—",
         )
 
     # ------------------------------------------------------------------
-    # Individual Sync Workers (Multi-threaded per account)
+    # Multi-threaded Individual Sync Workers
     # ------------------------------------------------------------------
 
     def _start_individual_sync(self, account_id: int):
+        if not self.settings.is_configured_data_path_available():
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Yedekleme Diski Takılı Değil")
+            msg.setText(
+                f"Yapılandırılmış arşiv diski (<b>{self.settings.configured_data_path_str()}</b>) şu anda takılı veya erişilebilir değil.\n\n"
+                "Senkronizasyon yapabilmek için lütfen harici diskinizi bilgisayara takınız."
+            )
+            msg.setStyleSheet(GLOBAL_MSG_STYLE)
+            msg.exec()
+            return
+
         if account_id in self._active_syncs:
             return
             
@@ -2310,21 +2545,20 @@ class SyncPanel(QWidget):
             ui["btn_pause"].setEnabled(True)
             ui["btn_pause"].setText("⏸")
             ui["btn_stop"].setEnabled(True)
-            ui["lbl_status"].setText("Connecting...")
+            ui["lbl_status"].setText("Bağlanıyor...")
             ui["progress_bar"].setRange(0, 0)
             
         self._active_syncs[account_id] = {
             "cancel_event": cancel_event,
             "pause_event": pause_event,
-            "status": "Connecting",
+            "status": "Bağlanıyor...",
             "thread": None,
         }
         
-        # Enabled global cancel/pause
         self.btn_cancel.setEnabled(True)
         self.btn_pause.setEnabled(True)
+        self._update_selection_count()
         
-        # Load account-specific filters
         f_data = self.settings.account_sync_filters(account_id) or {}
         folder_filter = f_data.get("folders")
         since_date_enabled = f_data.get("since_date_enabled", False)
@@ -2335,7 +2569,7 @@ class SyncPanel(QWidget):
         timeout = f_data.get("timeout", 180)
         
         def progress_cb(aid: int, folder_name: str, current: int, total: int):
-            self._account_progress_signal.emit(aid, f"Syncing {folder_name}", current, total)
+            self._account_progress_signal.emit(aid, f"Arşivleniyor: {folder_name}", current, total)
             
         def log_cb(msg: str):
             self._log_signal.emit(msg)
@@ -2372,13 +2606,13 @@ class SyncPanel(QWidget):
         if pe.is_set():
             pe.clear()
             ui["btn_pause"].setText("⏸")
-            ui["lbl_status"].setText("Resumed")
-            self._log_callback(f"Account ID {account_id} sync resumed")
+            ui["lbl_status"].setText("Devam Ediyor")
+            self._log_callback(f"Hesap ID {account_id} senkronizasyonu devam ettirildi.")
         else:
             pe.set()
             ui["btn_pause"].setText("▶")
-            ui["lbl_status"].setText("Paused")
-            self._log_callback(f"Account ID {account_id} sync paused — waiting at next item...")
+            ui["lbl_status"].setText("Duraklatıldı")
+            self._log_callback(f"Hesap ID {account_id} senkronizasyonu duraklatıldı.")
 
     def _stop_individual_sync(self, account_id: int):
         sync = self._active_syncs.get(account_id)
@@ -2388,20 +2622,12 @@ class SyncPanel(QWidget):
             
         sync["cancel_event"].set()
         ui["btn_stop"].setEnabled(False)
-        ui["lbl_status"].setText("Stopping...")
-        self._log_callback(f"Account ID {account_id} sync cancellation requested")
+        ui["lbl_status"].setText("Durduruluyor...")
+        self._log_callback(f"Hesap ID {account_id} senkronizasyonu durdurma isteği gönderildi.")
 
     def _show_individual_report(self, account_id: int):
-        label = ""
-        for i in range(self.account_table.rowCount()):
-            item = self.account_table.item(i, 0)
-            if item and item.data(Qt.UserRole) == account_id:
-                widget = self.account_table.cellWidget(i, 1)
-                if widget:
-                    lbl = widget.findChild(QLabel)
-                    if lbl:
-                        label = lbl.text().replace("<b>", "").replace("</b>", "")
-                break
+        acc = self.engine.accounts.get(account_id)
+        label = acc.get("label", f"Hesap #{account_id}") if acc else f"Hesap #{account_id}"
                 
         acc_reports = []
         for r in self._reports:
@@ -2410,7 +2636,7 @@ class SyncPanel(QWidget):
                 acc_reports.append(r)
                 
         if not acc_reports:
-            QMessageBox.information(self, "No Reports", "No sync reports available for this account in this session.")
+            QMessageBox.information(self, "Rapor Bulunamadı", "Bu oturumda bu hesap için tamamlanmış rapor bulunamadı.")
             return
             
         dialog = ReportsDialog(acc_reports, self)
@@ -2425,53 +2651,41 @@ class SyncPanel(QWidget):
         ui = self._accounts_ui.get(account_id)
         if ui:
             ui["lbl_status"].setText(f"{status_text} ({current}/{total})")
-            ui["progress_bar"].setRange(0, total)
+            ui["progress_bar"].setRange(0, total if total > 0 else 100)
             ui["progress_bar"].setValue(current)
             
         if account_id in self._active_syncs:
             self._active_syncs[account_id]["status"] = status_text
             
         if self._get_active_row_account_id() == account_id:
-            local_mails_cnt = 0
-            folders_cnt = 0
-            try:
-                with self.engine.db.get_conn() as conn:
-                    row_mails = conn.execute("SELECT COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (account_id,)).fetchone()
-                    local_mails_cnt = row_mails["cnt"] if row_mails else 0
-                    row_folders = conn.execute("SELECT COUNT(DISTINCT folder) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (account_id,)).fetchone()
-                    folders_cnt = row_folders["cnt"] if row_folders else 0
-            except Exception:
-                pass
             prog_text = f"{int((current/total)*100)}%" if total > 0 else "0%"
             self.card_current.set_value(status_text)
-            self.card_remaining.set_value(str(total - current))
+            self.card_remaining.set_value(str(total - current) if total >= current else "0")
             self.card_progress.set_value(prog_text)
-            self.card_folders.set_value(str(folders_cnt))
-            self.card_server.set_value(f"{local_mails_cnt + (total - current)} (Local)")
             
-            # Simple ETA
             eta_sec = int((total - current) * 0.3)
             if eta_sec > 60:
-                self.card_eta.set_value(f"{eta_sec // 60}m {eta_sec % 60}s")
+                self.card_eta.set_value(f"{eta_sec // 60}dk {eta_sec % 60}sn")
             else:
-                self.card_eta.set_value(f"{eta_sec}s")
+                self.card_eta.set_value(f"{eta_sec}sn")
 
     @Slot(int, object)
     def _on_account_sync_done(self, account_id: int, report: Any):
         ui = self._accounts_ui.get(account_id)
+        cancelled = account_id in self._active_syncs and self._active_syncs[account_id]["cancel_event"].is_set()
+        
         if ui:
             ui["btn_start"].setEnabled(True)
             ui["btn_pause"].setEnabled(False)
             ui["btn_stop"].setEnabled(False)
             
-            cancelled = account_id in self._active_syncs and self._active_syncs[account_id]["cancel_event"].is_set()
             if cancelled:
-                ui["lbl_status"].setText("Cancelled")
+                ui["lbl_status"].setText("İptal Edildi")
                 ui["progress_bar"].setRange(0, 100)
                 ui["progress_bar"].setValue(0)
             else:
                 fetched = report.get("mails_fetched", 0) if isinstance(report, dict) else getattr(report, "mails_fetched", 0)
-                ui["lbl_status"].setText(f"Done: {fetched} fetched")
+                ui["lbl_status"].setText(f"Tamamlandı: {fetched} mail çekildi")
                 ui["progress_bar"].setRange(0, 100)
                 ui["progress_bar"].setValue(100)
                 
@@ -2484,6 +2698,7 @@ class SyncPanel(QWidget):
                     logger.error("Failed to generate sync report: %s", e)
             
         self._active_syncs.pop(account_id, None)
+        self._update_selection_count()
         
         if not self._active_syncs:
             self._on_all_syncs_finished()
@@ -2495,7 +2710,7 @@ class SyncPanel(QWidget):
             ui["btn_start"].setEnabled(True)
             ui["btn_pause"].setEnabled(False)
             ui["btn_stop"].setEnabled(False)
-            ui["lbl_status"].setText(f"Error: {err_msg}")
+            ui["lbl_status"].setText(f"Hata: {err_msg}")
             ui["progress_bar"].setRange(0, 100)
             ui["progress_bar"].setValue(0)
             
@@ -2514,19 +2729,18 @@ class SyncPanel(QWidget):
             "end_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._reports.append(error_report)
-        
         self._active_syncs.pop(account_id, None)
+        self._update_selection_count()
         
         if not self._active_syncs:
             self._on_all_syncs_finished()
 
-
-
     def _on_all_syncs_finished(self):
         self.btn_cancel.setEnabled(False)
         self.btn_pause.setEnabled(False)
-        self.btn_pause.setText("⏸️ Pause All")
-        self._log_callback("All background sync tasks finished.")
+        self.btn_pause.setText("⏸️ Duraklat")
+        self._log_callback("Tüm arka plan senkronizasyon işlemleri tamamlandı.")
+        self._update_selection_count()
         
         if self._reports:
             try:
@@ -2537,7 +2751,7 @@ class SyncPanel(QWidget):
                     r_dict = r if isinstance(r, dict) else (r.__dict__ if hasattr(r, "__dict__") else {})
                     self.engine.reporter.generate_sync_report(r_dict, output_format="both")
             except Exception as e:
-                logger.error("Failed to save sync report in reporter: %s", e)
+                logger.error("Failed to save sync report: %s", e)
 
             dialog = SyncFinishedDialog(self)
             if dialog.exec() == QDialog.Accepted:
@@ -2549,9 +2763,6 @@ class SyncPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _log_callback(self, msg: str):
-        self._log_signal.emit(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-
-    def _log_callback_unsafe(self, msg: str):
         self._log_signal.emit(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
     @Slot(str)
@@ -2574,45 +2785,18 @@ class SyncPanel(QWidget):
         source = src_match.group(1) if src_match else "sync"
         message = rest[src_match.end():] if src_match else rest
         entry = LogEntry(ts, level, source, message)
+        
         if getattr(self, '_log_model', None) is not None:
-            self._log_model.append_entry(entry)
+            self._log_model.append(entry) if hasattr(self._log_model, 'append') else self._log_model.append_entry(entry)
             if getattr(self, '_log_proxy', None) is not None:
                 self._update_pagination()
                 self._log_proxy.set_page(self._log_proxy.total_pages() - 1)
                 self._update_pagination()
 
-        # Clean parsing for Current Folder stat card
-        if "Syncing folder" in message:
-            folder_start_match = re.search(r'Syncing folder \'([^\']+)\'', message)
-            if folder_start_match:
-                fld = folder_start_match.group(1)
-                self.card_current.set_value(fld)
-        elif "Fetching UID" in message:
-            progress_match = re.search(r'\[([^\]]+)\]\s+Fetching UID \d+\s+\((\d+)/(\d+)\)', message)
-            if progress_match:
-                fld = progress_match.group(1)
-                curr = int(progress_match.group(2))
-                tot = int(progress_match.group(3))
-                self.card_current.set_value(fld)
-                self.card_remaining.set_value(str(tot - curr))
-                self.card_progress.set_value(f"{int((curr/tot)*100)}%")
-                
-                # Simple ETA
-                eta_sec = int((tot - curr) * 0.3)
-                if eta_sec > 60:
-                    self.card_eta.set_value(f"{eta_sec // 60}m {eta_sec % 60}s")
-                else:
-                    self.card_eta.set_value(f"{eta_sec}s")
-        elif "Folder done" in message:
-            folder_done_match = re.search(r'\[([^\]]+)\]\s*===\s*Folder done', message)
-            if folder_done_match:
-                fld = folder_done_match.group(1)
-                self.card_current.set_value(f"{fld} (Done)")
-                self.card_remaining.set_value("0")
-                self.card_progress.set_value("100%")
-                self.card_eta.set_value("0s")
-        elif source != "sync" and "Syncing" in message:
-            self.card_account.set_value(source)
+        if "Syncing folder" in message or "Arşivleniyor" in message:
+            fld_match = re.search(r'[\'"]([^\'"]+)[\'"]', message)
+            if fld_match:
+                self.card_current.set_value(fld_match.group(1))
 
     # ------------------------------------------------------------------
     # Pagination
@@ -2622,7 +2806,7 @@ class SyncPanel(QWidget):
         if hasattr(self, 'label_page') and self.label_page and getattr(self, '_log_proxy', None) is not None:
             total = self._log_proxy.total_pages()
             cur = self._log_proxy.current_page() + 1
-            self.label_page.setText(f"Page {cur} / {total}")
+            self.label_page.setText(f"Sayfa {cur} / {total}")
             if hasattr(self, 'btn_prev_page') and self.btn_prev_page:
                 self.btn_prev_page.setEnabled(cur > 1)
             if hasattr(self, 'btn_next_page') and self.btn_next_page:
@@ -2634,7 +2818,7 @@ class SyncPanel(QWidget):
 
     def _on_page_size_changed(self, idx: int):
         val = self.combo_page_size.currentText()
-        if val == "All":
+        if val in ("Tümü", "All"):
             self._log_proxy.set_page_size(999999)
         else:
             self._log_proxy.set_page_size(int(val))
@@ -2657,8 +2841,7 @@ class SyncPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _confirm_sync(self, ids: list) -> bool:
-        """Run dry-run on selected accounts in a background thread, show confirmation, return True if OK."""
-        from PySide6.QtWidgets import QProgressDialog, QApplication
+        from PySide6.QtWidgets import QProgressDialog
         
         table_data = {}
         for acc_id in ids:
@@ -2678,7 +2861,7 @@ class SyncPanel(QWidget):
         progress.setWindowModality(Qt.WindowModal)
         progress.setWindowTitle("Senkronizasyon Hazırlığı")
         progress.setMinimumDuration(0)
-        progress.setStyleSheet("QProgressDialog { background-color: #f8fafc; } QLabel { color: #1e293b; }")
+        progress.setStyleSheet("QProgressDialog { background-color: #f8fafc; } QLabel { color: #1e293b; font-size:12px; }")
         progress.setValue(0)
         
         worker = DryRunWorker(self.engine, self.settings, ids, table_data, parent=self)
@@ -2715,87 +2898,104 @@ class SyncPanel(QWidget):
         dialog = SyncConfirmDialog(previews_result, self)
         return dialog.exec() == QDialog.Accepted
 
+    @Slot(QPoint)
+    def _show_toya_grid_context_menu(self, pos: QPoint):
+        sender = self.sender()
+        is_header = (sender == self.account_table.horizontalHeader())
+        global_pos = sender.mapToGlobal(pos) if sender else QCursor.pos()
+        row = self.account_table.rowAt(pos.y()) if not is_header else -1
 
-    def _on_account_table_context_menu(self, pos: QPoint):
-        row = self.account_table.rowAt(pos.y())
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #1e3a8a;
+                color: #ffffff;
+                border: 1.5px solid #1e40af;
+                border-radius: 8px;
+                padding: 6px;
+                font-weight: 600;
+                font-size: 11.5px;
+            }
+            QMenu::item {
+                padding: 6px 22px 6px 12px;
+                border-radius: 4px;
+                color: #ffffff;
+            }
+            QMenu::item:selected {
+                background-color: #2563eb;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #3b82f6;
+                margin: 4px 6px;
+            }
+        """)
+
         acc_id = None
         acc = None
-
-        if row >= 0:
+        if row >= 0 and not is_header:
             item = self.account_table.item(row, 0)
             if item:
                 acc_id = item.data(Qt.UserRole)
                 acc = self.engine.accounts.get(acc_id)
 
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu { background-color: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px; }
-            QMenu::item { padding: 8px 24px; font-size: 12px; color: #1e293b; border-radius: 4px; font-weight: 500; }
-            QMenu::item:selected { background-color: #2563eb; color: #ffffff; font-weight: bold; }
-            QMenu::separator { height: 1px; background: #e2e8f0; margin: 4px 8px; }
-        """)
-
-        act_sync_selected = menu.addAction("⚡ Seçili Hesapları Senkronize Et (Sync Selected)")
-        act_sync_group = menu.addAction("🚀 Seçili Grubu Senkronize Et (Sync Group)")
-        act_sync_all = menu.addAction("🌐 Tüm Hesapları Senkronize Et (Sync All)")
-        menu.addSeparator()
-        act_select_all = menu.addAction("☑️ Tümünü Seç (Select All)")
-        act_deselect_all = menu.addAction("🔳 Seçimleri Kaldır (Deselect All)")
-        menu.addSeparator()
-
-        act_sync_this = None
-        act_pause_this = None
-        act_stop_this = None
-        act_dry = None
-        act_flt = None
-        act_rep = None
-        act_copy = None
-
         if acc_id is not None and acc:
             acc_label = acc.get("label", f"Hesap #{acc_id}")
             act_sync_this = menu.addAction(f"▶ '{acc_label}' İçin Senkronizasyonu Başlat")
-            act_pause_this = menu.addAction(f"⏸ Duraklat / Sürdür")
-            act_stop_this = menu.addAction(f"⏹ İptal Et / Durdur")
+            act_sync_this.triggered.connect(lambda chk=False, aid=acc_id: self._trigger_individual_sync_direct(aid))
+
+            act_pause_this = menu.addAction("⏸ Duraklat / Sürdür")
+            act_pause_this.triggered.connect(lambda chk=False, aid=acc_id: self._toggle_individual_pause(aid))
+
+            act_stop_this = menu.addAction("⏹ İptal Et / Durdur")
+            act_stop_this.triggered.connect(lambda chk=False, aid=acc_id: self._stop_individual_sync(aid))
+
             menu.addSeparator()
-            act_dry = menu.addAction("🔍 Kuru Çalıştırma / Önizleme (Dry Run)")
+            act_dry = menu.addAction("🔍 Kuru Çalıştırma (Önizleme)")
+            act_dry.triggered.connect(lambda chk=False, aid=acc_id: self._confirm_sync([aid]))
+
             act_flt = menu.addAction("⚙️ Klasör & Filtre Ayarları...")
-            act_rep = menu.addAction("📊 Raporları Göster")
+            act_flt.triggered.connect(lambda chk=False, aid=acc_id: self._open_filters_dialog_for_account(aid))
+
+            act_rep = menu.addAction("📊 Bu Hesabın Raporu")
+            act_rep.triggered.connect(lambda chk=False, aid=acc_id: self._show_individual_report(aid))
+
             act_copy = menu.addAction("📋 E-Posta Adresini Kopyala")
+            act_copy.triggered.connect(lambda chk=False, em=acc.get("email", ""): QApplication.clipboard().setText(em))
+            menu.addSeparator()
 
-        action = menu.exec(self.account_table.viewport().mapToGlobal(pos))
-        if not action:
-            return
+        act_sync_sel = menu.addAction("⚡ Seçili Hesapları Senkronize Et")
+        act_sync_sel.triggered.connect(self._sync_selected)
 
-        if action == act_sync_selected:
-            self._sync_selected()
-        elif action == act_sync_group:
-            self._sync_current_group()
-        elif action == act_sync_all:
-            self._sync_all()
-        elif action == act_select_all:
-            if not self._all_selected_flag:
-                self._toggle_select_all()
-        elif action == act_deselect_all:
-            if self._all_selected_flag:
-                self._toggle_select_all()
-        elif action == act_sync_this and acc_id is not None:
-            self._trigger_individual_sync_direct(acc_id)
-        elif action == act_pause_this and acc_id is not None:
-            self._toggle_individual_pause(acc_id)
-        elif action == act_stop_this and acc_id is not None:
-            self._stop_individual_sync(acc_id)
-        elif action == act_dry and acc_id is not None:
-            self._confirm_sync([acc_id])
-        elif action == act_flt and acc_id is not None:
-            self._open_filters_dialog_for_account(acc_id)
-        elif action == act_rep:
-            self._show_reports()
-        elif action == act_copy and acc:
-            from PySide6.QtWidgets import QApplication
-            QApplication.clipboard().setText(acc.get("email", ""))
+        act_sync_grp = menu.addAction("🚀 Seçili Grubu Senkronize Et")
+        act_sync_grp.triggered.connect(self._sync_current_group)
+
+        act_sync_all = menu.addAction("🌐 Tüm Hesapları Senkronize Et")
+        act_sync_all.triggered.connect(self._sync_all)
+
+        menu.addSeparator()
+        act_save_layout = menu.addAction("💾 Görünüm Düzenini Kaydet")
+        act_save_layout.triggered.connect(self._save_current_layout_dialog)
+
+        menu_profiles = menu.addMenu("📂 Kayıtlı Görünüm Düzenleri")
+        menu_profiles.setStyleSheet(menu.styleSheet())
+        profile_names = self.right_sidebar.view_profile_widget.manager.get_profile_names()
+        active_prof = self.right_sidebar.view_profile_widget.get_current_profile_name()
+
+        for p_name in profile_names:
+            p_prefix = "✔ " if p_name == active_prof else "  "
+            act_p = menu_profiles.addAction(f"{p_prefix}{p_name}")
+            act_p.triggered.connect(lambda chk=False, name=p_name: self._apply_named_profile(name))
+
+        menu.addSeparator()
+        act_reset = menu.addAction("🔄 Varsayılan Düzene (88px) Sıfırla")
+        act_reset.triggered.connect(self._reset_grid_layout_to_default)
+
+        menu.exec(global_pos)
 
     # ------------------------------------------------------------------
-    # Sync operations (Global Actions)
+    # Sync Operations
     # ------------------------------------------------------------------
 
     def _trigger_individual_sync_direct(self, acc_id: int):
@@ -2804,6 +3004,21 @@ class SyncPanel(QWidget):
     def _trigger_sync_for_accounts(self, ids: list):
         if not ids:
             return
+        if not self.settings.is_configured_data_path_available():
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Yedekleme Diski Takılı Değil")
+            msg.setText(
+                f"Yapılandırılmış arşiv diski (<b>{self.settings.configured_data_path_str()}</b>) şu anda takılı veya erişilebilir değil.\n\n"
+                "Senkronizasyon yapabilmek için lütfen harici diskinizi takınız."
+            )
+            msg.setStyleSheet(GLOBAL_MSG_STYLE)
+            msg.exec()
+            return
+
+        if not self._confirm_sync(ids):
+            return
+
         self._reports.clear()
         for acc_id in ids:
             self._start_individual_sync(acc_id)
@@ -2826,8 +3041,6 @@ class SyncPanel(QWidget):
             if item:
                 item.setCheckState(Qt.Checked)
         self.btn_select_all.setText("🔳 Seçimleri Kaldır")
-        if hasattr(self, 'btn_top_select_all'):
-            self.btn_top_select_all.setText("🔳 Seçimleri Kaldır")
         self._all_selected_flag = True
         self._update_selection_count()
         
@@ -2848,8 +3061,6 @@ class SyncPanel(QWidget):
                         ids.append(acc_id)
         self._all_selected_flag = True
         self.btn_select_all.setText("🔳 Seçimleri Kaldır")
-        if hasattr(self, 'btn_top_select_all'):
-            self.btn_top_select_all.setText("🔳 Seçimleri Kaldır")
         self._update_selection_count()
 
         if ids:
@@ -2857,10 +3068,9 @@ class SyncPanel(QWidget):
         else:
             QMessageBox.warning(self, "Hesap Bulunamadı", "Seçili grupta senkronize edilecek hesap bulunamadı.")
 
-
     @Slot()
     def _cancel_sync(self):
-        self._log_callback("Global cancellation requested — stopping all account syncs...")
+        self._log_callback("Tüm senkronizasyon işlemleri durduruluyor...")
         for aid in list(self._active_syncs.keys()):
             self._stop_individual_sync(aid)
 
@@ -2868,87 +3078,31 @@ class SyncPanel(QWidget):
     def _toggle_pause_sync(self):
         any_running = False
         for aid in self._active_syncs:
-            # If pause event is not set, then it is running
             if not self._active_syncs[aid]["cancel_event"].is_set() and not self._active_syncs[aid]["pause_event"].is_set():
                 any_running = True
                 break
                 
         if any_running:
-            self._log_callback("Global pause requested...")
+            self._log_callback("Tüm işlemler duraklatılıyor...")
             for aid in self._active_syncs:
                 if not self._active_syncs[aid]["pause_event"].is_set():
                     self._toggle_individual_pause(aid)
-            self.btn_pause.setText("▶️ Resume All")
+            self.btn_pause.setText("▶️ Devam Et")
         else:
-            self._log_callback("Global resume requested...")
+            self._log_callback("Tüm işlemler devam ettiriliyor...")
             for aid in self._active_syncs:
                 if self._active_syncs[aid]["pause_event"].is_set():
                     self._toggle_individual_pause(aid)
-            self.btn_pause.setText("⏸️ Pause All")
-
-    # ------------------------------------------------------------------
-    # Dry Run
-    # ------------------------------------------------------------------
+            self.btn_pause.setText("⏸️ Duraklat")
 
     @Slot()
     def _dry_run(self):
         ids = self._get_selected_account_ids()
         if not ids:
-            QMessageBox.warning(self, "No Selection", "Select at least one account from the list.")
+            QMessageBox.warning(self, "Seçim Yapılmadı", "Lütfen önizleme yapmak için en az bir hesap seçin.")
             return
-            
-        self._log_callback(f"--- Dry Run (Estimation) for {len(ids)} account(s) ---")
 
-        # Check filters for dry run too
-        for acc_id in ids:
-            f_data = self.settings.account_sync_filters(acc_id)
-            if not f_data:
-                acc = self.engine.accounts.get(acc_id)
-                acc_label = acc.get("label", f"Hesap #{acc_id}") if acc else f"Hesap #{acc_id}"
-                
-                msg = QMessageBox(self)
-                msg.setIcon(QMessageBox.Information)
-                msg.setWindowTitle("Filtre Ayarı Eksik")
-                msg.setText(f"'{acc_label}' hesabı için arşivleme filtreleri henüz ayarlanmamış.\n\nLütfen arşivlenecek klasörleri seçin.")
-                msg.setStyleSheet(GLOBAL_MSG_STYLE)
-                msg.exec()
-                
-                self._open_filters_dialog_for_account(acc_id, force_prompt=True)
-                f_data = self.settings.account_sync_filters(acc_id)
-                if not f_data:
-                    self._log_callback(f"[{acc_label}] Klasör eşleştirme/filtre ayarı iptal edildi.")
-                    return
-
-        def task(acc_id):
-            ui = self._accounts_ui.get(acc_id)
-            if ui:
-                ui["lbl_status"].setText("Estimating...")
-                ui["progress_bar"].setRange(0, 0)
-            
-            f_data = self.settings.account_sync_filters(acc_id) or {}
-            folder_filter = f_data.get("folders")
-            since_date_enabled = f_data.get("since_date_enabled", False)
-            since_date = f_data.get("since_date") if since_date_enabled else None
-            before_date_enabled = f_data.get("before_date_enabled", False)
-            before_date = f_data.get("before_date") if before_date_enabled else None
-            archive_unread = f_data.get("archive_unread", True)
-            
-            try:
-                result = self.engine.sync_dry_run(
-                    acc_id,
-                    folder_filter=folder_filter,
-                    since_date=since_date,
-                    before_date=before_date,
-                    archive_unread=archive_unread,
-                )
-                total = result.get("total_estimated", 0)
-                error = result.get("error", None)
-                self._account_dry_run_done_signal.emit(acc_id, total, error)
-            except Exception as exc:
-                self._account_dry_run_done_signal.emit(acc_id, 0, str(exc))
-
-        for aid in ids:
-            threading.Thread(target=task, args=(aid,), daemon=True).start()
+        self._confirm_sync(ids)
 
     @Slot(int, int, object)
     def _on_account_dry_run_done(self, account_id: int, total: int, error: Optional[str]):
@@ -2956,33 +3110,11 @@ class SyncPanel(QWidget):
         if ui:
             ui["progress_bar"].setRange(0, 100)
             if error:
-                ui["lbl_status"].setText(f"Preview error: {error}")
+                ui["lbl_status"].setText(f"Önizleme Hatası: {error}")
                 ui["progress_bar"].setValue(0)
-                self._log_callback(f"Preview error for account ID {account_id}: {error}")
             else:
-                ui["lbl_status"].setText(f"Preview: ~{total} new mails")
+                ui["lbl_status"].setText(f"Önizleme: ~{total} yeni mail")
                 ui["progress_bar"].setValue(100)
-                self._log_callback(f"Preview completed for account ID {account_id}: ~{total} new mails")
-                
-        # Update global stats if focused
-        if self._get_active_row_account_id() == account_id:
-            local_mails_cnt = 0
-            folders_cnt = 0
-            try:
-                with self.engine.db.get_conn() as conn:
-                    row_mails = conn.execute("SELECT COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (account_id,)).fetchone()
-                    local_mails_cnt = row_mails["cnt"] if row_mails else 0
-                    row_folders = conn.execute("SELECT COUNT(DISTINCT folder) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (account_id,)).fetchone()
-                    folders_cnt = row_folders["cnt"] if row_folders else 0
-            except Exception:
-                pass
-            total_server = local_mails_cnt + total
-            self._update_stats(
-                server_emails=f"{total_server} (Server)",
-                folders=str(folders_cnt),
-                remaining=str(total),
-                progress="0%" if total > 0 else "100%",
-            )
 
     def _load_recent_reports_from_db(self) -> list:
         reports = []
@@ -3028,10 +3160,6 @@ class SyncPanel(QWidget):
                 msg.setIcon(QMessageBox.Information)
                 msg.setWindowTitle("Rapor Bulunamadı")
                 msg.setText("Henüz kayıtlı senkronizasyon raporu bulunmuyor.\n\nLütfen önce en az bir hesabı senkronize edin.")
-                msg.setStandardButtons(QMessageBox.Ok)
-                ok_btn = msg.button(QMessageBox.Ok)
-                if ok_btn:
-                    ok_btn.setText("Tamam")
                 msg.setStyleSheet(GLOBAL_MSG_STYLE)
                 msg.exec()
                 return
@@ -3043,55 +3171,79 @@ class SyncPanel(QWidget):
         dialog = DetailedReportDialog(self.engine, self)
         dialog.exec()
 
-    def _get_since_date(self) -> Optional[str]:
-        if not self._filter_since_date_enabled:
-            return None
-        qdate = self._filter_since_date
-        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        day = qdate.day()
-        month_str = months[qdate.month() - 1]
-        year = qdate.year()
-        return f"{day:02d}-{month_str}-{year}"
-
-    def _get_before_date(self) -> Optional[str]:
-        if not self._filter_before_date_enabled:
-            return None
-        qdate = self._filter_before_date
-        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        day = qdate.day()
-        month_str = months[qdate.month() - 1]
-        year = qdate.year()
-        return f"{day:02d}-{month_str}-{year}"
-
-    def _get_archive_unread(self) -> bool:
-        return self._filter_archive_unread
-
-    def _get_timeout(self) -> int:
-        return self._filter_timeout
-
-    def _set_buttons_enabled(self, enabled: bool):
-        # Retained for legacy compatibility but not strictly needed anymore
-        for btn in (self.btn_sync, self.btn_sync_all, self.btn_dry_run,
-                    self.btn_select_all, self.btn_reports, self.btn_detailed_report):
-            btn.setEnabled(enabled)
-
     # ------------------------------------------------------------------
-    # Refresh
+    # Refresh & Asynchronous Lazy Load
     # ------------------------------------------------------------------
+
+    @Slot()
+    def _check_disk_and_refresh(self):
+        if self.settings.is_configured_data_path_available():
+            db_path = self.settings.db_path()
+            key_path = self.settings.key_file_path()
+            if db_path.exists() and getattr(self.engine.db, "_db_path", None) != db_path:
+                try:
+                    from core.database import DatabaseManager
+                    from core.crypto_utils import CryptoManager
+                    km = CryptoManager(key_file=key_path) if key_path.exists() else getattr(self.engine, "crypto", None)
+                    decrypt_fn = km.decrypt if km else None
+                    self.engine.db = DatabaseManager(db_path=db_path)
+                    self.engine.accounts = {a["id"]: a for a in self.engine.db.list_accounts(decrypt_fn=decrypt_fn)}
+                    logger.info("Successfully reconnected to database on %s", db_path)
+                except Exception as e:
+                    logger.error("Failed to re-bind db to newly connected disk: %s", e)
+        self.refresh()
 
     def refresh(self):
+        """Asynchronously load accounts and render rows immediately in <5ms."""
+        self._is_refreshing = True
+        is_disk_online = self.settings.is_configured_data_path_available()
+        disk_path_str = self.settings.configured_data_path_str()
+
         self._refresh_groups_sidebar()
 
         self.account_table.blockSignals(True)
         self.account_table.setRowCount(0)
         self._accounts_ui.clear()
+        self._stats_labels_map.clear()
 
-        selected_item = self.group_filter_list.currentItem()
-        selected_group = selected_item.data(Qt.UserRole) if selected_item else "__ALL__"
+        selected_group = self._selected_group
 
         try:
-            accounts = self.engine.list_accounts()
-            # Filter accounts by selected group
+            if is_disk_online:
+                accounts = self.engine.list_accounts()
+                if accounts:
+                    self.settings.save_account_cache(accounts)
+                
+                self.disk_status_banner.setStyleSheet("""
+                    QFrame#diskStatusBanner {
+                        background-color: #ecfdf5;
+                        border: 1px solid #10b981;
+                        border-radius: 6px;
+                    }
+                """)
+                self.lbl_disk_status_icon.setText("🟢")
+                self.lbl_disk_status_text.setText(
+                    f"<b>Aktif Yedekleme Diski Bağlı:</b> <span style='color:#065f46;'>{disk_path_str}</span> "
+                    f"({len(accounts)} Hesap Kayıtlı — İstatistikler taranıyor...)"
+                )
+            else:
+                accounts = self.settings.load_account_cache()
+                if not accounts:
+                    accounts = self.engine.list_accounts()
+                
+                self.disk_status_banner.setStyleSheet("""
+                    QFrame#diskStatusBanner {
+                        background-color: #fffbeb;
+                        border: 1px solid #f59e0b;
+                        border-radius: 6px;
+                    }
+                """)
+                self.lbl_disk_status_icon.setText("🟠")
+                self.lbl_disk_status_text.setText(
+                    f"<b>⚠️ Yedekleme Diski ({disk_path_str}) Bağlı Değil — Çevrimdışı Mod</b> "
+                    f"({len(accounts)} Hesap Listelenmektedir)"
+                )
+
             if selected_group != "__ALL__":
                 filtered_accounts = []
                 for acc in accounts:
@@ -3102,63 +3254,55 @@ class SyncPanel(QWidget):
                         filtered_accounts.append(acc)
                 accounts = filtered_accounts
 
+            # Build UI rows immediately
             self.account_table.setRowCount(len(accounts))
             for i, acc in enumerate(accounts):
-                acc_id = acc["id"]
+                acc_id = acc.get("id", i + 1)
                 
-                # Column 0: Sync Checkbox
+                # Column 0: Checkbox
                 chk_item = QTableWidgetItem()
                 chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 chk_item.setCheckState(Qt.Unchecked)
                 chk_item.setData(Qt.UserRole, acc_id)
                 self.account_table.setItem(i, 0, chk_item)
-                
-                # Query local stats
-                local_mails_cnt = 0
-                folders_cnt = 0
-                try:
-                    with self.engine.db.get_conn() as conn:
-                        row_mails = conn.execute("SELECT COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (acc_id,)).fetchone()
-                        local_mails_cnt = row_mails["cnt"] if row_mails else 0
-                        row_folders = conn.execute("SELECT COUNT(DISTINCT folder) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (acc_id,)).fetchone()
-                        folders_cnt = row_folders["cnt"] if row_folders else 0
-                except Exception:
-                    pass
 
-                # Column 1: Account details (name + email + stats in 3 distinct well-spaced lines)
+                # Column 1: Account Info Widget
                 info_widget = QWidget()
                 info_layout = QVBoxLayout(info_widget)
-                info_layout.setContentsMargins(10, 8, 10, 8)
-                info_layout.setSpacing(6)
+                info_layout.setContentsMargins(8, 4, 8, 4)
+                info_layout.setSpacing(2)
                 
                 g_val = acc.get("account_group", "").strip()
                 if not g_val and "@" in acc.get("email", ""):
                     g_val = acc["email"].split("@")[-1]
                 
-                group_badge = f"<span style='background-color:#e0e7ff; color:#4361ee; font-weight:bold; font-size:10px; padding:2px 6px; border-radius:4px;'>📁 {g_val}</span>" if g_val else ""
+                group_badge = f"<span style='background-color:#e0e7ff; color:#2563eb; font-weight:bold; font-size:10px; padding:1px 5px; border-radius:4px;'>📁 {g_val}</span>" if g_val else ""
 
-                lbl_label = QLabel(f"<b>{acc['label']}</b>  {group_badge}")
-                lbl_label.setStyleSheet("color: #0f172a; font-size: 13px; font-weight: 700; padding-bottom: 2px;")
+                lbl_label = QLabel(f"<b>{acc.get('label', 'Hesap')}</b>  {group_badge}")
+                lbl_label.setStyleSheet("color: #0f172a; font-size: 12.5px; font-weight: 700;")
                 
-                lbl_email = QLabel(f"✉️ {acc['email']}")
-                lbl_email.setStyleSheet("color: #334155; font-size: 11.5px; font-weight: 500; padding-bottom: 2px;")
+                lbl_email = QLabel(f"✉️ {acc.get('email', '')}")
+                lbl_email.setStyleSheet("color: #334155; font-size: 11px; font-weight: 500;")
                 
-                lbl_stats = QLabel(f"📂 <b>{folders_cnt}</b> Klasör   •   📧 <b>{local_mails_cnt:,}</b> Arşivlenmiş Mail")
+                lbl_stats = QLabel("📂 <i>İstatistikler yükleniyor...</i>")
                 lbl_stats.setStyleSheet("color: #64748b; font-size: 10.5px; font-weight: 500;")
+                self._stats_labels_map[acc_id] = lbl_stats
                 
                 info_layout.addWidget(lbl_label)
                 info_layout.addWidget(lbl_email)
                 info_layout.addWidget(lbl_stats)
                 self.account_table.setCellWidget(i, 1, info_widget)
                 
-                # Column 2: Progress status + progress bar
+                # Column 2: Status & Row Progress Bar
                 prog_widget = QWidget()
                 prog_layout = QVBoxLayout(prog_widget)
                 prog_layout.setContentsMargins(6, 4, 6, 4)
-                prog_layout.setSpacing(2)
+                prog_layout.setSpacing(3)
                 
-                lbl_status = QLabel("Idle")
-                lbl_status.setStyleSheet("color: #475569; font-size: 11px;")
+                status_text = "Hazır" if is_disk_online else "Çevrimdışı"
+                lbl_status = QLabel(status_text)
+                lbl_status.setStyleSheet("color: #475569; font-size: 11px; font-weight: 600;")
+                
                 progress_bar = QProgressBar()
                 progress_bar.setRange(0, 100)
                 progress_bar.setValue(0)
@@ -3172,9 +3316,10 @@ class SyncPanel(QWidget):
                         font-size: 9px;
                         text-align: center;
                         color: #1e293b;
+                        font-weight: bold;
                     }
                     QProgressBar::chunk {
-                        background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0, stop: 0 #4361ee, stop: 1 #7209b7);
+                        background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0, stop: 0 #2563eb, stop: 1 #7c3aed);
                         border-radius: 4px;
                     }
                 """)
@@ -3182,32 +3327,36 @@ class SyncPanel(QWidget):
                 prog_layout.addWidget(progress_bar)
                 self.account_table.setCellWidget(i, 2, prog_widget)
                 
-                # Column 3: Row Actions
+                # Column 3: Row Action Buttons
                 actions_widget = QWidget()
                 actions_layout = QHBoxLayout(actions_widget)
                 actions_layout.setContentsMargins(4, 2, 4, 2)
                 actions_layout.setSpacing(4)
                 
                 btn_start = QPushButton("▶")
-                btn_start.setToolTip("Start archiving for this account")
+                btn_start.setToolTip("Bu hesap için arşivlemeyi başlat")
+                btn_start.setCursor(Qt.PointingHandCursor)
                 btn_start.setStyleSheet(self._action_btn_style("#10b981", "#059669"))
                 btn_start.clicked.connect(lambda checked, aid=acc_id: self._trigger_individual_sync_direct(aid))
                 
                 btn_pause = QPushButton("⏸")
-                btn_pause.setToolTip("Pause/Resume archiving")
+                btn_pause.setToolTip("Arşivlemeyi duraklat / sürdür")
+                btn_pause.setCursor(Qt.PointingHandCursor)
                 btn_pause.setStyleSheet(self._action_btn_style("#f59e0b", "#d97706"))
                 btn_pause.setEnabled(False)
                 btn_pause.clicked.connect(lambda checked, aid=acc_id: self._toggle_individual_pause(aid))
                 
                 btn_stop = QPushButton("⏹")
-                btn_stop.setToolTip("Stop archiving")
+                btn_stop.setToolTip("Arşivlemeyi durdur")
+                btn_stop.setCursor(Qt.PointingHandCursor)
                 btn_stop.setStyleSheet(self._action_btn_style("#ef4444", "#dc2626"))
                 btn_stop.setEnabled(False)
                 btn_stop.clicked.connect(lambda checked, aid=acc_id: self._stop_individual_sync(aid))
                 
                 btn_report = QPushButton("📊")
-                btn_report.setToolTip("View sync reports for this account")
-                btn_report.setStyleSheet(self._action_btn_style("#4361ee", "#3a56d4"))
+                btn_report.setToolTip("Bu hesabın raporunu göster")
+                btn_report.setCursor(Qt.PointingHandCursor)
+                btn_report.setStyleSheet(self._action_btn_style("#2563eb", "#1d4ed8"))
                 btn_report.clicked.connect(lambda checked, aid=acc_id: self._show_individual_report(aid))
                 
                 actions_layout.addWidget(btn_start)
@@ -3225,163 +3374,63 @@ class SyncPanel(QWidget):
                     "btn_stop": btn_stop,
                     "btn_report": btn_report,
                 }
+                
+            self.set_row_height(self._current_row_height, auto_save=False)
+
+            # Start Async Background Stats Loader
+            if is_disk_online and accounts:
+                acc_ids = [a["id"] for a in accounts if "id" in a]
+                if self._data_loader and self._data_loader.isRunning():
+                    self._data_loader.terminate()
+                self._data_loader = SyncDataLoaderWorker(self.engine, acc_ids, parent=self)
+                self._data_loader.account_loaded_signal.connect(self._on_account_stat_loaded)
+                self._data_loader.finished_signal.connect(self._on_all_stats_loaded)
+                self._data_loader.start()
+
         except Exception as exc:
             logger.error("Refresh error: %s", exc)
         finally:
             self.account_table.blockSignals(False)
             self._update_selection_count()
+            self._is_refreshing = False
 
-        # Restore active sync UI states after rebuild
-        for acc_id, sync_info in list(self._active_syncs.items()):
-            ui = self._accounts_ui.get(acc_id)
-            if not ui:
-                continue
-            is_paused = sync_info["pause_event"].is_set()
-            is_cancelled = sync_info["cancel_event"].is_set()
-            if is_cancelled:
-                ui["lbl_status"].setText("Cancelled")
-                ui["progress_bar"].setRange(0, 100)
-                ui["progress_bar"].setValue(0)
-                ui["btn_start"].setEnabled(True)
-                ui["btn_pause"].setEnabled(False)
-                ui["btn_stop"].setEnabled(False)
-            elif is_paused:
-                ui["lbl_status"].setText("Paused")
-                ui["progress_bar"].setRange(0, 0)
-                ui["btn_start"].setEnabled(False)
-                ui["btn_pause"].setEnabled(True)
-                ui["btn_pause"].setText("▶")
-                ui["btn_stop"].setEnabled(True)
-            else:
-                ui["lbl_status"].setText("Running...")
-                ui["progress_bar"].setRange(0, 0)
-                ui["btn_start"].setEnabled(False)
-                ui["btn_pause"].setEnabled(True)
-                ui["btn_pause"].setText("⏸")
-                ui["btn_stop"].setEnabled(True)
-            self.btn_cancel.setEnabled(True)
-            self.btn_pause.setEnabled(True)
+    @Slot(int, int, int)
+    def _on_account_stat_loaded(self, acc_id: int, mails_cnt: int, folders_cnt: int):
+        lbl = self._stats_labels_map.get(acc_id)
+        if lbl:
+            lbl.setText(f"📂 <b>{folders_cnt}</b> Klasör   •   📧 <b>{mails_cnt:,}</b> Arşivlenmiş Mail")
 
-        self._load_grid_state()
-
-    def _save_grid_state(self):
-        if not self.settings:
-            return
-        state = {
-            "hidden_columns": [c for c in range(self.account_table.columnCount()) if self.account_table.isColumnHidden(c)],
-            "column_widths": [self.account_table.columnWidth(c) for c in range(self.account_table.columnCount())]
-        }
-        self.settings.set("grid_state_sync_account_table", state)
-        self.settings.save()
-        QMessageBox.information(self, "Grid Düzeni Kaydedildi", "Hesap tablosu sütun görünürlük ve genişlik tercihleri başarıyla kaydedildi.")
-
-    def _load_grid_state(self):
-        if not self.settings:
-            return
-        state = self.settings.get("grid_state_sync_account_table", None)
-        if state and isinstance(state, dict):
-            hidden = state.get("hidden_columns", [])
-            widths = state.get("column_widths", [])
-            for c in range(self.account_table.columnCount()):
-                if c < len(widths) and widths[c] > 10:
-                    self.account_table.setColumnWidth(c, widths[c])
-                self.account_table.setColumnHidden(c, c in hidden)
-
-    def _reset_grid_state(self):
-        for c in range(self.account_table.columnCount()):
-            self.account_table.setColumnHidden(c, False)
-        self.account_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.account_table.setColumnWidth(0, 70)
-        self.account_table.setColumnWidth(1, 400)
-        self.account_table.setColumnWidth(2, 320)
-        self.account_table.setColumnWidth(3, 150)
-        if self.settings:
-            self.settings.set("grid_state_sync_account_table", None)
-            self.settings.save()
-        QMessageBox.information(self, "Grid Sıfırlandı", "Tablo sütunları varsayılan genişlik ve görünürlüğe sıfırlandı.")
+    @Slot(dict)
+    def _on_all_stats_loaded(self, all_stats: dict):
+        disk_path_str = self.settings.configured_data_path_str()
+        total_accounts = len(self._accounts_ui)
+        total_mails = sum(s.get("mails", 0) for s in all_stats.values())
+        self.lbl_disk_status_text.setText(
+            f"<b>Aktif Yedekleme Diski Bağlı:</b> <span style='color:#065f46;'>{disk_path_str}</span> "
+            f"({total_accounts} Hesap, Toplam {total_mails:,} E-Posta Arşivli)"
+        )
+        self.card_server.set_value(f"{total_mails:,} Mail")
 
     # ------------------------------------------------------------------
-    # Group Sidebar Filtering Slots & Helpers
+    # Group Sidebar Integration
     # ------------------------------------------------------------------
 
     def _refresh_groups_sidebar(self):
-        # Store currently selected group to restore it
-        selected_item = self.group_filter_list.currentItem()
-        current_group = selected_item.data(Qt.UserRole) if selected_item else "__ALL__"
-
-        self.group_filter_list.blockSignals(True)
-        self.group_filter_list.clear()
-
         groups_status = {}
+        all_accounts = self.settings.load_account_cache() or self.engine.list_accounts()
+        for acc in all_accounts:
+            g_name = acc.get("account_group", "").strip()
+            if not g_name and "@" in acc.get("email", ""):
+                g_name = acc["email"].split("@")[-1].strip()
+            if g_name:
+                groups_status.setdefault(g_name, {"is_active": True, "count": 0})
+                groups_status[g_name]["count"] += 1
 
-        # 1. From settings
-        settings_groups = self.settings.get("group_domains", [])
-        for g in settings_groups:
-            if isinstance(g, str):
-                name = g.strip()
-                is_active = True
-            elif isinstance(g, dict):
-                name = g.get("name", "").strip()
-                is_active = g.get("is_active", True)
-            else:
-                continue
-            if name:
-                groups_status[name] = is_active
+        self.left_sidebar.populate_groups(groups_status, total_accounts_count=len(all_accounts))
 
-        # 2. From database account_group column
-        try:
-            with self.engine.db.get_conn() as conn:
-                rows = conn.execute("SELECT DISTINCT account_group FROM accounts WHERE account_group IS NOT NULL AND account_group != ''").fetchall()
-                for r in rows:
-                    if r["account_group"] and r["account_group"].strip():
-                        name = r["account_group"].strip()
-                        if name not in groups_status:
-                            groups_status[name] = True
-        except Exception as e:
-            logger.error("Failed to query database groups: %s", e)
-
-        # Add All groups item
-        all_item = QListWidgetItem("📁 Tüm Gruplar")
-        all_item.setData(Qt.UserRole, "__ALL__")
-        self.group_filter_list.addItem(all_item)
-
-        # Sort and add other groups
-        for g in sorted(groups_status.keys()):
-            is_active = groups_status[g]
-            label = f"📁 {g}" if is_active else f"📁 {g} (Pasif)"
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, g)
-            if not is_active:
-                item.setForeground(Qt.gray)
-            self.group_filter_list.addItem(item)
-
-        # Restore selection
-        found_item = None
-        for i in range(self.group_filter_list.count()):
-            item = self.group_filter_list.item(i)
-            if item.data(Qt.UserRole) == current_group:
-                found_item = item
-                break
-        if found_item:
-            self.group_filter_list.setCurrentItem(found_item)
-        else:
-            self.group_filter_list.setCurrentRow(0)
-
-        self.group_filter_list.blockSignals(False)
-
-    @Slot()
-    def _on_group_filter_changed(self):
+    @Slot(str)
+    def _on_group_filter_changed(self, group_name: str):
+        self._selected_group = group_name or "__ALL__"
         self._all_selected_flag = False
         self.btn_select_all.setText("☑️ Tümünü Seç")
-        if hasattr(self, 'btn_top_select_all'):
-            self.btn_top_select_all.setText("☑️ Tümünü Seç")
         self.refresh()
-
-    @Slot()
-    def _toggle_sidebar(self):
-        is_visible = self.sidebar_widget.isVisible()
-        self.sidebar_widget.setVisible(not is_visible)
-        if not is_visible:
-            self.btn_toggle_sidebar.setText("◀")
-        else:
-            self.btn_toggle_sidebar.setText("▶")

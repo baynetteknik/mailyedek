@@ -1,0 +1,57 @@
+gui\main_window.py:479: [işlem] reply.setText("Arka planda çalışan aktif arşivleme veya dışa aktarım işlemleri m
+gui\dialogs\archive_optimizer_dialog.py:633: [işlem] self.console.append("🕒 Optimizasyon işlemi başlatıldı...")
+gui\dialogs\portable_import_dialog.py:243: [işlem] "İçe aktarma işleminde hesap ayarlarınız korunacak, bu hesaplara ait yeni e-post
+gui\dialogs\portable_import_dialog.py:271: [işlem] "İçeri aktarma işlemi başlatıldığında varolan mailler korunarak eksik veriler ot
+gui\templates\three_panel_workspace.py:59: [filtre] self.btn_toggle_left.setToolTip("Sol filtre panelini göster/gizle")
+gui\templates\three_panel_workspace.py:66: [işlem] self.btn_toggle_right.setToolTip("Sağ işlem panelini göster/gizle")
+gui\templates\three_panel_workspace.py:98: [filtre] self.left_group = QGroupBox("🔍 Filtreleme ve Gruplama")
+gui\widgets\account_panel.py:395: [filtre] lbl_side = QLabel("📁 Grup / Domain Filtresi")
+gui\widgets\account_panel.py:541: [filtre] act_flt = menu.addAction("⚙️ Klasör & Filtre Ayarları")
+gui\widgets\account_panel.py:767: [işlem] "Bu işlem geri alınamaz. Devam etmek istiyor musunuz?",
+gui\widgets\account_panel.py:930: [hızlı] self, "Toplu / Hızlı Grup Değiştir",
+gui\widgets\account_panel.py:950: [hızlı] self, "Hızlı Şifre Güncelleme",
+gui\widgets\account_panel.py:1093: [işlem] f"'{email_addr}' hesabı için diskteki EML dosyalarını tarayıp veri tabanına işle
+gui\widgets\account_panel.py:1094: [işlem] "Bu işlem indirilen e-postaları algılayıp tekrar indirmeyi engelleyecektir.",
+gui\widgets\account_panel.py:1702: [işlem] "Artık bu hesaplar için 'Optimize' işlemlerini çalıştırabilirsiniz."
+gui\widgets\export_panel.py:5: [filtre] - ThreePanelWorkspaceTemplate architecture (Sol: Domain/Grup filtresi, Orta: Pro
+gui\widgets\export_panel.py:324: [filtre] filters_group = QGroupBox("Tarih Filtresi ve Klasör Seçimi")
+gui\widgets\export_panel.py:363: [filtre] dates_form.addRow("Kaynak Sunucu Filtresi:", self.combo_server_filter)
+gui\widgets\export_panel.py:1279: [filtre] left_layout.addWidget(QLabel("🌐 Domain Filtresi:"))
+gui\widgets\export_panel.py:1295: [filtre] left_layout.addWidget(QLabel("👥 Grup Filtresi:"))
+gui\widgets\export_panel.py:1336: [filtre] self.btn_reset_filters = QPushButton("🔄 Filtreleri Sıfırla")
+gui\widgets\mail_viewer_panel.py:979: [filtre] self.combo_group.setToolTip("Grup / Domain filtresine göre hesapları ve klasörle
+gui\widgets\pro_grid_widget.py:129: [hızlı] self.input_search.setPlaceholderText("🔍 Tabloda Hızlı Arama...")
+gui\widgets\report_panel.py:543: [filtre] self.btn_toggle_right_sidebar.setToolTip("Sağ Filtre Panelini Gizle/Göster")
+gui\widgets\report_panel.py:589: [filtre] self.chk_date_filter = QCheckBox("Tarih Filtresi Aktif")
+gui\widgets\report_panel.py:609: [filtre] btn_clear_filters = QPushButton("🔄 Filtreleri Temizle")
+gui\widgets\report_panel.py:664: [filtre] "<span style='color:#64748b;'>Sağ menüdeki filtreleri seçip rapor oluşturabilirs
+gui\widgets\report_panel.py:691: [filtre] self.btn_toggle_custom_right_sidebar.setToolTip("Sağ Filtre Panelini Gizle/Göste
+gui\widgets\report_panel.py:1699: [filtre] fb_layout.addWidget(QLabel("Sağlık / Durum Filtresi:"))
+gui\widgets\report_panel.py:2136: [işlem] <p style="margin:4px 0 0 0; font-size:11px; color:#60a5fa;">Bu işlem veritabanı 
+gui\widgets\report_panel.py:2375: [filtre] self, "Filtre / Rapor Seçilmedi",
+gui\widgets\report_panel.py:2376: [işlem] "Bir grup seçmediniz ve henüz yapılmış bir senkronizasyon işlemi bulunamadı.\n"
+gui\widgets\search_panel.py:180: [filtre] ws.btn_toggle_left.setText("🌐 Sol Filtre Paneli")
+gui\widgets\search_panel.py:184: [filtre] # 1. SOL PANEL: Domain, Grup, Hesap, Klasör ve Tarih Filtreleri
+gui\widgets\search_panel.py:186: [filtre] ws.left_group.setTitle("🌐 Domain & Filtre Seçenekleri")
+gui\widgets\search_panel.py:189: [filtre] left_layout.addWidget(QLabel("🌐 Domain Filtresi:"))
+gui\widgets\search_panel.py:194: [filtre] left_layout.addWidget(QLabel("👥 Grup Filtresi:"))
+gui\widgets\search_panel.py:204: [filtre] left_layout.addWidget(QLabel("📁 Klasör Filtresi (Açılır Çoklu Seçim):"))
+gui\widgets\search_panel.py:259: [filtre] btn_reset_filters = QPushButton("🔄 Filtreleri Sıfırla")
+gui\widgets\search_panel.py:327: [hızlı] # 3. SAĞ PANEL: Önizleme & Hızlı Dışa Aktarım İşlemleri
+gui\widgets\settings_panel.py:713: [işlem] self.text_ver_log.setPlaceholderText("Git ve Setup işlem çıktıları burada görünt
+gui\widgets\sync_panel.py:608: [filtre] self.setWindowTitle(f"Arşivleme Filtreleri: {account_label}")
+gui\widgets\sync_panel.py:635: [filtre] info_text = QLabel(f"<b>Hesap:</b> {account_label}<br/><span style='color: #6474
+gui\widgets\sync_panel.py:723: [filtre] filters_group = QGroupBox("Gelişmiş Arşivleme Filtreleri")
+gui\widgets\sync_panel.py:1072: [filtre] subtitle_lbl = QLabel("Bu ayarların tamamı Configure Filters (Filtre Ayarları) e
+gui\widgets\sync_panel.py:1286: [filtre] self.folder_list_widget.addItem("📁 (Filtrelenen klasör yok)")
+gui\widgets\sync_panel.py:1487: [işlem] self.btn_toggle_drawer.setToolTip("Sağ taraftaki işlem butonlarını gizle/göster"
+gui\widgets\sync_panel.py:1597: [filtre] lbl_groups = QLabel("Grup / Domain Filtresi")
+gui\widgets\sync_panel.py:1737: [filtre] self.btn_filters.setToolTip("Arşiv klasörlerini ve filtreleri ayarlar")
+gui\widgets\sync_panel.py:1799: [işlem] self.btn_pause.setToolTip("Aktif arşiv işlemlerini duraklatır")
+gui\widgets\sync_panel.py:1810: [işlem] self.btn_cancel.setToolTip("Aktif arşiv işlemlerini iptal eder")
+gui\widgets\sync_panel.py:2026: [filtre] msg.setText("Lütfen filtrelerini düzenlemek istediğiniz hesabı tabloda seçin vey
+gui\widgets\sync_panel.py:2111: [filtre] self._log_callback(f"[{acc.get('label')}] Filtreler kaydedildi: {len(new_f_data[
+gui\widgets\sync_panel.py:2761: [filtre] act_flt = menu.addAction("⚙️ Klasör & Filtre Ayarları...")
+gui\widgets\sync_panel.py:2911: [filtre] msg.setWindowTitle("Filtre Ayarı Eksik")
+gui\widgets\sync_panel.py:2912: [filtre] msg.setText(f"'{acc_label}' hesabı için arşivleme filtreleri henüz ayarlanmamış.
+gui\widgets\sync_panel.py:2919: [filtre] self._log_callback(f"[{acc_label}] Klasör eşleştirme/filtre ayarı iptal edildi."

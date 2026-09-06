@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QSize, Signal, Slot
-from PySide6.QtGui import QIcon, QFont, QAction
+from PySide6.QtGui import QIcon, QFont, QAction, QPixmap
 from PySide6.QtCore import Qt, QSize, Signal, Slot
 from PySide6.QtGui import QIcon, QFont, QAction
 from PySide6.QtWidgets import (
@@ -36,10 +36,98 @@ from gui.widgets.schedule_panel import SchedulePanel
 from gui.widgets.mail_viewer_panel import MailViewerPanel
 from gui.widgets.export_panel import ExportPanel
 from gui.widgets.settings_panel import SettingsPanel
+from gui.widgets.top_notification_banner import TopNotificationBanner
+from gui.dialogs.login_dialog import LoginDialog
+from gui.dialogs.disk_arrival_dialog import DiskArrivalDialog
+from infrastructure.disk_identifier import (
+    get_disk_signature,
+    stamp_disk_signature,
+    find_registered_disk_on_system,
+    inspect_drive_recognition,
+)
+
+from PySide6.QtCore import QThread, QTimer
 
 logger = logging.getLogger(__name__)
 
 STYLE_PATH = Path(__file__).parent / "resources" / "style.qss"
+
+
+class StartupDiskWorker(QThread):
+    disk_ready_signal = Signal(dict)
+    disk_found_other_signal = Signal(str, str, dict)  # old_path, new_path, sig
+    disk_missing_signal = Signal(str)
+
+    def __init__(self, settings: AppSettings, engine: MailEngine, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.engine = engine
+
+    def run(self):
+        try:
+            raw_path = self.settings._data.get("data_path")
+            registered_sig = self.settings.data_disk_signature()
+
+            if not raw_path:
+                return
+
+            raw_path_obj = Path(raw_path)
+            is_ready = False
+            try:
+                is_ready = raw_path_obj.exists()
+            except OSError:
+                is_ready = False
+
+            if is_ready:
+                sig = get_disk_signature(raw_path_obj)
+                self.disk_ready_signal.emit({
+                    "path": str(raw_path_obj),
+                    "signature": sig,
+                    "is_official": sig is not None,
+                    "label": sig.get("label", "Resmi Yedekleme Diski") if sig else "Ana Depolama Alanı",
+                })
+                return
+
+            # If not accessible at configured raw_path, search without blocking
+            target_folder_name = raw_path_obj.name if raw_path_obj.name else "mailyedek"
+            auto_found = find_registered_disk_on_system(registered_sig, target_folder_name)
+
+            if auto_found:
+                found_path = str(auto_found["found_path"])
+                sig = auto_found.get("signature") or {}
+                self.disk_found_other_signal.emit(raw_path, found_path, sig)
+            else:
+                self.disk_missing_signal.emit(raw_path)
+        except Exception as e:
+            logger.warning("StartupDiskWorker exception: %s", e)
+
+
+class DiskArrivalScanWorker(QThread):
+    finished_signal = Signal(dict, dict)  # drive_info, stats
+
+    def __init__(self, engine: MailEngine, drive_info: dict, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.drive_info = drive_info
+
+    def run(self):
+        try:
+            drive_path = self.drive_info.get("path", "")
+            scan = self.engine.scan_drive_backups(drive_path)
+            all_backups = scan.get("all_backups", [])
+            sql_cnt = len([i for i in all_backups if "SQL" in i.get("type", "")])
+            vhdx_cnt = len([i for i in all_backups if "VHDX" in i.get("type", "") or "Hyper-V" in i.get("type", "")])
+            mail_cnt = len([i for i in all_backups if "Mail" in i.get("type", "") or "E-Posta" in i.get("type", "")])
+            stats = {
+                "total": len(all_backups),
+                "sql": sql_cnt,
+                "vhdx": vhdx_cnt,
+                "mail": mail_cnt,
+            }
+            self.finished_signal.emit(self.drive_info, stats)
+        except Exception as e:
+            logger.error("DiskArrivalScanWorker error: %s", e)
+            self.finished_signal.emit(self.drive_info, {"total": 0, "sql": 0, "vhdx": 0, "mail": 0})
 
 
 class SidebarButton(QPushButton):
@@ -114,6 +202,8 @@ class SidebarButton(QPushButton):
 class MainWindow(QMainWindow):
     """Main application window with sidebar navigation."""
 
+    disk_arrived_signal = Signal(dict)
+
     def __init__(self, engine: Optional[MailEngine] = None,
                  db_path: Optional[Path] = None,
                  key_file: Optional[Path] = None,
@@ -121,16 +211,29 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = settings or AppSettings()
         self.engine = engine or MailEngine(db_path=db_path, key_file=key_file)
+        self.current_user = None
 
-        self.setWindowTitle("Mail Archive System v1.0")
-        self.setMinimumSize(1200, 760)
-        self.resize(1400, 860)
+        self.setWindowTitle("Toya Yedek - Kurumsal E-Posta Arşivleme & Yedekleme Sistemi")
+        self.setMinimumSize(960, 560)
+        self.resize(1260, 700)
         self.setWindowIcon(self._create_app_icon())
+
+        self._startup_worker: Optional[StartupDiskWorker] = None
+        self._disk_arrival_workers = []
+
+        self.disk_arrived_signal.connect(self._on_disk_arrived)
+        try:
+            self.engine.start_disk_watcher(lambda d: self.disk_arrived_signal.emit(d))
+        except Exception as e:
+            logger.warning("Could not start background disk watcher: %s", e)
 
         self._init_ui()
         self._load_style()
         self._connect_signals()
         self._init_tray_icon()
+
+        # Schedule non-blocking startup disk verification in background
+        QTimer.singleShot(200, self._start_startup_disk_check)
 
     # ------------------------------------------------------------------
     # UI setup
@@ -157,6 +260,10 @@ class MainWindow(QMainWindow):
         # Header bar
         header = self._create_header()
         content_layout.addWidget(header)
+
+        # Top Notification Banner (dismissible, non-blocking)
+        self.top_banner = TopNotificationBanner(self)
+        content_layout.addWidget(self.top_banner)
 
         # Stacked panels
         self.stack = QStackedWidget()
@@ -194,45 +301,75 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(10, 16, 10, 16)
         layout.setSpacing(4)
 
-        # Logo / Brand & Toggle
-        brand_row = QHBoxLayout()
-        self.brand = QLabel("📧  Mail Archive")
+        # Logo / Brand & Toggle Row
+        self.brand_container = QWidget()
+        self.brand_layout = QHBoxLayout(self.brand_container)
+        self.brand_layout.setContentsMargins(4, 4, 4, 8)
+        self.brand_layout.setSpacing(8)
+
+        # Toya Logo Icon
+        self.lbl_brand_logo = QLabel()
+        self.lbl_brand_logo.setCursor(Qt.PointingHandCursor)
+        self.lbl_brand_logo.setToolTip("Toya Yedek")
+        
+        logo_path = Path("gui/resources/toya_logo_32.png")
+        if not logo_path.exists():
+            logo_path = Path("gui/resources/toya_logo.png")
+        
+        if logo_path.exists():
+            pix = QPixmap(str(logo_path)).scaled(26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.lbl_brand_logo.setPixmap(pix)
+        else:
+            self.lbl_brand_logo.setText("🛡️")
+            self.lbl_brand_logo.setStyleSheet("font-size: 18px;")
+            
+        self.lbl_brand_logo.mousePressEvent = lambda e: self._toggle_sidebar()
+        self.brand_layout.addWidget(self.lbl_brand_logo)
+
+        # Brand text
+        self.brand = QLabel("Toya Yedek")
         self.brand.setStyleSheet("""
             font-size: 16px;
             font-weight: 800;
             color: #ffffff;
             border: none;
+            letter-spacing: 0.5px;
         """)
         self.brand.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        
-        self.btn_toggle_sidebar = QPushButton("☰")
+        self.brand_layout.addWidget(self.brand, stretch=1)
+
+        # Toggle Button
+        self.btn_toggle_sidebar = QPushButton("◀")
+        self.btn_toggle_sidebar.setToolTip("Menüyü Daralt / Genişlet")
         self.btn_toggle_sidebar.setCursor(Qt.PointingHandCursor)
-        self.btn_toggle_sidebar.setFixedWidth(34)
-        self.btn_toggle_sidebar.setMinimumHeight(30)
+        self.btn_toggle_sidebar.setFixedWidth(28)
+        self.btn_toggle_sidebar.setMinimumHeight(28)
         self.btn_toggle_sidebar.setStyleSheet("""
             QPushButton {
-                background: #4361ee;
-                color: #ffffff !important;
-                border: 1.5px solid #ffffff;
+                background: rgba(255, 255, 255, 0.08);
+                color: #cbd5e1 !important;
+                border: 1px solid rgba(255, 255, 255, 0.15);
                 border-radius: 6px;
-                font-size: 16px;
+                font-size: 11px;
                 font-weight: bold;
+                padding: 0px;
             }
             QPushButton:hover {
-                background: #3a56d4;
+                background: rgba(255, 255, 255, 0.18);
+                color: #ffffff !important;
+                border-color: #60a5fa;
             }
         """)
         self.btn_toggle_sidebar.clicked.connect(self._toggle_sidebar)
-        
-        brand_row.addWidget(self.brand, stretch=1)
-        brand_row.addWidget(self.btn_toggle_sidebar)
-        layout.addLayout(brand_row)
+        self.brand_layout.addWidget(self.btn_toggle_sidebar)
+
+        layout.addWidget(self.brand_container)
 
         # Navigation buttons
         self.nav_buttons = {}
         nav_items = [
             ("mail",      "📧", "Mail İzleyici"),
-            ("accounts",  "👤", "Hesaplar"),
+            ("accounts",  "📮", "E-Posta Hesapları"),
             ("sync",      "🔄", "Senkronizasyon"),
             ("export",    "📤", "Dışa Aktarım"),
             ("backup",    "☁️", "Yedekleme"),
@@ -242,6 +379,7 @@ class MainWindow(QMainWindow):
             ("schedule",  "⏰", "Zamanlayıcı"),
             ("report",    "📊", "Raporlar"),
             ("health",    "❤️", "Sistem Sağlığı"),
+            ("users",     "👥", "Kullanıcı Yönetimi"),
             ("settings",  "⚙️", "Ayarlar & Depolama"),
         ]
 
@@ -253,12 +391,39 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        # Version label
+        # Footer / Version Section
+        self.footer_container = QFrame()
+        self.footer_container.setStyleSheet("border: none; background: transparent;")
+        footer_layout = QVBoxLayout(self.footer_container)
+        footer_layout.setContentsMargins(4, 8, 4, 4)
+        footer_layout.setSpacing(4)
+        footer_layout.setAlignment(Qt.AlignCenter)
+
+        # Designated Logo Slot / Container
+        self.lbl_footer_logo = QLabel("[ TOYA LOGO ]")
+        self.lbl_footer_logo.setAlignment(Qt.AlignCenter)
+        self.lbl_footer_logo.setStyleSheet("""
+            QLabel {
+                color: #64748b;
+                font-size: 9.5px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                padding: 4px 8px;
+                border: 1px dashed rgba(255, 255, 255, 0.12);
+                border-radius: 4px;
+                background: rgba(255, 255, 255, 0.03);
+            }
+        """)
+        footer_layout.addWidget(self.lbl_footer_logo)
+
+        # Version label only
         from core.version import get_version
-        self.lbl_app_ver = QLabel(f"v{get_version()}  —  Baynet Teknik")
-        self.lbl_app_ver.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold; padding: 8px;")
+        self.lbl_app_ver = QLabel(f"v{get_version()}")
+        self.lbl_app_ver.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600; padding: 2px;")
         self.lbl_app_ver.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.lbl_app_ver)
+        footer_layout.addWidget(self.lbl_app_ver)
+
+        layout.addWidget(self.footer_container)
 
         return self.sidebar
 
@@ -292,11 +457,29 @@ class MainWindow(QMainWindow):
         self.label_data_path.setToolTip("Current data directory")
         hlayout.addWidget(self.label_data_path)
 
-        hlayout.addStretch()
+        hlayout.addSpacing(10)
+
+        # User and Role Badge
+        self.lbl_user_badge = QLabel("👤 Giriş Yapılmadı")
+        self.lbl_user_badge.setStyleSheet("""
+            background: #ede9fe;
+            color: #6d28d9;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: 1px solid #ddd6fe;
+        """)
+        hlayout.addWidget(self.lbl_user_badge)
+
+        self.btn_logout = QPushButton("🚪 Kullanıcı Değiştir")
+        self.btn_logout.setProperty("outline", True)
+        self.btn_logout.setProperty("small", True)
+        self.btn_logout.setCursor(Qt.PointingHandCursor)
+        self.btn_logout.clicked.connect(self.prompt_login)
+        hlayout.addWidget(self.btn_logout)
 
         # Quick actions
-        from PySide6.QtWidgets import QPushButton
-
         self.btn_export = QPushButton("📤 Export")
         self.btn_export.setProperty("outline", True)
         self.btn_export.setProperty("small", True)
@@ -317,46 +500,294 @@ class MainWindow(QMainWindow):
 
         return header
 
-    def _register_panels(self):
-        panels_def = [
-            ("mail", "Mail Viewer", MailViewerPanel),
-            ("accounts", "Accounts", AccountPanel),
-            ("sync", "Sync", SyncPanel),
-            ("export", "Export Workspace", ExportPanel),
-            ("backup", "Backup", BackupPanel),
-            ("restore", "Restore", RestorePanel),
-            ("search", "Search", SearchPanel),
-            ("audit", "Audit Trail", AuditPanel),
-            ("schedule", "Schedule", SchedulePanel),
-            ("report", "Reports", ReportPanel),
-            ("health", "Health", HealthPanel),
-            ("settings", "Settings Workspace", SettingsPanel),
-        ]
+    def prompt_login(self) -> bool:
+        """Prompt user login dialog."""
+        dialog = LoginDialog(self.engine, self)
+        if dialog.exec() == QDialog.Accepted and dialog.authenticated_user:
+            self.current_user = dialog.authenticated_user
+            uname = self.current_user.username
+            role = self.current_user.role
+            self.lbl_user_badge.setText(f"👤 {uname} ({role})")
 
-        for key, title, PanelClass in panels_def:
+            if role == "ADMIN":
+                self.lbl_user_badge.setStyleSheet("background: #ede9fe; color: #6d28d9; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 6px; border: 1px solid #ddd6fe;")
+            elif role == "OPERATOR":
+                self.lbl_user_badge.setStyleSheet("background: #e0f2fe; color: #0369a1; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 6px; border: 1px solid #bae6fd;")
+            else:
+                self.lbl_user_badge.setStyleSheet("background: #f1f5f9; color: #475569; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 6px; border: 1px solid #cbd5e1;")
+
+            self._apply_permissions()
+            return True
+        return False
+
+    def _apply_permissions(self):
+        """Apply active user role permissions across UI panels."""
+        if not self.current_user:
+            return
+        role = self.current_user.role
+        if "accounts" in self.panels and hasattr(self.panels["accounts"], "apply_permissions"):
+            self.panels["accounts"].apply_permissions(role)
+        if "backup" in self.panels and hasattr(self.panels["backup"], "apply_permissions"):
+            self.panels["backup"].apply_permissions(role)
+        if "settings" in self.panels and hasattr(self.panels["settings"], "apply_permissions"):
+            self.panels["settings"].apply_permissions(role)
+
+    # ------------------------------------------------------------------
+    # Background Disk Verification & Notification Banner Handlers
+    # ------------------------------------------------------------------
+
+    def _start_startup_disk_check(self):
+        """Perform non-blocking verification of data disk in background."""
+        raw_path = self.settings._data.get("data_path")
+        if not raw_path:
+            return
+
+        self.top_banner.show_progress(
+            "💾 Depolama Diski Kontrol Ediliyor",
+            f"'{raw_path}' veri konumu ve sistemdeki yedekleme sürücüleri denetleniyor...",
+            is_indeterminate=True,
+        )
+
+        self._startup_worker = StartupDiskWorker(self.settings, self.engine, self)
+        self._startup_worker.disk_ready_signal.connect(self._on_startup_disk_ready)
+        self._startup_worker.disk_found_other_signal.connect(self._on_startup_disk_found_other)
+        self._startup_worker.disk_missing_signal.connect(self._on_startup_disk_missing)
+        self._startup_worker.start()
+
+    def _on_startup_disk_ready(self, data: dict):
+        path = data.get("path", "")
+        label = data.get("label", "Resmi Yedekleme Diski")
+        is_official = data.get("is_official", False)
+        if is_official:
+            self.top_banner.show_success(
+                "✅ Resmi Yedekleme Diski Bağlı",
+                f"'{path}' konumundaki kayıtlı yedekleme diski ({label}) doğrulandı ve aktif.",
+                actions=[
+                    ("🔍 Diski İncele", lambda: self._open_disk_dialog_by_path(path)),
+                    ("✕ Kapat", self.top_banner.dismiss),
+                ],
+                auto_dismiss_seconds=8,
+            )
+        else:
+            self.top_banner.show_success(
+                "✅ Ana Veri Deposu Hazır",
+                f"'{path}' veri konumu aktif olarak kullanılıyor.",
+                actions=[
+                    ("💾 Resmi Disk Olarak İmzala", lambda: self._stamp_drive_as_official(path, label)),
+                    ("✕ Kapat", self.top_banner.dismiss),
+                ],
+                auto_dismiss_seconds=6,
+            )
+
+    def _on_startup_disk_found_other(self, old_path: str, new_path: str, sig: dict):
+        label = sig.get("label", "Kayıtlı Yedekleme Diski")
+        self.top_banner.show_info(
+            "💾 Kayıtlı Yedekleme Diski Algılandı",
+            f"Yapılandırılmış konum '{old_path}' yerine, kayıtlı yedek diskiniz ({label}) şu anda '{new_path}' sürücüsünde takılı.",
+            actions=[
+                ("🔄 Bu Konuma Otomatik Bağlan", lambda: self._connect_and_switch_data_path(new_path)),
+                ("✕ Kapat", self.top_banner.dismiss),
+            ],
+        )
+
+    def _on_startup_disk_missing(self, raw_path: str):
+        self.top_banner.show_warning(
+            "⚠️ Ana Veri Diski Bağlı Değil",
+            f"Yapılandırılmış ana veri dizini ({raw_path}) şu anda takılı veya erişilebilir değil. "
+            f"Uygulama yerel depolama ile açıldı (Yedek diskinizi taktığınızda otomatik tanınacaktır).",
+            actions=[
+                ("📁 Yeni Konum Seç", self._prompt_change_data_path),
+                ("✕ Kapat", self.top_banner.dismiss),
+            ],
+        )
+
+    @Slot(dict)
+    def _on_disk_arrived(self, drive_info: dict):
+        """Handle newly connected disk in a non-blocking background way."""
+        letter = drive_info.get("letter", "")
+        label = drive_info.get("label", "Harici Sürücü")
+        free_gb = drive_info.get("free_gb", 0)
+
+        logger.info("New disk plugged in: %s (%s - %.1f GB free)", letter, label, free_gb)
+
+        # Show non-blocking progress banner
+        self.top_banner.show_progress(
+            f"💾 Yeni Harici Disk Algılandı ({letter})",
+            f"{label} ({free_gb:.1f} GB Boş) — Yedek durumu ve disk imzası taranıyor...",
+            is_indeterminate=True,
+        )
+
+        # Start asynchronous background scanner for the newly attached drive
+        worker = DiskArrivalScanWorker(self.engine, drive_info, self)
+        worker.finished_signal.connect(self._on_disk_arrival_scanned)
+        self._disk_arrival_workers.append(worker)
+        worker.start()
+
+    def _on_disk_arrival_scanned(self, drive_info: dict, stats: dict):
+        letter = drive_info.get("letter", "")
+        label = drive_info.get("label", "Harici Sürücü")
+        path = drive_info.get("path", "")
+        total_backups = stats.get("total", 0)
+
+        reg_sig = self.settings.data_disk_signature()
+        cfg_path = str(self.settings.data_path())
+        recog = inspect_drive_recognition(path, reg_sig, cfg_path)
+
+        if recog.get("is_recognized"):
+            recog_lbl = recog.get("label", "Resmi Yedekleme Diski")
+            msg = f"Kayıtlı '{recog_lbl}' ({letter}) takıldı. Toplam {total_backups} adet mevcut yedek dosyası tespit edildi."
+            self.top_banner.show_success(
+                f"✅ Kayıtlı Yedekleme Diski Bağlandı ({letter})",
+                msg,
+                actions=[
+                    ("🔍 Yedek Raporunu Aç", lambda: self._open_disk_arrival_dialog(drive_info)),
+                    ("🚀 Bu Diske Yedek Al", lambda: self._open_disk_arrival_dialog(drive_info)),
+                    ("✕ Kapat", self.top_banner.dismiss),
+                ],
+                auto_dismiss_seconds=15,
+            )
+        else:
+            msg = f"{letter} [{label}] bağlandı. Diskte {total_backups} adet yedek dosyası bulundu. Bu diski resmi yedek diski yapabilir veya yedekleme başlatabilirsiniz."
+            self.top_banner.show_info(
+                f"ℹ️ Yeni Harici Sürücü Hazır ({letter})",
+                msg,
+                actions=[
+                    ("🔍 Diski İncele / Yedek Al", lambda: self._open_disk_arrival_dialog(drive_info)),
+                    ("💾 Resmi Yedek Diski Yap", lambda: self._stamp_drive_as_official(path, label)),
+                    ("✕ Kapat", self.top_banner.dismiss),
+                ],
+                auto_dismiss_seconds=20,
+            )
+
+    def _open_disk_arrival_dialog(self, drive_info: dict):
+        """Open the detailed DiskArrivalDialog for a drive."""
+        try:
+            dialog = DiskArrivalDialog(self.engine, drive_info, self, settings=self.settings)
+            dialog.exec()
+        except Exception as e:
+            logger.error("Error opening DiskArrivalDialog: %s", e)
+
+    def _open_disk_dialog_by_path(self, path_str: str):
+        """Open DiskArrivalDialog by path."""
+        p = Path(path_str)
+        drive_letter = p.anchor or path_str[:2]
+        d_info = {
+            "path": str(p),
+            "letter": drive_letter,
+            "label": "Yedekleme Deposu",
+            "type": "Sabit / Harici Disk",
+            "is_removable": True,
+            "free_gb": 0.0,
+        }
+        self._open_disk_arrival_dialog(d_info)
+
+    def _connect_and_switch_data_path(self, new_path_str: str):
+        """Connect to a recognized data path."""
+        new_path = Path(new_path_str).resolve()
+        self.settings.set_data_path(new_path)
+        sig = get_disk_signature(new_path)
+        if sig:
+            self.settings.set_data_disk_signature(sig)
+        self.top_banner.show_success(
+            "✅ Veri Konumu Güncellendi",
+            f"Ana veri konumu '{new_path}' olarak güncellendi ve bağlandı.",
+            auto_dismiss_seconds=6,
+        )
+        self.status.showMessage(f"Veri konumu güncellendi: {new_path}")
+
+    def _stamp_drive_as_official(self, drive_path: str, label: str):
+        """Stamp the given drive as official backup disk."""
+        try:
+            sig = stamp_disk_signature(Path(drive_path), label=f"Resmi Yedek Diski ({label})")
+            self.settings.set_data_disk_signature(sig)
+            self.top_banner.show_success(
+                "✅ Disk Başarıyla İmzalandı",
+                f"'{drive_path}' konumu resmi yedekleme diski olarak kaydedildi. Sürücü harfi değişse bile sistem tarafından tanınacaktır.",
+                auto_dismiss_seconds=8,
+            )
+        except Exception as e:
+            self.top_banner.show_error("❌ Hata", f"Disk imzalanamadı: {e}")
+
+    def _prompt_change_data_path(self):
+        """Prompt the user to select a new data directory."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Yeni Veri Dizinini (Ana Depolama Alanı) Seçin", str(Path.cwd())
+        )
+        if folder:
+            self._connect_and_switch_data_path(folder)
+
+    def _register_panels(self):
+        self._panel_defs = {
+            "mail": (MailViewerPanel, {}),
+            "accounts": (AccountPanel, {"settings": self.settings}),
+            "sync": (SyncPanel, {"settings": self.settings}),
+            "export": (ExportPanel, {}),
+            "backup": (BackupPanel, {}),
+            "restore": (RestorePanel, {}),
+            "search": (SearchPanel, {}),
+            "audit": (AuditPanel, {}),
+            "schedule": (SchedulePanel, {}),
+            "report": (ReportPanel, {}),
+            "health": (HealthPanel, {}),
+            "settings": (SettingsPanel, {"settings": self.settings}),
+        }
+        self.panels = {}
+        # Only instantiate the initial landing panel immediately
+        self._get_or_create_panel("mail")
+
+    def _get_or_create_panel(self, key: str) -> Optional[QWidget]:
+        """Lazily instantiate panels only when navigated to."""
+        if key in self.panels:
+            return self.panels[key]
+
+        if key in self._panel_defs:
+            PanelClass, extra_kwargs = self._panel_defs[key]
             kwargs = {"engine": self.engine, "parent": self}
-            if PanelClass in (AccountPanel, SyncPanel, SettingsPanel):
-                kwargs["settings"] = self.settings
+            kwargs.update(extra_kwargs)
             panel = PanelClass(**kwargs)
             self.panels[key] = panel
             self.stack.addWidget(panel)
+
+            if self.current_user and hasattr(panel, "apply_permissions"):
+                try:
+                    panel.apply_permissions(self.current_user.role)
+                except Exception:
+                    pass
+            return panel
+        return None
 
     # ------------------------------------------------------------------
     # Navigation
     # ------------------------------------------------------------------
 
     def _navigate(self, key: str):
-        if key in self.panels:
+        if key == "users":
+            for k, btn in self.nav_buttons.items():
+                btn.setChecked(k == "users")
+            settings_panel = self._get_or_create_panel("settings")
+            if settings_panel:
+                self.stack.setCurrentWidget(settings_panel)
+                if hasattr(settings_panel, "tabs"):
+                    settings_panel.tabs.setCurrentIndex(0)
+                self.page_title.setText("👥 Program Kullanıcıları & Yetkilendirme (RBAC)")
+                self.page_title.setToolTip("Yazılıma giriş yapan kullanıcıları (Admin, Operatör, İzleyici), şifreleri ve yetkileri yönetin.")
+                self.status.showMessage("Kullanıcı Yönetimi paneline geçildi.")
+                if hasattr(settings_panel, "refresh"):
+                    settings_panel.refresh()
+            return
+
+        panel = self._get_or_create_panel(key)
+        if panel:
             for k, btn in self.nav_buttons.items():
                 btn.setChecked(k == key)
-            self.stack.setCurrentWidget(self.panels[key])
+            self.stack.setCurrentWidget(panel)
             # Update header title & tooltip hints
             titles = {
                 "mail": "Mail İzleyici",
-                "accounts": "Hesap Yönetimi",
+                "accounts": "📮 E-Posta Hesap Yönetimi (Yedeklenecek Mail Hesapları)",
                 "sync": "E-Posta Senkronizasyonu",
                 "export": "Dışa Aktarım ve Sunucu Göçü Çalışma Alanı",
-                "backup": "Bulut Yedekleme",
+                "backup": "🛡️ Yedekleme ve Kurtarma Merkezi",
                 "restore": "Yedekten Geri Yükleme",
                 "search": "Detaylı Mail Arama",
                 "audit": "Denetim ve Log İzi",
@@ -366,25 +797,26 @@ class MainWindow(QMainWindow):
                 "settings": "Uygulama Ayarları ve Port Teşhis Paneli",
             }
             descriptions = {
-                "mail": "View local archived mails asynchronously.",
-                "accounts": "Manage IMAP archive accounts and storage paths.",
-                "sync": "Download, preview, and update emails from server.",
-                "export": "Configure export definitions, push archives to target IMAP servers, and check file/inode details.",
-                "backup": "Save archives to secondary files or cloud backups.",
-                "restore": "Load archived data back into active workspace.",
-                "search": "Fast search across sender, recipient, subject, and body.",
-                "audit": "Trace data actions and verify audit blockchain integrity.",
-                "schedule": "Define auto-run archiving timers and schedules.",
-                "report": "Summary analytics of database usage and message sizes.",
-                "health": "Database status, index validation, and network latency checks.",
+                "mail": "Arşivlenmiş e-postaları asenkron olarak görüntüleyin.",
+                "accounts": "Yedeklenecek şirket e-posta ve IMAP hesaplarını ekleyin, düzenleyin ve yönetin.",
+                "sync": "Sunucudan e-postaları indirin, önizleyin ve arşivleyin.",
+                "export": "Dışa aktarım tanımları ve IMAP sunucularına aktarım.",
+                "backup": "SQL Veritabanları (MSSQL, MySQL, Postgres, SQLite), Canlı VHDX/Hyper-V disk ve E-Posta yedekleme yönetimi.",
+                "restore": "Arşivlenmiş verileri aktif çalışma alanına geri yükleyin.",
+                "search": "Gönderen, alıcı, konu ve gövdede hızlı arama.",
+                "audit": "Veri işlemlerini izleyin ve denetim loglarını denetleyin.",
+                "schedule": "Otomatik arşivleme ve yedekleme zamanlayıcıları.",
+                "report": "Veritabanı kullanımı ve mesaj boyutları analitiği.",
+                "health": "Veritabanı durumu, indeks doğrulaması ve ağ gecikme testleri.",
+                "settings": "Uygulama tercihleri, depolama alanları ve port analizörü.",
             }
             self.page_title.setText(titles.get(key, key.title()))
             self.page_title.setToolTip(descriptions.get(key, ""))
             self.status.showMessage(f"Navigated to {titles.get(key, key.title())}")
 
             # Refresh panel data
-            if hasattr(self.panels[key], "refresh"):
-                self.panels[key].refresh()
+            if hasattr(panel, "refresh"):
+                panel.refresh()
 
     # ------------------------------------------------------------------
     # Settings
@@ -404,8 +836,35 @@ class MainWindow(QMainWindow):
     def _toggle_sidebar(self):
         """Toggle sidebar collapsed (Icons Only) vs expanded (Full)."""
         collapsed = self.sidebar.width() > 70
-        self.sidebar.setFixedWidth(55 if collapsed else 220)
-        self.brand.setText("📧" if collapsed else "📧  Mail Archive")
+        self.sidebar.setFixedWidth(58 if collapsed else 220)
+        
+        from core.version import get_version
+        if collapsed:
+            # When collapsed: only logo remains at top
+            self.brand.setVisible(False)
+            self.btn_toggle_sidebar.setVisible(False)
+            self.lbl_brand_logo.setVisible(True)
+            self.lbl_brand_logo.setAlignment(Qt.AlignCenter)
+            self.brand_layout.setContentsMargins(0, 4, 0, 8)
+            self.brand_layout.setAlignment(Qt.AlignCenter)
+            if hasattr(self, "lbl_footer_logo"):
+                self.lbl_footer_logo.setVisible(False)
+            if hasattr(self, "lbl_app_ver"):
+                self.lbl_app_ver.setText(f"v{get_version()[:4]}")
+        else:
+            # When expanded: brand text, logo and toggle button
+            self.brand.setVisible(True)
+            self.btn_toggle_sidebar.setVisible(True)
+            self.btn_toggle_sidebar.setText("◀")
+            self.lbl_brand_logo.setVisible(True)
+            self.lbl_brand_logo.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            self.brand_layout.setContentsMargins(4, 4, 4, 8)
+            self.brand_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            if hasattr(self, "lbl_footer_logo"):
+                self.lbl_footer_logo.setVisible(True)
+            if hasattr(self, "lbl_app_ver"):
+                self.lbl_app_ver.setText(f"v{get_version()}")
+
         for btn in self.nav_buttons.values():
             btn.set_collapsed(collapsed)
 
@@ -454,7 +913,6 @@ class MainWindow(QMainWindow):
 
         from PySide6.QtWidgets import QMessageBox, QSystemTrayIcon
         
-        # Check if background sync or export is running
         sync_running = False
         if "sync" in self.panels:
             sync_panel = self.panels["sync"]
@@ -467,28 +925,30 @@ class MainWindow(QMainWindow):
             if hasattr(export_panel, "_active_exports") and export_panel._active_exports:
                 export_running = True
 
-        if not sync_running and not export_running:
-            self.exit_completely()
-            event.accept()
-            return
-
         reply = QMessageBox(self)
-        reply.setWindowTitle("Çıkış Onayı")
+        reply.setWindowTitle("Program Kapanış Onayı")
         
         if sync_running or export_running:
-            reply.setText("Arka planda çalışan aktif arşivleme veya dışa aktarım işlemleri mevcut.\n\n"
-                          "Programı tamamen kapatmak mı istiyorsunuz, yoksa arka planda çalışmaya devam etmesini mi istersiniz?")
+            reply.setText(
+                "<b>⚠️ Arka planda çalışan aktif arşivleme veya dışa aktarım işlemleri mevcut!</b><br/><br/>"
+                "Programın arka planda (Sistem Tepsisinde) çalışmaya devam etmesini mi, "
+                "yoksa tüm işlemleri durdurarak tamamen kapanmasını mı istersiniz?"
+            )
         else:
-            reply.setText("Programı kapatmak mı istiyorsunuz, yoksa sistem tepsisinde arka planda çalışmaya devam etmesini mi istersiniz?")
+            reply.setText(
+                "<b>Mail Arşivleme Sisteminden çıkmak üzeresiniz.</b><br/><br/>"
+                "Zamanlanmış görevlerin ve disk izleyicisinin arka planda çalışmaya devam etmesi için "
+                "uygulamayı sistem tepsisine küçültebilir veya tamamen kapatabilirsiniz."
+            )
         
-        btn_background = reply.addButton("Arka Planda Çalıştır", QMessageBox.ButtonRole.AcceptRole)
+        btn_background = reply.addButton("Arka Planda Çalıştır (Tepsiye Küçült)", QMessageBox.ButtonRole.AcceptRole)
         btn_exit = reply.addButton("Tamamen Kapat", QMessageBox.ButtonRole.DestructiveRole)
-        btn_cancel = reply.addButton("İptal", QMessageBox.ButtonRole.RejectRole)
+        btn_cancel = reply.addButton("Vazgeç (Pencerede Kal)", QMessageBox.ButtonRole.RejectRole)
         
-        # Style message box buttons slightly for premium look
         reply.setStyleSheet("""
-            QMessageBox { background-color: #f8f9fa; }
-            QPushButton { padding: 6px 14px; font-size: 12px; border-radius: 4px; font-weight: 600; }
+            QMessageBox { background-color: #f8fafc; }
+            QLabel { font-size: 12px; color: #0f172a; }
+            QPushButton { padding: 6px 14px; font-size: 11.5px; border-radius: 6px; font-weight: 600; min-height: 26px; }
         """)
         reply.exec()
         
@@ -498,10 +958,10 @@ class MainWindow(QMainWindow):
             self.hide()
             if self.tray_icon.isSystemTrayAvailable():
                 self.tray_icon.showMessage(
-                    "Mail Arşivleme Sistemi",
-                    "Uygulama arka planda çalışmaya devam ediyor. Tekrar açmak için tepsi simgesine tıklayabilirsiniz.",
+                    "Toya Mail Arşivleme Sistemi",
+                    "Uygulama arka planda çalışmaya devam ediyor. Tekrar açmak için tepsi simgesine çift tıklayabilirsiniz.",
                     QSystemTrayIcon.MessageIcon.Information,
-                    3000
+                    4000
                 )
         elif clicked_button == btn_exit:
             self.exit_completely()
@@ -516,21 +976,58 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(self._create_app_icon())
-        self.tray_icon.setToolTip("Mail Archive System")
+        self.tray_icon.setToolTip("Toya Yedek - E-Posta Arşivleme Sistemi")
         
         tray_menu = QMenu(self)
-        show_action = QAction("Show Window", self)
+        tray_menu.setStyleSheet("""
+            QMenu {
+                background-color: #1e3a8a;
+                color: #ffffff;
+                border: 1px solid #1e40af;
+                border-radius: 6px;
+                padding: 4px;
+                font-weight: 600;
+                font-size: 11.5px;
+            }
+            QMenu::item {
+                padding: 6px 20px 6px 10px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #2563eb;
+            }
+        """)
+
+        show_action = QAction("🖥️ Pencereyi Göster", self)
         show_action.triggered.connect(self.show_and_activate)
-        exit_action = QAction("Exit Completely", self)
+        
+        stop_action = QAction("⏹️ Aktif Senkronizasyonları Durdur", self)
+        stop_action.triggered.connect(self._stop_all_active_syncs)
+        
+        exit_action = QAction("🚪 Programı Tamamen Kapat", self)
         exit_action.triggered.connect(self.exit_completely)
         
         tray_menu.addAction(show_action)
+        tray_menu.addAction(stop_action)
         tray_menu.addSeparator()
         tray_menu.addAction(exit_action)
         
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self._on_tray_icon_activated)
         self.tray_icon.show()
+
+    def _stop_all_active_syncs(self):
+        if hasattr(self, "panels") and "sync" in self.panels:
+            try:
+                self.panels["sync"]._cancel_sync()
+                self.tray_icon.showMessage(
+                    "Toya Mail Arşivleme",
+                    "Aktif senkronizasyon işlemleri durduruldu.",
+                    QSystemTrayIcon.MessageIcon.Warning,
+                    3000
+                )
+            except Exception:
+                pass
         
     def _create_app_icon(self):
         from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QBrush

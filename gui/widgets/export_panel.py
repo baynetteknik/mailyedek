@@ -1,11 +1,7 @@
 """
-export_panel.py — Full-page email export & server migration panel with 3-panel layout.
-
-Features:
-- ThreePanelWorkspaceTemplate architecture (Sol: Domain/Grup filtresi, Orta: ProGrid, Sağ: İşlem paneli).
-- ProGridWidget with customizable, filterable, persistent columns and crisp Account Details readability.
-- Multi-column separation (Check, Label, Email, Domain/Group, Host, Stats, Profile, Progress, Actions).
-- Comprehensive migration options, inode checking, profile configuration dialog, and real-time reports.
+export_panel.py — Email export & server migration panel with detailed logging,
+asynchronous (lazy load) disk & database scanner, multi-account background workers,
+live row progress bars, view profiles, and comprehensive reporting.
 """
 
 import os
@@ -13,82 +9,425 @@ import re
 import imaplib
 import logging
 import threading
-from pathlib import Path
-from typing import Any, Dict, Optional, List
+import time
+from typing import Optional, Any, Dict, List
 from datetime import datetime
+from pathlib import Path
 
-from PySide6.QtCore import Qt, Slot, Signal, QDate
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import (
+    Qt, Slot, Signal, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
+    QDate, QObject, QEventLoop, QThread, QPoint, QTimer, QSize
+)
+from PySide6.QtGui import QFont, QColor, QIcon, QAction, QCursor
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QFrame, QScrollArea,
-    QComboBox, QListWidget, QListWidgetItem, QCheckBox, QDateEdit,
-    QLineEdit, QPushButton, QFileDialog, QProgressBar, QTextEdit,
-    QMessageBox, QLabel, QAbstractItemView, QGroupBox, QSplitter,
-    QTableWidget, QTableWidgetItem, QHeaderView, QDialog, QDialogButtonBox,
-    QSizePolicy
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
+    QGroupBox, QMessageBox, QListWidget, QListWidgetItem,
+    QAbstractItemView, QFrame, QTableView, QComboBox, QLineEdit,
+    QDialog, QDialogButtonBox, QCheckBox, QDateEdit, QTextEdit,
+    QSpinBox, QMenu, QScrollArea, QApplication, QInputDialog, QFileDialog
 )
 
 from core.mail_engine import MailEngine
 from core.settings import AppSettings
-from gui.templates.three_panel_workspace import ThreePanelWorkspaceTemplate
-from gui.widgets.pro_grid_widget import ProGridWidget
+from gui.widgets.view_profile_widget import ViewProfileWidget, SaveLayoutProfileDialog, ColumnManagerDialog
+from gui.widgets.account_group_sidebar_widget import AccountGroupSidebarWidget, CollapsibleSection
+from gui.widgets.export_right_sidebar_widget import ExportRightSidebarWidget
+from infrastructure.imap_client import format_folder_display_name, decode_imap_utf7
 
 logger = logging.getLogger(__name__)
 
+GLOBAL_MSG_STYLE = """
+    QMessageBox, QDialog, QProgressDialog {
+        background-color: #f8fafc;
+        color: #0f172a;
+    }
+    QMessageBox QLabel, QInputDialog QLabel, QProgressDialog QLabel {
+        color: #0f172a;
+        font-weight: 500;
+        font-size: 13px;
+    }
+    QMessageBox QPushButton, QDialog QPushButton {
+        background-color: #2563eb;
+        color: #ffffff;
+        font-weight: 600;
+        font-size: 12px;
+        border: none;
+        border-radius: 6px;
+        padding: 6px 16px;
+        min-width: 85px;
+        min-height: 28px;
+    }
+    QMessageBox QPushButton:hover, QDialog QPushButton:hover {
+        background-color: #1d4ed8;
+    }
+"""
+
 
 # ---------------------------------------------------------------------------
-# Clickable Stat Card Widget
+# Structured log entry model
+# ---------------------------------------------------------------------------
+
+class LogEntry:
+    __slots__ = ('time', 'level', 'source', 'message')
+
+    def __init__(self, time: str, level: str, source: str, message: str):
+        self.time = time
+        self.level = level
+        self.source = source
+        self.message = message
+
+
+class LogTableModel(QAbstractTableModel):
+    COLUMNS = ["Saat", "Seviye", "Kaynak", "Mesaj"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: list[LogEntry] = []
+
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()) -> int:
+        return len(self.COLUMNS)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        entry = self._rows[index.row()]
+        col = index.column()
+        if role == Qt.DisplayRole:
+            return [entry.time, entry.level, entry.source, entry.message][col]
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return self.COLUMNS[section]
+        return None
+
+    def append_entry(self, entry: LogEntry):
+        row = len(self._rows)
+        self.beginInsertRows(QModelIndex(), row, row)
+        self._rows.append(entry)
+        self.endInsertRows()
+
+    def clear_entries(self):
+        c = len(self._rows)
+        if c == 0:
+            return
+        self.beginRemoveRows(QModelIndex(), 0, c - 1)
+        self._rows.clear()
+        self.endRemoveRows()
+
+
+# ---------------------------------------------------------------------------
+# Proxy model with text filtering + pagination
+# ---------------------------------------------------------------------------
+
+class LogFilterProxy(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._filter_text = ""
+        self._page = 0
+        self._page_size = 50
+        self.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.setFilterKeyColumn(-1)
+
+    def set_filter_text(self, text: str):
+        self._filter_text = text
+        self.invalidateFilter()
+        self._page = 0
+
+    def set_page_size(self, size: int):
+        self._page_size = size
+        self._page = 0
+        self.invalidateFilter()
+
+    def total_pages(self) -> int:
+        total = self.sourceModel().rowCount() if self.sourceModel() else 0
+        if total == 0:
+            return 1
+        return (total + self._page_size - 1) // self._page_size
+
+    def current_page(self) -> int:
+        return self._page
+
+    def set_page(self, page: int):
+        total = self.total_pages()
+        self._page = max(0, min(page, total - 1))
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent) -> bool:
+        if self._filter_text:
+            model = self.sourceModel()
+            if model:
+                found = False
+                for col in range(model.columnCount()):
+                    idx = model.index(source_row, col, source_parent)
+                    val = idx.data(Qt.DisplayRole) or ""
+                    if self._filter_text.lower() in str(val).lower():
+                        found = True
+                        break
+                if not found:
+                    return False
+        return source_row // self._page_size == self._page
+
+
+# ---------------------------------------------------------------------------
+# Stat card widget
 # ---------------------------------------------------------------------------
 
 class StatCard(QFrame):
-    def __init__(self, title: str, value: str = "0000", bg_color: str = "#3b82f6", callback=None, tooltip_text="", parent=None):
+    def __init__(self, title: str, value: str = "—", icon: str = "", parent=None):
         super().__init__(parent)
-        self.callback = callback
-        if tooltip_text:
-            self.setToolTip(tooltip_text)
-            
-        self.setStyleSheet(f"""
-            StatCard {{
-                background-color: {bg_color};
-                border: 2px solid #cbd5e1;
+        self.setStyleSheet("""
+            StatCard {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
                 border-radius: 8px;
-                padding: 6px;
-            }}
-            StatCard:hover {{
-                border-color: #3b82f6;
-            }}
+                padding: 4px;
+            }
         """)
-        self.setMinimumHeight(65)
-        self.setCursor(Qt.PointingHandCursor if callback else Qt.ArrowCursor)
-        
+        self.setMinimumHeight(64)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(2)
         
-        self.title_label = QLabel(title.upper())
-        self.title_label.setStyleSheet("font-size:10px; color:#ffffff; font-weight:bold; border:none; background:transparent;")
+        self.title_label = QLabel(f"{icon} {title}" if icon else title)
+        self.title_label.setStyleSheet(
+            "font-size: 10.5px; color: #64748b; font-weight: 600; border: none;"
+        )
         self.title_label.setAlignment(Qt.AlignCenter)
         
         self.value_label = QLabel(value)
-        self.value_label.setStyleSheet("font-size:18px; font-weight:900; color:#ffffff; border:none; background:transparent;")
+        self.value_label.setStyleSheet(
+            "font-size: 14px; font-weight: 700; color: #1e293b; border: none;"
+        )
         self.value_label.setAlignment(Qt.AlignCenter)
+        self.value_label.setWordWrap(True)
         
         layout.addWidget(self.title_label)
         layout.addWidget(self.value_label)
 
     def set_value(self, val: str):
-        if val.isdigit():
-            val = f"{int(val):04d}"
         self.value_label.setText(val)
-
-    def mousePressEvent(self, event):
-        if self.callback:
-            self.callback()
-        super().mousePressEvent(event)
 
 
 # ---------------------------------------------------------------------------
-# Dynamic Config Dialog
+# Asynchronous Lazy Load Worker for Database Stats
+# ---------------------------------------------------------------------------
+
+class ExportDataLoaderWorker(QThread):
+    """Background worker to query folder and email statistics without freezing GUI."""
+    progress_signal = Signal(int, int)  # current, total
+    account_loaded_signal = Signal(int, int, int)  # account_id, mails_cnt, folders_cnt
+    finished_signal = Signal(object)  # all stats dict
+
+    def __init__(self, engine: MailEngine, account_ids: List[int], parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.account_ids = account_ids
+
+    def run(self):
+        results = {}
+        total = len(self.account_ids)
+        try:
+            with self.engine.db.get_conn() as conn:
+                for idx, aid in enumerate(self.account_ids):
+                    self.progress_signal.emit(idx + 1, total)
+                    try:
+                        row_m = conn.execute(
+                            "SELECT COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (aid,)
+                        ).fetchone()
+                        m_cnt = row_m["cnt"] if row_m else 0
+                        row_f = conn.execute(
+                            "SELECT COUNT(DISTINCT folder) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (aid,)
+                        ).fetchone()
+                        f_cnt = row_f["cnt"] if row_f else 0
+                        results[aid] = {"mails": m_cnt, "folders": f_cnt}
+                        self.account_loaded_signal.emit(aid, m_cnt, f_cnt)
+                    except Exception:
+                        results[aid] = {"mails": 0, "folders": 0}
+        except Exception as e:
+            logger.debug("ExportDataLoaderWorker DB read exception: %s", e)
+        finally:
+            self.finished_signal.emit(results)
+
+
+# ---------------------------------------------------------------------------
+# Export Reports popup dialog
+# ---------------------------------------------------------------------------
+
+class ExportReportsDialog(QDialog):
+    def __init__(self, reports: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Dışa Aktarım ve Sunucu Göçü Sonuç Raporları")
+        self.resize(920, 560)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8fafc;
+            }
+            QLabel {
+                color: #1e293b;
+            }
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+            }
+            QTableWidget {
+                color: #1e293b;
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                gridline-color: #f1f5f9;
+                border-radius: 6px;
+            }
+            QHeaderView::section {
+                background-color: #1e3a8a;
+                color: #ffffff !important;
+                font-weight: bold;
+                padding: 8px;
+                border: 1px solid #1e40af;
+                font-size: 11px;
+            }
+            QPushButton {
+                background-color: #2563eb;
+                color: white;
+                font-weight: 600;
+                padding: 8px 20px;
+                border-radius: 6px;
+                min-height: 24px;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+        
+        header_title = QLabel("📊 E-Posta Dışa Aktarım ve Sunucu Göçü Raporu")
+        header_title.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        header_title.setStyleSheet("color: #0f172a;")
+        layout.addWidget(header_title)
+        
+        total_accounts = len(reports)
+        total_exported = 0
+        total_errors = 0
+        total_bytes = 0
+        
+        for r in reports:
+            def g(k, d=None):
+                return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
+            total_exported += g("exported", 0) or g("mails_exported", 0)
+            total_errors += g("errors", 0)
+            total_bytes += g("total_bytes", 0) or g("size_bytes", 0)
+            
+        summary_layout = QHBoxLayout()
+        summary_layout.setSpacing(10)
+        
+        cards_data = [
+            ("Toplam Hesap", str(total_accounts), "#2563eb"),
+            ("Aktarılan İletiler", str(total_exported), "#10b981"),
+            ("Hatalar", str(total_errors), "#ef4444" if total_errors > 0 else "#64748b"),
+            ("Toplam Boyut", self._fmt_bytes(total_bytes), "#7c3aed")
+        ]
+        
+        for label_text, val_text, color in cards_data:
+            card = QFrame()
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(10, 8, 10, 8)
+            card_layout.setSpacing(2)
+            
+            lbl_title = QLabel(label_text.upper())
+            lbl_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            lbl_title.setStyleSheet("color: #64748b; background: transparent;")
+            lbl_title.setAlignment(Qt.AlignCenter)
+            
+            lbl_val = QLabel(val_text)
+            lbl_val.setFont(QFont("Segoe UI", 15, QFont.Bold))
+            lbl_val.setStyleSheet(f"color: {color}; background: transparent;")
+            lbl_val.setAlignment(Qt.AlignCenter)
+            
+            card_layout.addWidget(lbl_title)
+            card_layout.addWidget(lbl_val)
+            summary_layout.addWidget(card)
+            
+        layout.addLayout(summary_layout)
+        
+        table = QTableWidget()
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels([
+            "Hesap Adı", "Biçim / Hedef", "Aktarılan E-Posta", "Hatalar", "Veri Boyutu", "Süre"
+        ])
+        
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        for col in range(2, 6):
+            table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+            
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.setRowCount(len(reports))
+        
+        for i, r in enumerate(reports):
+            def g(k, d=None):
+                return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
+                
+            item_lbl = QTableWidgetItem(str(g("account_label", "") or g("label", "")))
+            item_lbl.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            table.setItem(i, 0, item_lbl)
+            
+            target_info = str(g("target_path", "") or g("format", ""))
+            item_tgt = QTableWidgetItem(target_info)
+            table.setItem(i, 1, item_tgt)
+            
+            exported = g("exported", 0) or g("mails_exported", 0)
+            item_exp = QTableWidgetItem(str(exported))
+            if exported > 0:
+                item_exp.setForeground(QColor("#10b981"))
+                item_exp.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            item_exp.setTextAlignment(Qt.AlignCenter)
+            table.setItem(i, 2, item_exp)
+            
+            errors = g("errors", 0)
+            item_errors = QTableWidgetItem(str(errors))
+            if errors > 0:
+                item_errors.setForeground(QColor("#ef4444"))
+                item_errors.setFont(QFont("Segoe UI", 10, QFont.Bold))
+            item_errors.setTextAlignment(Qt.AlignCenter)
+            table.setItem(i, 3, item_errors)
+            
+            bv = g("total_bytes", 0) or g("size_bytes", 0)
+            item_bytes = QTableWidgetItem(self._fmt_bytes(bv))
+            item_bytes.setTextAlignment(Qt.AlignCenter)
+            table.setItem(i, 4, item_bytes)
+            
+            dur = g("duration_seconds", 0)
+            item_dur = QTableWidgetItem(f"{dur:.1f}s")
+            item_dur.setTextAlignment(Qt.AlignCenter)
+            table.setItem(i, 5, item_dur)
+            
+        layout.addWidget(table)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_box.rejected.connect(self.accept)
+        layout.addWidget(btn_box)
+
+    @staticmethod
+    def _fmt_bytes(size: int) -> str:
+        for unit in ["B", "KB", "MB"]:
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.2f} GB"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Export Configuration Dialog (Pop-up)
 # ---------------------------------------------------------------------------
 
 class ExportConfigDialog(QDialog):
@@ -127,7 +466,7 @@ class ExportConfigDialog(QDialog):
                 subcontrol-origin: margin;
                 left: 12px;
                 padding: 0 5px;
-                color: #4361ee;
+                color: #2563eb;
             }
             QLabel {
                 color: #475569;
@@ -144,7 +483,7 @@ class ExportConfigDialog(QDialog):
                 font-size: 11px;
             }
             QLineEdit:focus, QComboBox:focus, QDateEdit:focus {
-                border: 1px solid #4361ee;
+                border: 1px solid #2563eb;
             }
             QPushButton {
                 background-color: #f1f5f9;
@@ -159,348 +498,246 @@ class ExportConfigDialog(QDialog):
                 border-color: #94a3b8;
             }
         """)
-        
-        self._setup_ui()
-        self._load_profiles()
-        self._load_folders_from_db()
-        self._is_loading = False
-        self._on_format_changed()
 
-    def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(10)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        # 1. Profile Manager Header
+        prof_frame = QFrame()
+        prof_frame.setStyleSheet("background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px;")
+        prof_layout = QHBoxLayout(prof_frame)
+        prof_layout.setContentsMargins(8, 6, 8, 6)
         
-        scroll_content = QWidget()
-        scroll_content.setStyleSheet("background: transparent;")
-        
-        main_columns_layout = QHBoxLayout(scroll_content)
-        main_columns_layout.setSpacing(16)
-        main_columns_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Left Column: Profile & Target/Server settings
-        left_col = QVBoxLayout()
-        left_col.setSpacing(10)
-
-        prof_group = QGroupBox("Kayıtlı Profiller / Şablonlar")
-        prof_form = QFormLayout(prof_group)
-        prof_form.setSpacing(6)
-        
+        lbl_prof = QLabel("Profil Seç:")
         self.combo_profile = QComboBox()
+        self.combo_profile.setMinimumWidth(200)
         self.combo_profile.currentIndexChanged.connect(self._on_profile_selection_changed)
-        prof_form.addRow("Profil:", self.combo_profile)
-
+        
         self.input_profile_name = QLineEdit()
         self.input_profile_name.setPlaceholderText("Yeni Profil Adı...")
-        prof_form.addRow("Profil Adı:", self.input_profile_name)
-
-        prof_btns = QHBoxLayout()
-        self.btn_save_profile = QPushButton("💾 Kaydet")
-        self.btn_save_profile.setStyleSheet("background:#10b981; color:white; font-weight:bold; padding:6px;")
+        
+        self.btn_save_profile = QPushButton("💾 Profili Kaydet")
+        self.btn_save_profile.setStyleSheet("background-color: #2563eb; color: white;")
         self.btn_save_profile.clicked.connect(self._save_current_profile)
 
-        self.btn_copy_profile = QPushButton("📋 Kopyala")
-        self.btn_copy_profile.setStyleSheet("background:#3b82f6; color:white; font-weight:bold; padding:6px;")
+        self.btn_copy_profile = QPushButton("📋 Kopyasını Oluştur")
         self.btn_copy_profile.clicked.connect(self._copy_current_profile)
 
-        self.btn_delete_profile = QPushButton("🗑 Sil")
-        self.btn_delete_profile.setStyleSheet("background:#ef4444; color:white; font-weight:bold; padding:6px;")
+        self.btn_delete_profile = QPushButton("🗑️ Profili Sil")
+        self.btn_delete_profile.setStyleSheet("background-color: #fee2e2; color: #dc2626; border-color: #fca5a5;")
         self.btn_delete_profile.clicked.connect(self._delete_selected_profile)
 
-        prof_btns.addWidget(self.btn_save_profile)
-        prof_btns.addWidget(self.btn_copy_profile)
-        prof_btns.addWidget(self.btn_delete_profile)
-        prof_form.addRow("", prof_btns)
+        prof_layout.addWidget(lbl_prof)
+        prof_layout.addWidget(self.combo_profile)
+        prof_layout.addWidget(self.input_profile_name)
+        prof_layout.addWidget(self.btn_save_profile)
+        prof_layout.addWidget(self.btn_copy_profile)
+        prof_layout.addWidget(self.btn_delete_profile)
+        prof_layout.addStretch()
+        layout.addWidget(prof_frame)
+
+        # 2. Main Config Splitter
+        main_split = QHBoxLayout()
+        main_split.setSpacing(12)
+
+        # Left Column: Format & Filters
+        left_col = QVBoxLayout()
+        left_col.setSpacing(8)
+
+        format_group = QGroupBox("1. Dışa Aktarım Biçimi ve Hedef Dizin")
+        fg_layout = QVBoxLayout(format_group)
         
-        left_col.addWidget(prof_group)
-
-        config_group = QGroupBox("Hedef Biçim ve Sunucu Ayarları")
-        opts_form = QFormLayout(config_group)
-        opts_form.setSpacing(8)
-
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("Format:"))
         self.combo_format = QComboBox()
-        self.combo_format.addItem("ZIP Arşivi (.zip)", "ZIP")
-        self.combo_format.addItem("EML Dizin Yapısı (Thunderbird / Opera)", "DIRECTORY")
-        self.combo_format.addItem("JSON Meta Veri Dosyası (.json)", "JSON")
-        self.combo_format.addItem("MBOX Dosya Paketi (.mbox)", "MBOX")
-        self.combo_format.addItem("IMAP Mail Sunucusu (Server Migration)", "IMAP_SERVER")
+        self.combo_format.addItem("📦 ZIP Arşivi (.zip)", "ZIP")
+        self.combo_format.addItem("📁 Dizin / EML Klasörleri", "DIRECTORY")
+        self.combo_format.addItem("📄 JSON Veri Dosyası (.json)", "JSON")
+        self.combo_format.addItem("📬 Standart MBOX (.mbox)", "MBOX")
+        self.combo_format.addItem("🗃️ Outlook PST (.pst)", "PST")
+        self.combo_format.addItem("🌐 IMAP Sunucu Göçü (Doğrudan)", "IMAP_SERVER")
         self.combo_format.currentIndexChanged.connect(self._on_format_changed)
-        opts_form.addRow("Hedef Format:", self.combo_format)
+        fmt_row.addWidget(self.combo_format, 1)
+        fg_layout.addLayout(fmt_row)
 
-        self.path_label = QLabel("Hedef Dizin:")
-        self.path_layout = QHBoxLayout()
+        path_row = QHBoxLayout()
+        self.path_label = QLabel("Hedef Dizin / Dosya:")
         self.input_path = QLineEdit()
-        self.input_path.setReadOnly(True)
-        self.input_path.setPlaceholderText("Hedef dizin seçin...")
+        self.input_path.setText(str(Path("data/exports").resolve()))
         self.btn_browse = QPushButton("Gözat...")
-        self.btn_browse.setStyleSheet("background:#cbd5e1; padding:4px 8px; font-weight:bold;")
         self.btn_browse.clicked.connect(self._on_browse)
-        self.path_layout.addWidget(self.input_path)
-        self.path_layout.addWidget(self.btn_browse)
-        opts_form.addRow(self.path_label, self.path_layout)
+        path_row.addWidget(self.path_label)
+        path_row.addWidget(self.input_path, 1)
+        path_row.addWidget(self.btn_browse)
+        fg_layout.addLayout(path_row)
 
-        self.server_group = QWidget()
-        server_form = QFormLayout(self.server_group)
-        server_form.setContentsMargins(0, 0, 0, 0)
-        server_form.setSpacing(6)
+        left_col.addWidget(format_group)
 
-        # Dynamic Load Account Combo
-        self.combo_load_account = QComboBox()
-        self.combo_load_account.addItem("— Kayıtlı Hesaplardan Doldur... —", None)
-        try:
-            if self.engine and hasattr(self.engine, "accounts"):
-                for acc in self.engine.accounts.list_all():
-                    lbl = f"👤 {acc.get('label') or 'Hesap'} ({acc.get('email')})"
-                    self.combo_load_account.addItem(lbl, acc)
-        except Exception:
-            pass
-        self.combo_load_account.currentIndexChanged.connect(self._on_load_account_changed)
-        server_form.addRow("Dinamik Hesap:", self.combo_load_account)
-
-        # Saved Target Server Combo & Actions
-        self.combo_saved_servers = QComboBox()
-        self.combo_saved_servers.currentIndexChanged.connect(self._on_saved_server_changed)
-        server_form.addRow("Kayıtlı Sunucu:", self.combo_saved_servers)
-
-        srv_btns = QHBoxLayout()
-        self.btn_save_server = QPushButton("💾 Sunucuyu Kaydet")
-        self.btn_save_server.setStyleSheet("background:#10b981; color:white; font-weight:bold; padding:4px 8px; font-size:11px;")
-        self.btn_save_server.clicked.connect(self._save_target_server)
-
-        self.btn_delete_server = QPushButton("🗑️ Sunucuyu Sil")
-        self.btn_delete_server.setStyleSheet("background:#ef4444; color:white; font-weight:bold; padding:4px 8px; font-size:11px;")
-        self.btn_delete_server.clicked.connect(self._delete_target_server)
-
-        srv_btns.addWidget(self.btn_save_server)
-        srv_btns.addWidget(self.btn_delete_server)
-        server_form.addRow("", srv_btns)
+        # Filter Group
+        filter_group = QGroupBox("2. Zaman ve Durum Filtreleri")
+        flt_layout = QVBoxLayout(filter_group)
         
-        self.input_host = QLineEdit()
-        self.input_host.setPlaceholderText("Örn: imap.mail.com")
-        server_form.addRow("Sunucu Adresi:", self.input_host)
-        
-        port_layout = QHBoxLayout()
-        self.input_port = QLineEdit("993")
-        self.input_port.setFixedWidth(60)
-        self.chk_ssl = QCheckBox("SSL/TLS")
-        self.chk_ssl.setChecked(True)
-        self.chk_ssl.setStyleSheet("color:#1e293b; font-weight:bold;")
-        port_layout.addWidget(self.input_port)
-        port_layout.addWidget(self.chk_ssl)
-        port_layout.addStretch()
-        server_form.addRow("Port Yapılandırması:", port_layout)
-        
-        self.input_username = QLineEdit()
-        self.input_username.setPlaceholderText("Kullanıcı adı veya E-posta")
-        server_form.addRow("Kullanıcı Adı:", self.input_username)
-        
-        self.input_password = QLineEdit()
-        self.input_password.setPlaceholderText("Posta kutusu şifresi")
-        self.input_password.setEchoMode(QLineEdit.Password)
-        server_form.addRow("Şifre:", self.input_password)
-
-        self.btn_test_target = QPushButton("🔌 Sunucu Bağlantısını Test Et")
-        self.btn_test_target.setStyleSheet("background:#4361ee; color:white; font-weight:bold; padding:6px;")
-        self.btn_test_target.clicked.connect(self._test_target_connection)
-        server_form.addRow("", self.btn_test_target)
-
-        self.lbl_target_test_status = QLabel("")
-        self.lbl_target_test_status.setStyleSheet("font-size:11px; font-weight:bold;")
-        server_form.addRow("", self.lbl_target_test_status)
-        opts_form.addRow("", self.server_group)
-        
-        left_col.addWidget(config_group)
-        left_col.addStretch()
-
-        # Right Column: Date Filters and Folders Selection
-        right_col = QVBoxLayout()
-        right_col.setSpacing(10)
-
-        filters_group = QGroupBox("Tarih Filtresi ve Klasör Seçimi")
-        filters_layout = QVBoxLayout(filters_group)
-        filters_layout.setSpacing(10)
-        filters_layout.setContentsMargins(12, 18, 12, 12)
-
-        dates_form = QFormLayout()
-        dates_form.setSpacing(6)
-
-        dates_layout = QHBoxLayout()
-        self.chk_since = QCheckBox("Başlangıç:")
-        self.chk_since.setStyleSheet("color:#1e293b; font-weight:bold;")
-        self.date_since = QDateEdit(QDate.currentDate().addYears(-1))
+        d_row = QHBoxLayout()
+        self.chk_since = QCheckBox("Başlangıç Tarihi:")
+        self.date_since = QDateEdit()
         self.date_since.setCalendarPopup(True)
+        self.date_since.setDate(QDate.currentDate().addMonths(-6))
         self.date_since.setEnabled(False)
         self.chk_since.toggled.connect(self.date_since.setEnabled)
+        d_row.addWidget(self.chk_since)
+        d_row.addWidget(self.date_since)
 
-        self.chk_before = QCheckBox("Bitiş:")
-        self.chk_before.setStyleSheet("color:#1e293b; font-weight:bold;")
-        self.date_before = QDateEdit(QDate.currentDate())
+        self.chk_before = QCheckBox("Bitiş Tarihi:")
+        self.date_before = QDateEdit()
         self.date_before.setCalendarPopup(True)
+        self.date_before.setDate(QDate.currentDate())
         self.date_before.setEnabled(False)
         self.chk_before.toggled.connect(self.date_before.setEnabled)
+        d_row.addWidget(self.chk_before)
+        d_row.addWidget(self.date_before)
+        flt_layout.addLayout(d_row)
 
-        dates_layout.addWidget(self.chk_since)
-        dates_layout.addWidget(self.date_since)
-        dates_layout.addWidget(self.chk_before)
-        dates_layout.addWidget(self.date_before)
-        dates_form.addRow("Tarih Aralığı:", dates_layout)
+        left_col.addWidget(filter_group)
 
-        self.combo_server_filter = QComboBox()
-        self.combo_server_filter.addItem("— Tüm Sunuculardan Çekilen Mailler —", None)
-        try:
-            with self.engine.db.get_conn() as conn:
-                hosts = conn.execute("SELECT DISTINCT server_host FROM mail_metadata WHERE server_host IS NOT NULL AND server_host != ''").fetchall()
-                for h in hosts:
-                    if h["server_host"]:
-                        self.combo_server_filter.addItem(f"🖥️ {h['server_host']}", h["server_host"])
-        except Exception:
-            pass
-        dates_form.addRow("Kaynak Sunucu Filtresi:", self.combo_server_filter)
-
-        filters_layout.addLayout(dates_form)
+        # Folder selection
+        folder_group = QGroupBox("3. Klasör Seçimi")
+        fld_layout = QVBoxLayout(folder_group)
+        
+        self.lbl_folder_summary = QLabel("Arşivlenecek Klasörler: Tümü Seçili")
+        fld_layout.addWidget(self.lbl_folder_summary)
 
         self.folder_list = QListWidget()
-        self.folder_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.folder_list.setMinimumHeight(320)
-        self.folder_list.setStyleSheet("""
-            QListWidget {
-                background-color: #ffffff;
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-            }
-            QListWidget::item {
-                background-color: #ffffff;
-                padding: 6px 8px;
-                border-bottom: 1px solid #f1f5f9;
-            }
-            QListWidget::item:hover {
-                background-color: #f8fafc;
-            }
-            QListWidget::indicator {
-                width: 18px;
-                height: 18px;
-                border: 2px solid #4361ee;
-                border-radius: 3px;
-                background-color: #ffffff;
-            }
-            QListWidget::indicator:checked {
-                background-color: #10b981;
-                border-color: #10b981;
-                image: url("data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-width%3D%224%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpolyline%20points%3D%2220%206%209%2017%204%2012%22%3E%3C%2Fpolyline%3E%3C%2Fsvg%3E");
-            }
-            QListWidget::indicator:unchecked {
-                background-color: #ffffff;
-            }
-        """)
+        self.folder_list.setSelectionMode(QAbstractItemView.NoSelection)
         self.folder_list.itemChanged.connect(self._on_folder_item_changed)
-        
-        folder_ctrls = QHBoxLayout()
-        btn_all = QPushButton("Tümü")
-        btn_all.setStyleSheet("background-color: #2563eb !important; color: #ffffff !important; font-weight: bold; padding: 4px 12px; font-size: 11px; border-radius: 4px;")
+        fld_layout.addWidget(self.folder_list)
+
+        fld_btns = QHBoxLayout()
+        btn_all = QPushButton("Tümünü Seç")
         btn_all.clicked.connect(self._select_all_folders)
-
-        btn_none = QPushButton("Temizle")
-        btn_none.setStyleSheet("background-color: #2563eb !important; color: #ffffff !important; font-weight: bold; padding: 4px 12px; font-size: 11px; border-radius: 4px;")
+        btn_none = QPushButton("Seçimi Kaldır")
         btn_none.clicked.connect(self._select_none_folders)
+        fld_btns.addWidget(btn_all)
+        fld_btns.addWidget(btn_none)
+        fld_btns.addStretch()
+        fld_layout.addLayout(fld_btns)
 
+        left_col.addWidget(folder_group)
+        main_split.addLayout(left_col, 1)
+
+        # Right Column: IMAP Target Server Setup
+        self.server_group = QGroupBox("4. Hedef IMAP Sunucusu ve Göç Ayarları")
+        sg_layout = QVBoxLayout(self.server_group)
+
+        # Saved Target Servers Combo
+        saved_srv_row = QHBoxLayout()
+        saved_srv_row.addWidget(QLabel("Kayıtlı Sunucular:"))
+        self.combo_saved_servers = QComboBox()
+        self.combo_saved_servers.currentIndexChanged.connect(self._on_saved_server_changed)
+        saved_srv_row.addWidget(self.combo_saved_servers, 1)
+        
+        self.btn_save_server = QPushButton("💾 Sunucuyu Kaydet")
+        self.btn_save_server.clicked.connect(self._save_target_server)
+        saved_srv_row.addWidget(self.btn_save_server)
+
+        self.btn_delete_server = QPushButton("🗑️")
+        self.btn_delete_server.setStyleSheet("color: #dc2626;")
+        self.btn_delete_server.clicked.connect(self._delete_target_server)
+        saved_srv_row.addWidget(self.btn_delete_server)
+        sg_layout.addLayout(saved_srv_row)
+
+        srv_grid = QVBoxLayout()
+        
+        h_row = QHBoxLayout()
+        h_row.addWidget(QLabel("Sunucu Adresi (Host):"))
+        self.input_host = QLineEdit()
+        self.input_host.setPlaceholderText("mail.example.com")
+        h_row.addWidget(self.input_host, 2)
+        h_row.addWidget(QLabel("Port:"))
+        self.input_port = QLineEdit("993")
+        self.input_port.setMaximumWidth(60)
+        h_row.addWidget(self.input_port)
+        self.chk_ssl = QCheckBox("SSL/TLS")
+        self.chk_ssl.setChecked(True)
+        h_row.addWidget(self.chk_ssl)
+        srv_grid.addLayout(h_row)
+
+        u_row = QHBoxLayout()
+        u_row.addWidget(QLabel("Kullanıcı Adı:"))
+        self.input_username = QLineEdit()
+        self.input_username.setPlaceholderText("user@example.com")
+        u_row.addWidget(self.input_username)
+        srv_grid.addLayout(u_row)
+
+        p_row = QHBoxLayout()
+        p_row.addWidget(QLabel("Şifre:"))
+        self.input_password = QLineEdit()
+        self.input_password.setEchoMode(QLineEdit.Password)
+        p_row.addWidget(self.input_password)
+        srv_grid.addLayout(p_row)
+
+        sg_layout.addLayout(srv_grid)
+
+        # Connection test
+        test_row = QHBoxLayout()
+        self.btn_test_target = QPushButton("🔌 Bağlantıyı Test Et")
+        self.btn_test_target.clicked.connect(self._test_target_connection)
+        self.lbl_target_test_status = QLabel("Durum: Test edilmedi")
+        self.lbl_target_test_status.setStyleSheet("color: #64748b;")
+        test_row.addWidget(self.btn_test_target)
+        test_row.addWidget(self.lbl_target_test_status, 1)
+        sg_layout.addLayout(test_row)
+
+        # Folder auto match
+        match_box = QFrame()
+        match_box.setStyleSheet("background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 6px; padding: 6px;")
+        mb_layout = QVBoxLayout(match_box)
+        mb_layout.addWidget(QLabel("<b>Sunucu Klasörlerini Algıla & Eşleştir:</b>"))
+        lbl_m_info = QLabel("Hedef sunucunun klasör ağacını okur ve aynı isimdeki standart klasörleri (Gelen, Giden vb.) otomatik seçer.")
+        lbl_m_info.setWordWrap(True)
+        lbl_m_info.setStyleSheet("color: #64748b; font-size: 10px;")
+        mb_layout.addWidget(lbl_m_info)
+        
         self.btn_fetch_server_folders = QPushButton("🔍 Sunucudan Oku ve Eşleştir")
-        self.btn_fetch_server_folders.setToolTip(
-            "Hedef IMAP sunucusuna bağlanarak sunucudaki klasör listesini okur ve "
-            "yerel klasörlerinizle eşleşen standart klasörleri (Gelen, Gönderilen, "
-            "Taslaklar, Çöp, Arşiv, Spam) otomatik olarak seçer."
-        )
-        self.btn_fetch_server_folders.setStyleSheet("background-color: #2563eb !important; color: #ffffff !important; font-weight: bold; padding: 4px 12px; font-size: 11px; border-radius: 4px;")
         self.btn_fetch_server_folders.clicked.connect(self._fetch_server_folders_and_recommend)
+        mb_layout.addWidget(self.btn_fetch_server_folders)
+        sg_layout.addWidget(match_box)
 
-        folder_ctrls.addWidget(btn_all)
-        folder_ctrls.addWidget(btn_none)
-        folder_ctrls.addWidget(self.btn_fetch_server_folders)
-        folder_ctrls.addStretch()
+        sg_layout.addStretch()
+        main_split.addWidget(self.server_group, 1)
+        layout.addLayout(main_split)
 
-        self.lbl_folder_summary = QLabel("Seçilen Klasörler: 0 / 0")
-        self.lbl_folder_summary.setStyleSheet("color:#10b981; font-weight:bold; font-size:11px;")
-        folder_ctrls.addWidget(self.lbl_folder_summary)
+        # Footer Dialog Buttons
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
 
-        warning_label = QLabel("⚠️ Hedef sunucuda eşleşen klasörlerin gönderilmesi önerilir.")
-        warning_label.setWordWrap(True)
-        warning_label.setStyleSheet("background-color:#fffbeb; color:#b45309; border:1px solid #fef3c7; border-radius:6px; padding:6px; font-size:11px; font-weight:bold;")
-        filters_layout.addWidget(warning_label)
-        filters_layout.addWidget(QLabel("Klasör Listesi:"))
-        filters_layout.addWidget(self.folder_list)
-        filters_layout.addLayout(folder_ctrls)
-
-        right_col.addWidget(filters_group)
-
-        main_columns_layout.addLayout(left_col, 1)
-        main_columns_layout.addLayout(right_col, 1)
-
-        scroll.setWidget(scroll_content)
-        layout.addWidget(scroll)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        b_ok = buttons.button(QDialogButtonBox.Ok)
-        if b_ok:
-            b_ok.setText("Uygula")
-            b_ok.setStyleSheet("background-color: #2563eb !important; color: #ffffff !important; font-weight: bold; padding: 8px 20px; border-radius: 6px; min-width: 90px;")
-        b_cancel = buttons.button(QDialogButtonBox.Cancel)
-        if b_cancel:
-            b_cancel.setText("İptal")
-            b_cancel.setStyleSheet("background-color: #2563eb !important; color: #ffffff !important; font-weight: bold; padding: 8px 20px; border-radius: 6px; min-width: 90px;")
-
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self._load_profiles()
+        self._load_saved_servers()
+        self._load_folders_from_db()
+        self._on_format_changed()
+        self._is_loading = False
 
     def _load_profiles(self):
         self.combo_profile.blockSignals(True)
         self.combo_profile.clear()
-        self.combo_profile.addItem("— Yeni Profil / Yapılandırma —", None)
+        self.combo_profile.addItem("Özel / Yeni Profil...", None)
         profiles = self.settings.get("export_profiles", [])
         for p in profiles:
             if isinstance(p, dict) and p.get("name"):
                 self.combo_profile.addItem(p["name"], p)
         self.combo_profile.blockSignals(False)
-        self._load_saved_servers()
 
     def _load_saved_servers(self):
-        if not hasattr(self, "combo_saved_servers"):
-            return
         self.combo_saved_servers.blockSignals(True)
         self.combo_saved_servers.clear()
-        self.combo_saved_servers.addItem("— Kayıtlı Sunucu Seçin —", None)
+        self.combo_saved_servers.addItem("Sunucu Seçiniz...", None)
         servers = self.settings.get("saved_target_servers", [])
         for s in servers:
             if isinstance(s, dict) and s.get("name"):
                 self.combo_saved_servers.addItem(s["name"], s)
         self.combo_saved_servers.blockSignals(False)
-
-    @Slot(int)
-    def _on_load_account_changed(self, idx: int):
-        if getattr(self, '_is_loading', False) or idx <= 0:
-            return
-        acc = self.combo_load_account.itemData(idx)
-        if not acc or not isinstance(acc, dict):
-            return
-            
-        self.input_host.setText(acc.get("imap_host", ""))
-        self.input_port.setText(str(acc.get("imap_port", 993)))
-        self.chk_ssl.setChecked(bool(acc.get("use_ssl", True)))
-        self.input_username.setText(acc.get("username") or acc.get("email") or "")
-        
-        pwd_enc = acc.get("password_encrypted", "")
-        if pwd_enc:
-            try:
-                dec_pwd = self.engine.crypto.decrypt(pwd_enc)
-                self.input_password.setText(dec_pwd)
-            except Exception:
-                self.input_password.clear()
-        else:
-            self.input_password.clear()
 
     @Slot(int)
     def _on_saved_server_changed(self, idx: int):
@@ -534,7 +771,6 @@ class ExportConfigDialog(QDialog):
         user = self.input_username.text().strip()
         srv_name = f"{host} ({user})" if user else host
 
-        from PySide6.QtWidgets import QInputDialog
         name, ok = QInputDialog.getText(self, "Sunucu Kaydet", "Sunucu Şablon Adı:", text=srv_name)
         if not ok or not name.strip():
             return
@@ -586,7 +822,6 @@ class ExportConfigDialog(QDialog):
     @Slot()
     def _copy_current_profile(self):
         curr_name = self.input_profile_name.text().strip() or "Yeni_Profil"
-        from PySide6.QtWidgets import QInputDialog
         new_name, ok = QInputDialog.getText(self, "Profili Çoğalt / Kopyala", "Yeni Profil Adını Giriniz:", text=f"{curr_name}_Kopya")
         if not ok or not new_name.strip():
             return
@@ -659,8 +894,6 @@ class ExportConfigDialog(QDialog):
                     rows = conn.execute(
                         "SELECT DISTINCT folder FROM mail_metadata WHERE is_deleted=0 ORDER BY folder ASC"
                     ).fetchall()
-
-            from infrastructure.imap_client import format_folder_display_name
             
             for r in rows:
                 orig_folder = r["folder"]
@@ -676,7 +909,7 @@ class ExportConfigDialog(QDialog):
                 
                 if is_rec:
                     item.setCheckState(Qt.Checked)
-                    item.setForeground(QColor("#2d6a4f"))
+                    item.setForeground(QColor("#15803d"))
                     f = item.font()
                     f.setBold(True)
                     item.setFont(f)
@@ -695,7 +928,7 @@ class ExportConfigDialog(QDialog):
         for i in range(self.folder_list.count()):
             item = self.folder_list.item(i)
             item.setCheckState(Qt.Checked)
-            item.setForeground(QColor("#10b981"))
+            item.setForeground(QColor("#15803d"))
             f = item.font()
             f.setBold(True)
             item.setFont(f)
@@ -727,7 +960,7 @@ class ExportConfigDialog(QDialog):
     @Slot(QListWidgetItem)
     def _on_folder_item_changed(self, item: QListWidgetItem):
         if item.checkState() == Qt.Checked:
-            item.setForeground(QColor("#10b981"))
+            item.setForeground(QColor("#15803d"))
             f = item.font()
             f.setBold(True)
             item.setFont(f)
@@ -759,6 +992,8 @@ class ExportConfigDialog(QDialog):
             path, _ = QFileDialog.getSaveFileName(self, "Hedef JSON Dosyasını Seçin", "", "JSON Files (*.json)")
         elif fmt == "MBOX":
             path, _ = QFileDialog.getSaveFileName(self, "Hedef MBOX Dosyasını Seçin", "", "MBOX Files (*.mbox)")
+        elif fmt == "PST":
+            path, _ = QFileDialog.getSaveFileName(self, "Hedef PST Dosyasını Seçin", "", "Outlook PST Files (*.pst)")
         else:
             path = QFileDialog.getExistingDirectory(self, "Hedef Dizin Seçin")
         if path:
@@ -847,25 +1082,7 @@ class ExportConfigDialog(QDialog):
         self._load_profiles()
 
     @Slot()
-    def _delete_selected_profile(self):
-        idx = self.combo_profile.currentIndex()
-        prof = self.combo_profile.itemData(idx)
-        if not prof or not isinstance(prof, dict):
-            return
-
-        reply = QMessageBox.question(self, "Sil", f"'{prof.get('name')}' profilini silmek istediğinizden emin misiniz?")
-        if reply == QMessageBox.Yes:
-            profiles = self.settings.get("export_profiles", [])
-            profiles = [p for p in profiles if p.get("name") != prof.get("name")]
-            self.settings.set("export_profiles", profiles)
-            self.settings.save()
-            
-            QMessageBox.information(self, "Silindi", "Profil silindi.")
-            self._load_profiles()
-
-    @Slot()
     def _test_target_connection(self):
-        import time
         import socket
         import ssl as ssl_lib
 
@@ -882,7 +1099,7 @@ class ExportConfigDialog(QDialog):
 
         self.btn_test_target.setEnabled(False)
         self.lbl_target_test_status.setText("⏳ Sunucu yanıt süresi ve yetenekleri test ediliyor...")
-        self.lbl_target_test_status.setStyleSheet("color: #4361ee;")
+        self.lbl_target_test_status.setStyleSheet("color: #2563eb;")
 
         def test():
             start_time = time.time()
@@ -902,54 +1119,18 @@ class ExportConfigDialog(QDialog):
                 duration_ms = int((time.time() - start_time) * 1000)
                 client.logout()
 
-                success_msg = f"✅ Bağlantı Başarılı ({duration_ms} ms) | Port: {port} (SSL: {'Aktif' if use_ssl else 'Pasif'})\nYetki/Modül: {str(caps_str)[:70]}..."
+                success_msg = f"✅ Bağlantı Başarılı ({duration_ms} ms) | Port: {port} (SSL: {'Aktif' if use_ssl else 'Pasif'})"
                 self.lbl_target_test_status.setText(success_msg)
-                self.lbl_target_test_status.setStyleSheet("color: #2d6a4f;")
-
-                detailed_log = (
-                    f"🔌 [IMAP Bağlantı Testi Başarılı] Host: {host}:{port} | SSL: {use_ssl} | "
-                    f"Kullanıcı: {user} | Yanıt Süresi: {duration_ms} ms | Yetenekler: {caps_str}"
-                )
-                logger.info(detailed_log)
-                if self.parent() and hasattr(self.parent(), '_log_signal'):
-                    self.parent()._log_signal.emit(detailed_log)
-
-            except socket.gaierror as e:
-                err_text = f"❌ DNS / Sunucu Adresi Bulunamadı ({host})"
-                self.lbl_target_test_status.setText(err_text)
-                self.lbl_target_test_status.setStyleSheet("color: #e63946;")
-                logger.error("IMAP Test Error: DNS resolution failed for %s: %s", host, e)
-                if self.parent() and hasattr(self.parent(), '_log_signal'):
-                    self.parent()._log_signal.emit(f"❌ [IMAP Test Hatası] Sunucu adresi çözülemedi ({host}): {e}")
-
-            except (TimeoutError, socket.timeout) as e:
-                err_text = f"❌ Zaman Aşımı! ({host}:{port_str} yanıt vermiyor)"
-                self.lbl_target_test_status.setText(err_text)
-                self.lbl_target_test_status.setStyleSheet("color: #e63946;")
-                logger.error("IMAP Test Error: Connection timeout for %s:%s: %s", host, port_str, e)
-                if self.parent() and hasattr(self.parent(), '_log_signal'):
-                    self.parent()._log_signal.emit(f"❌ [IMAP Test Hatası] Sunucu bağlantı zaman aşımı ({host}:{port_str}): {e}")
-
-            except ssl_lib.SSLError as e:
-                err_text = f"❌ SSL/TLS Sertifika veya Port Hatası"
-                self.lbl_target_test_status.setText(err_text)
-                self.lbl_target_test_status.setStyleSheet("color: #e63946;")
-                logger.error("IMAP Test Error: SSL failure for %s:%s: %s", host, port_str, e)
-                if self.parent() and hasattr(self.parent(), '_log_signal'):
-                    self.parent()._log_signal.emit(f"❌ [IMAP Test Hatası] SSL/TLS El sıkışma hatası ({host}:{port_str}): {e}")
+                self.lbl_target_test_status.setStyleSheet("color: #15803d;")
 
             except Exception as e:
                 err_msg = str(e)
-                if "AUTHENTICATIONFAILED" in err_msg.upper() or "LOGIN" in err_msg.upper() or "AUTHENTICATE" in err_msg.upper():
-                    err_text = f"❌ Kimlik Doğrulama Başarısız (Kullanıcı adı veya şifre hatalı)"
+                if "AUTHENTICATIONFAILED" in err_msg.upper() or "LOGIN" in err_msg.upper():
+                    err_text = "❌ Kimlik Doğrulama Başarısız (Kullanıcı adı veya şifre hatalı)"
                 else:
-                    err_text = f"❌ Bağlantı Hatası: {err_msg[:60]}"
+                    err_text = f"❌ Bağlantı Hatası: {err_msg[:50]}"
                 self.lbl_target_test_status.setText(err_text)
-                self.lbl_target_test_status.setStyleSheet("color: #e63946;")
-                logger.error("IMAP Test Error: %s", e)
-                if self.parent() and hasattr(self.parent(), '_log_signal'):
-                    self.parent()._log_signal.emit(f"❌ [IMAP Test Hatası] {e}")
-
+                self.lbl_target_test_status.setStyleSheet("color: #dc2626;")
             finally:
                 self.btn_test_target.setEnabled(True)
 
@@ -978,8 +1159,6 @@ class ExportConfigDialog(QDialog):
                     client = imaplib.IMAP4(host, port, timeout=15)
                 
                 client.login(user, pwd)
-                from infrastructure.imap_client import decode_imap_utf7
-
                 list_re = re.compile(
                     r'\((?P<flags>[^)]*)\)\s+"(?P<delim>[^"]*)"\s+(?:"(?P<name_quoted>[^"]*)"|(?P<name_unquoted>[^\s]+))'
                 )
@@ -1032,9 +1211,7 @@ class ExportConfigDialog(QDialog):
 
     @Slot(list)
     def _on_match_completed(self, target_types):
-        from infrastructure.imap_client import decode_imap_utf7
         self.folder_list.blockSignals(True)
-        
         matched_count = 0
         for i in range(self.folder_list.count()):
             item = self.folder_list.item(i)
@@ -1051,7 +1228,6 @@ class ExportConfigDialog(QDialog):
                 pass
             
             decoded_lower = decoded.lower()
-            
             folder_type = decoded_lower
             if 'sent' in decoded_lower or 'giden' in decoded_lower:
                 folder_type = 'sent'
@@ -1068,7 +1244,7 @@ class ExportConfigDialog(QDialog):
 
             if folder_type in target_types:
                 item.setCheckState(Qt.Checked)
-                item.setForeground(QColor("#2d6a4f"))
+                item.setForeground(QColor("#15803d"))
                 f = item.font()
                 f.setBold(True)
                 item.setFont(f)
@@ -1100,129 +1276,416 @@ class ExportConfigDialog(QDialog):
         QMessageBox.critical(self, "Bağlantı Hatası", f"Sunucu klasörleri okunurken hata oluştu:\n{err_msg}")
 
 
+# ---------------------------------------------------------------------------
+# High Contrast, Modern Export Confirmation Dialog
+# ---------------------------------------------------------------------------
+
 class ExportConfirmDialog(QDialog):
     def __init__(self, account_previews: list, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Dışa Aktarım Planını Onayla")
-        self.resize(950, 500)
+        self.setWindowTitle("Dışa Aktarım & Sunucu Göçü Önizleme Raporu")
+        self.resize(980, 620)
+        self.setMinimumSize(850, 520)
         self.setStyleSheet("""
             QDialog {
                 background-color: #f8fafc;
             }
-            QPushButton, QDialogButtonBox QPushButton {
-                background-color: #2563eb !important;
-                color: #ffffff !important;
-                font-weight: bold;
-                font-size: 13px;
-                padding: 10px 24px;
+            QLabel {
+                color: #0f172a;
+            }
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+            }
+            QTableWidget {
+                color: #0f172a;
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                gridline-color: #f1f5f9;
                 border-radius: 6px;
-                border: none;
-                min-width: 110px;
-                min-height: 28px;
+                font-size: 12px;
             }
-            QPushButton:hover, QDialogButtonBox QPushButton:hover {
-                background-color: #1d4ed8 !important;
+            QHeaderView::section {
+                background-color: #1e3a8a;
                 color: #ffffff !important;
-            }
-            QPushButton:pressed, QDialogButtonBox QPushButton:pressed {
-                background-color: #1e40af !important;
-                color: #ffffff !important;
-            }
-            QPushButton:disabled, QDialogButtonBox QPushButton:disabled {
-                background-color: #94a3b8 !important;
-                color: #f8fafc !important;
+                font-weight: 700;
+                padding: 8px 10px;
+                border: 1px solid #1e40af;
+                font-size: 11.5px;
             }
         """)
+        
+        self.previews = account_previews
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(12)
-
-        header_layout = QHBoxLayout()
-        header_icon = QLabel("📊")
-        header_icon.setStyleSheet("font-size: 24px;")
-        header_layout.addWidget(header_icon)
         
-        header_title = QLabel(f"<b>Dışa Aktarım Planı Detayları</b><br/>{len(account_previews)} adet hesabın verileri aktarılacaktır:")
-        header_title.setStyleSheet("font-size: 13px; color: #1e293b;")
-        header_layout.addWidget(header_title, 1)
-        layout.addLayout(header_layout)
-
-        table = QTableWidget()
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels([
-            "Hesap Adı / E-Posta", "Format", "Hedef Dosya / Dizin", "Klasör Sayısı", "Aktarılacak Mail Sayısı"
-        ])
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        table.setSelectionBehavior(QTableWidget.SelectRows)
-        table.setEditTriggers(QTableWidget.NoEditTriggers)
-        table.setAlternatingRowColors(True)
-        table.verticalHeader().setVisible(False)
-        table.setStyleSheet("""
-            QTableWidget {
+        # 1. Header Frame
+        header_frame = QFrame()
+        header_frame.setStyleSheet("""
+            QFrame {
                 background-color: #ffffff;
-                alternate-background-color: #f8fafc;
-                border: 1px solid #e2e8f0;
-                border-radius: 6px;
-                color: #1e293b;
-                font-size: 11px;
+                border: 1.5px solid #cbd5e1;
+                border-radius: 8px;
             }
         """)
-
-        total_mails = 0
-        table.setRowCount(len(account_previews))
-        for i, prev in enumerate(account_previews):
-            table.setItem(i, 0, QTableWidgetItem(prev["label"]))
-            table.setItem(i, 1, QTableWidgetItem(prev["format"]))
-            table.setItem(i, 2, QTableWidgetItem(prev["resolved_target"]))
-            table.setItem(i, 3, QTableWidgetItem(str(prev["folders"])))
-            table.setItem(i, 4, QTableWidgetItem(str(prev["mails"])))
-            total_mails += prev["mails"]
-
-        layout.addWidget(table)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btn_ok = btns.button(QDialogButtonBox.Ok)
-        if btn_ok:
-            btn_ok.setText("Evet, Başlat")
-            btn_ok.setStyleSheet("background-color: #2563eb !important; color: #ffffff !important; font-weight: bold; padding: 10px 24px; border-radius: 6px; font-size: 13px; min-width: 110px;")
-
-        btn_cancel = btns.button(QDialogButtonBox.Cancel)
-        if btn_cancel:
-            btn_cancel.setText("İptal")
-            btn_cancel.setStyleSheet("background-color: #2563eb !important; color: #ffffff !important; font-weight: bold; padding: 10px 24px; border-radius: 6px; font-size: 13px; min-width: 110px;")
-
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
+        header_layout = QHBoxLayout(header_frame)
+        header_layout.setContentsMargins(16, 10, 16, 10)
+        header_layout.setSpacing(12)
+        
+        header_icon = QLabel("📤")
+        header_icon.setStyleSheet("font-size: 28px; background: transparent; border: none;")
+        header_layout.addWidget(header_icon)
+        
+        header_text_vbox = QVBoxLayout()
+        header_text_vbox.setSpacing(2)
+        
+        title_lbl = QLabel("DIŞA AKTARIM & SUNUCU GÖÇÜ ÖNİZLEME RAPORU")
+        title_lbl.setStyleSheet("font-size: 15px; font-weight: 800; color: #1e3a8a; background: transparent; border: none;")
+        
+        subtitle_lbl = QLabel("Aşağıdaki hesap ve klasör verileri seçilen biçimde dışa aktarılacak veya hedef IMAP sunucusuna taşınacaktır.")
+        subtitle_lbl.setStyleSheet("font-size: 11.5px; color: #64748b; background: transparent; border: none;")
+        
+        header_text_vbox.addWidget(title_lbl)
+        header_text_vbox.addWidget(subtitle_lbl)
+        header_layout.addLayout(header_text_vbox, stretch=1)
+        layout.addWidget(header_frame)
+        
+        # 2. Summary KPI Cards
+        total_accounts = len(self.previews)
+        total_estimated_mails = sum(p.get("mails", 0) for p in self.previews)
+        total_folders = sum(p.get("folders", 0) for p in self.previews)
+        
+        kpi_layout = QHBoxLayout()
+        kpi_layout.setSpacing(10)
+        
+        kpi_data = [
+            ("Seçilen Hesap", f"{total_accounts} Adet", "#2563eb", "👥"),
+            ("Aktarılacak Klasör", f"{total_folders} Klasör", "#0284c7", "📁"),
+            ("Aktarılacak Mail", f"{total_estimated_mails:,} E-Posta", "#10b981", "✉️"),
+        ]
+        
+        for k_title, k_val, k_color, k_icon in kpi_data:
+            card = QFrame()
+            card.setStyleSheet("""
+                QFrame {
+                    background-color: #ffffff;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 8px;
+                }
+            """)
+            c_lyt = QVBoxLayout(card)
+            c_lyt.setContentsMargins(12, 8, 12, 8)
+            c_lyt.setSpacing(2)
+            
+            lbl_t = QLabel(f"{k_icon} {k_title.upper()}")
+            lbl_t.setStyleSheet("font-size: 10.5px; font-weight: 700; color: #64748b; background: transparent; border: none;")
+            lbl_t.setAlignment(Qt.AlignCenter)
+            
+            lbl_v = QLabel(k_val)
+            lbl_v.setStyleSheet(f"font-size: 16px; font-weight: 800; color: {k_color}; background: transparent; border: none;")
+            lbl_v.setAlignment(Qt.AlignCenter)
+            
+            c_lyt.addWidget(lbl_t)
+            c_lyt.addWidget(lbl_v)
+            kpi_layout.addWidget(card)
+            
+        layout.addLayout(kpi_layout)
+        
+        # 3. Main Body Splitter Layout
+        body_layout = QHBoxLayout()
+        body_layout.setSpacing(12)
+        
+        left_box = QGroupBox(f"Hesap Listesi ({len(self.previews)})")
+        left_box.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #1e3a8a;
+                font-size: 12px;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 14px;
+                background-color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 4px;
+            }
+        """)
+        left_layout = QVBoxLayout(left_box)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        
+        self.account_list_widget = QListWidget()
+        self.account_list_widget.setStyleSheet("""
+            QListWidget {
+                border: 1px solid #e2e8f0;
+                background-color: #f8fafc;
+                border-radius: 6px;
+                color: #0f172a;
+            }
+            QListWidget::item {
+                padding: 8px 10px;
+                border-bottom: 1px solid #e2e8f0;
+                border-radius: 4px;
+                margin-bottom: 2px;
+            }
+            QListWidget::item:hover {
+                background-color: #e0e7ff;
+            }
+            QListWidget::item:selected {
+                background-color: #2563eb;
+                color: #ffffff !important;
+                font-weight: bold;
+            }
+        """)
+        
+        for idx, p in enumerate(self.previews):
+            lbl_text = p.get("label", f"Hesap #{idx+1}")
+            mail_cnt = p.get("mails", 0)
+            item = QListWidgetItem(f"👤 {lbl_text} ({mail_cnt} mail)")
+            item.setData(Qt.UserRole, idx)
+            self.account_list_widget.addItem(item)
+            
+        self.account_list_widget.currentRowChanged.connect(self._load_preview)
+        left_layout.addWidget(self.account_list_widget)
+        body_layout.addWidget(left_box, stretch=1)
+        
+        right_box = QGroupBox("Seçili Hesap Aktarım ve Hedef Detayları")
+        right_box.setStyleSheet(left_box.styleSheet())
+        right_layout = QVBoxLayout(right_box)
+        right_layout.setContentsMargins(10, 10, 10, 10)
+        right_layout.setSpacing(8)
+        
+        info_bar = QFrame()
+        info_bar.setStyleSheet("background-color: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px;")
+        info_bar_lyt = QVBoxLayout(info_bar)
+        info_bar_lyt.setContentsMargins(8, 6, 8, 6)
+        info_bar_lyt.setSpacing(4)
+        
+        self.lbl_acc_name_details = QLabel("<b>Hesap:</b> —")
+        self.lbl_acc_name_details.setStyleSheet("font-size: 12px; color: #1e293b; background: transparent; border: none;")
+        
+        self.lbl_format_details = QLabel("<b>Biçim:</b> ZIP   •   <b>Hedef:</b> data/exports")
+        self.lbl_format_details.setStyleSheet("font-size: 11.5px; color: #334155; background: transparent; border: none;")
+        self.lbl_format_details.setWordWrap(True)
+        
+        info_bar_lyt.addWidget(self.lbl_acc_name_details)
+        info_bar_lyt.addWidget(self.lbl_format_details)
+        right_layout.addWidget(info_bar)
+        
+        self.summary_table = QTableWidget()
+        self.summary_table.setColumnCount(3)
+        self.summary_table.setHorizontalHeaderLabels(["Özellik", "Değer", "Durum"])
+        self.summary_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.summary_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.summary_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.summary_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.summary_table.setAlternatingRowColors(True)
+        self.summary_table.verticalHeader().setVisible(False)
+        right_layout.addWidget(self.summary_table)
+        
+        body_layout.addWidget(right_box, stretch=2)
+        layout.addLayout(body_layout)
+        
+        # 4. Footer Buttons
+        footer_layout = QHBoxLayout()
+        footer_layout.setContentsMargins(0, 4, 0, 0)
+        footer_layout.setSpacing(10)
+        
+        btn_cancel = QPushButton("✕ Vazgeç")
+        btn_cancel.setCursor(Qt.PointingHandCursor)
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #64748b;
+                color: #ffffff;
+                font-weight: 700;
+                padding: 9px 22px;
+                border-radius: 6px;
+                font-size: 12px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #475569;
+            }
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        
+        btn_ok = QPushButton("⚡ Dışa Aktarımı Başlat")
+        btn_ok.setCursor(Qt.PointingHandCursor)
+        btn_ok.setStyleSheet("""
+            QPushButton {
+                background-color: #16a34a;
+                color: #ffffff;
+                font-weight: 800;
+                padding: 9px 28px;
+                border-radius: 6px;
+                font-size: 12.5px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #15803d;
+            }
+        """)
+        btn_ok.clicked.connect(self.accept)
+        
+        footer_layout.addStretch()
+        footer_layout.addWidget(btn_cancel)
+        footer_layout.addWidget(btn_ok)
+        layout.addLayout(footer_layout)
+        
+        if self.previews:
+            self.account_list_widget.setCurrentRow(0)
+            self._load_preview(0)
+            
+    def _load_preview(self, idx: int):
+        if idx < 0 or idx >= len(self.previews):
+            return
+            
+        p = self.previews[idx]
+        acc_label = p.get("label", "?")
+        fmt = p.get("format", "ZIP")
+        tgt = p.get("resolved_target", "data/exports")
+        mails = p.get("mails", 0)
+        folders = p.get("folders", 0)
+        
+        self.lbl_acc_name_details.setText(f"<b>Hesap:</b> <span style='color:#2563eb;'>{acc_label}</span>")
+        self.lbl_format_details.setText(f"<b>Biçim:</b> <span style='color:#059669;'>{fmt}</span>   •   <b>Hedef:</b> <span style='color:#0f172a;'>{tgt}</span>")
+        
+        rows_data = [
+            ("Biçim / Hedef Türü", fmt, "Hazır"),
+            ("Hedef Yol / Sunucu", tgt, "Geçerli"),
+            ("Arşivdeki Toplam E-Posta", f"{mails:,} Adet", "Aktarılacak" if mails > 0 else "Boş"),
+            ("Toplam Klasör Sayısı", f"{folders} Klasör", "Hazır"),
+        ]
+        
+        self.summary_table.setRowCount(len(rows_data))
+        for row, (prop, val, st) in enumerate(rows_data):
+            self.summary_table.setItem(row, 0, QTableWidgetItem(prop))
+            self.summary_table.setItem(row, 1, QTableWidgetItem(val))
+            st_item = QTableWidgetItem(st)
+            st_item.setTextAlignment(Qt.AlignCenter)
+            if "Aktarılacak" in st or "Hazır" in st or "Geçerli" in st:
+                st_item.setForeground(QColor("#16a34a"))
+            self.summary_table.setItem(row, 2, st_item)
 
 
 # ---------------------------------------------------------------------------
-# Main ExportPanel (ThreePanel Workspace Layout)
+# Export Finished Dialog (with countdown)
+# ---------------------------------------------------------------------------
+
+class ExportFinishedDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("İşlem Tamamlandı")
+        self.setMinimumWidth(440)
+        self.setStyleSheet(GLOBAL_MSG_STYLE)
+
+        self._remaining_seconds = 5
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        lbl_title = QLabel("✅ E-Posta Dışa Aktarım İşlemi Tamamlandı!")
+        lbl_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        lbl_title.setStyleSheet("color: #10b981;")
+        layout.addWidget(lbl_title)
+
+        lbl_msg = QLabel("Detaylı aktarım raporunu görüntülemek ister misiniz?")
+        lbl_msg.setWordWrap(True)
+        lbl_msg.setStyleSheet("color: #1e293b; font-size: 12px;")
+        layout.addWidget(lbl_msg)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+
+        self.btn_no = QPushButton("Hayır (Kapat)")
+        self.btn_no.setStyleSheet("background-color: #64748b; color: white; font-weight: bold; border-radius: 6px; padding: 6px 14px;")
+        self.btn_no.clicked.connect(self._on_no_clicked)
+        btn_layout.addWidget(self.btn_no)
+
+        self.btn_yes = QPushButton(f"Evet ({self._remaining_seconds}sn sonra otomatik açılacak)")
+        self.btn_yes.setDefault(True)
+        self.btn_yes.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; border-radius: 6px; padding: 6px 16px;")
+        self.btn_yes.clicked.connect(self._on_yes_clicked)
+        btn_layout.addWidget(self.btn_yes)
+
+        layout.addLayout(btn_layout)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._on_timer_tick)
+        self._timer.start()
+
+    def _on_timer_tick(self):
+        self._remaining_seconds -= 1
+        if self._remaining_seconds <= 0:
+            self._timer.stop()
+            self.accept()
+        else:
+            self.btn_yes.setText(f"Evet ({self._remaining_seconds}sn sonra otomatik açılacak)")
+
+    def _on_yes_clicked(self):
+        self._timer.stop()
+        self.accept()
+
+    def _on_no_clicked(self):
+        self._timer.stop()
+        self.reject()
+
+
+# ---------------------------------------------------------------------------
+# Main ExportPanel (Unified 3-Section Ergonomic Layout matching SyncPanel)
 # ---------------------------------------------------------------------------
 
 class ExportPanel(QWidget):
-    """Full-page panel for configuring export definitions & running server migrations with 3 panels."""
+    """
+    Email export & server migration panel with asynchronous background scanning,
+    default 88px row height, live row progress bars, collapsible log drawer,
+    and modular sidebar integration.
+    """
 
     _log_signal = Signal(str)
-    _progress_signal = Signal(int, str, int, int, object)
-    _export_done_signal = Signal(int, object)
-    _export_error_signal = Signal(int, str)
-    _overall_progress_signal = Signal(int)
+    _account_progress_signal = Signal(int, str, int, int, object)
+    _account_export_done_signal = Signal(int, object)
+    _account_export_error_signal = Signal(int, str)
     _export_all_finished_signal = Signal()
 
-    def __init__(self, engine: MailEngine, parent=None):
+    def __init__(self, engine: MailEngine, parent=None, settings: AppSettings = None):
         super().__init__(parent)
         self.engine = engine
-        self.settings = AppSettings()
+        self.settings = settings or AppSettings()
         
-        self._active_exports = {}
-        self._accounts_ui = {}
+        # Active workers tracking
+        self._active_exports: Dict[int, Any] = {}
+        self._accounts_ui: Dict[int, Dict[str, Any]] = {}
+        self._stats_labels_map: Dict[int, QLabel] = {}
+        self._session_reports: List[Dict[str, Any]] = []
+        self._selected_group = "__ALL__"
         self._all_selected_flag = False
+        self._is_paused = False
+        self._pause_event = threading.Event()
+        self._pause_event.set()
+        self._cancel_event = threading.Event()
+
+        # Row Height State
+        saved_h = self.settings.get("export_panel_row_height", 88)
+        self._current_row_height = int(saved_h) if saved_h else 88
+
+        # Log Model Setup
+        self._log_model = LogTableModel(self)
+        self._log_proxy = LogFilterProxy(self)
+        self._log_proxy.setSourceModel(self._log_model)
+
+        # Background worker ref
+        self._loader_worker: Optional[ExportDataLoaderWorker] = None
+        self._is_refreshing = False
+
         self._current_config = {
             "format": "ZIP",
             "target_path": str(Path("data/exports")),
@@ -1237,354 +1700,1086 @@ class ExportPanel(QWidget):
         }
 
         self._setup_ui()
-        self.refresh()
-
+        self._connect_signals()
+        
+        # Internal Signals
         self._log_signal.connect(self._on_log_message)
-        self._progress_signal.connect(self._on_export_progress)
-        self._export_done_signal.connect(self._on_export_done)
-        self._export_error_signal.connect(self._on_export_error)
-        self._overall_progress_signal.connect(self._on_overall_progress)
+        self._account_progress_signal.connect(self._on_account_progress)
+        self._account_export_done_signal.connect(self._on_account_export_done)
+        self._account_export_error_signal.connect(self._on_account_export_error)
         self._export_all_finished_signal.connect(self._on_export_all_finished)
 
+        self.refresh()
+
     def _setup_ui(self):
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_vbox = QVBoxLayout(self)
+        main_vbox.setContentsMargins(8, 6, 8, 6)
+        main_vbox.setSpacing(6)
 
-        # -------------------------------------------------------------------
-        # ThreePanel Workspace Container
-        # -------------------------------------------------------------------
-        self.workspace = ThreePanelWorkspaceTemplate(title="Export & Server Migration Workspace", parent=self)
-        main_layout.addWidget(self.workspace)
-
-        # Build Left Panel (Sol Panel: Domain & Group Filters)
-        self._setup_left_panel()
-
-        # Build Center Panel (Orta Panel: Pro Grid Table)
-        self._setup_center_panel()
-
-        # Build Right Panel (Sağ Panel: Operations & Live Logs)
-        self._setup_right_panel()
-
-        # Load persisted layout states
-        self.workspace.load_splitter_state(self.settings, "export_workspace")
-        self.grid.load_grid_state()
-
-    # -----------------------------------------------------------------------
-    # Sol Panel Setup
-    # -----------------------------------------------------------------------
-    def _setup_left_panel(self):
-        left_layout = self.workspace.left_inner_layout
-
-        # Domain Filter Combo
-        left_layout.addWidget(QLabel("🌐 Domain Filtresi:"))
-        self.combo_domain = QComboBox()
-        self.combo_domain.setStyleSheet("""
-            QComboBox {
-                background-color: #ffffff;
-                color: #0f172a;
+        # ----------------------------------------------------------------
+        # 1. TOP TOOLBAR: Minimalist, Search & Quick Stats
+        # ----------------------------------------------------------------
+        self.top_bar = QFrame()
+        self.top_bar.setStyleSheet("""
+            QFrame {
+                background: #ffffff;
                 border: 1px solid #cbd5e1;
-                border-radius: 5px;
-                padding: 5px;
-                font-size: 11px;
+                border-radius: 8px;
+                padding: 2px;
             }
         """)
-        self.combo_domain.currentIndexChanged.connect(self._apply_filters)
-        left_layout.addWidget(self.combo_domain)
+        top_layout = QHBoxLayout(self.top_bar)
+        top_layout.setContentsMargins(8, 4, 8, 4)
+        top_layout.setSpacing(8)
 
-        # Group Filter Combo
-        left_layout.addWidget(QLabel("👥 Grup Filtresi:"))
-        self.combo_group = QComboBox()
-        self.combo_group.setStyleSheet(self.combo_domain.styleSheet())
-        self.combo_group.currentIndexChanged.connect(self._apply_filters)
-        left_layout.addWidget(self.combo_group)
+        # Left Sidebar Toggle Button
+        self.btn_toggle_left = QPushButton("◀ Grupları Gizle")
+        self.btn_toggle_left.setToolTip("Sol Grup/Domain filtre panelini gizler/gösterir")
+        self.btn_toggle_left.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_left.setStyleSheet(self._toggle_btn_style())
+        self.btn_toggle_left.clicked.connect(self._toggle_left_sidebar)
+        top_layout.addWidget(self.btn_toggle_left)
 
-        left_layout.addSpacing(10)
-
-        # Quick Select Action Buttons
-        self.btn_select_all = QPushButton("✔️ Tümünü Seç")
-        self.btn_select_all.setStyleSheet("""
-            QPushButton {
-                background-color: #e0e7ff;
-                color: #3730a3;
-                font-weight: bold;
-                border: 1px solid #c7d2fe;
-                border-radius: 5px;
-                padding: 6px;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #c7d2fe; }
-        """)
-        self.btn_select_all.clicked.connect(lambda: self._set_all_checkboxes(True))
-        left_layout.addWidget(self.btn_select_all)
-
-        self.btn_deselect_all = QPushButton("❌ Seçimleri Temizle")
-        self.btn_deselect_all.setStyleSheet("""
-            QPushButton {
-                background-color: #f1f5f9;
-                color: #475569;
-                font-weight: bold;
-                border: 1px solid #cbd5e1;
-                border-radius: 5px;
-                padding: 6px;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #e2e8f0; }
-        """)
-        self.btn_deselect_all.clicked.connect(lambda: self._set_all_checkboxes(False))
-        left_layout.addWidget(self.btn_deselect_all)
-
-        self.btn_reset_filters = QPushButton("🔄 Filtreleri Sıfırla")
-        self.btn_reset_filters.setStyleSheet(self.btn_deselect_all.styleSheet())
-        self.btn_reset_filters.clicked.connect(self._reset_filters)
-        left_layout.addWidget(self.btn_reset_filters)
-
-        left_layout.addStretch()
-
-        # Status Summary Badge in Left Sidebar
-        self.lbl_left_summary = QLabel("Hesaplar yükleniyor...")
-        self.lbl_left_summary.setWordWrap(True)
-        self.lbl_left_summary.setStyleSheet("""
-            QLabel {
-                background-color: #f8fafc;
-                color: #334155;
-                border: 1px solid #e2e8f0;
+        # Search Input
+        self.txt_search_export = QLineEdit()
+        self.txt_search_export.setPlaceholderText("🔍 Hesap Adı, E-Posta veya Domain Grubu Ara...")
+        self.txt_search_export.setClearButtonEnabled(True)
+        self.txt_search_export.setStyleSheet("""
+            QLineEdit {
+                border: 1.5px solid #cbd5e1;
                 border-radius: 6px;
-                padding: 8px;
+                padding: 4px 8px;
+                background-color: #f8fafc;
+                color: #0f172a;
+                font-size: 11.5px;
+            }
+            QLineEdit:focus {
+                border-color: #2563eb;
+                background-color: #ffffff;
+            }
+        """)
+        self.txt_search_export.textChanged.connect(self._filter_table_rows)
+        top_layout.addWidget(self.txt_search_export, stretch=1)
+
+        # Statistics Badges
+        self.lbl_stat_total = QLabel("📊 0 Hesap")
+        self.lbl_stat_total.setStyleSheet(self._badge_style(bg="#e0e7ff", fg="#1e3a8a"))
+        top_layout.addWidget(self.lbl_stat_total)
+
+        self.lbl_stat_selected = QLabel("☑️ 0 Seçili")
+        self.lbl_stat_selected.setStyleSheet(self._badge_style(bg="#fef3c7", fg="#b45309"))
+        top_layout.addWidget(self.lbl_stat_selected)
+
+        self.lbl_stat_active = QLabel("🟢 0 Aktarılıyor")
+        self.lbl_stat_active.setStyleSheet(self._badge_style(bg="#dcfce7", fg="#15803d"))
+        top_layout.addWidget(self.lbl_stat_active)
+
+        # Refresh button
+        self.btn_refresh = QPushButton("🔄 Yenile")
+        self.btn_refresh.setCursor(Qt.PointingHandCursor)
+        self.btn_refresh.setStyleSheet("""
+            QPushButton {
+                background-color: #ffffff;
+                color: #1e3a8a;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11.5px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #f1f5f9; border-color: #2563eb; }
+        """)
+        self.btn_refresh.clicked.connect(self._check_disk_and_refresh)
+        top_layout.addWidget(self.btn_refresh)
+
+        # Right Sidebar Toggle Button
+        self.btn_toggle_right = QPushButton("⚙️ İşlemler ▶")
+        self.btn_toggle_right.setToolTip("Sağ işlem ve ayar çekmecesini gizler/gösterir")
+        self.btn_toggle_right.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_right.setStyleSheet(self._toggle_btn_style())
+        self.btn_toggle_right.clicked.connect(self._toggle_right_sidebar)
+        top_layout.addWidget(self.btn_toggle_right)
+
+        main_vbox.addWidget(self.top_bar)
+
+        # ----------------------------------------------------------------
+        # 2. 3-COLUMN SPLIT LAYOUT
+        # ----------------------------------------------------------------
+        split_layout = QHBoxLayout()
+        split_layout.setSpacing(2)
+        split_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 1. Left Sidebar: Account Group Widget
+        self.left_sidebar = AccountGroupSidebarWidget(self)
+        self.left_sidebar.setFixedWidth(230)
+        split_layout.addWidget(self.left_sidebar)
+
+        # Middle Arrow Toggle for Left Sidebar
+        self.btn_middle_toggle_left = QPushButton("◀")
+        self.btn_middle_toggle_left.setToolTip("Sol Filtre Panelini Gizle / Göster")
+        self.btn_middle_toggle_left.setFixedWidth(16)
+        self.btn_middle_toggle_left.setCursor(Qt.PointingHandCursor)
+        self.btn_middle_toggle_left.setStyleSheet("""
+            QPushButton {
+                background-color: #e2e8f0;
+                color: #334155;
+                border: 1px solid #cbd5e1;
+                border-left: none;
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+                border-top-left-radius: 0px;
+                border-bottom-left-radius: 0px;
+                font-weight: bold;
+                font-size: 10px;
+                padding: 0px;
+                min-height: 50px;
+                max-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+                color: #ffffff;
+                border-color: #1d4ed8;
+            }
+        """)
+        self.btn_middle_toggle_left.clicked.connect(self._toggle_left_sidebar)
+        split_layout.addWidget(self.btn_middle_toggle_left)
+
+        # 2. Center: DBGrid Container + Stats Header + Ergonomic Action Buttons + Table + Collapsible Log
+        center_container = QGroupBox("📤 E-Posta Dışa Aktarma & Sunucu Göçü Havuzu")
+        center_container.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #1e3a8a;
+                border: 1.5px solid #cbd5e1;
+                border-radius: 8px;
+                margin-top: 8px;
+                padding-top: 12px;
+                background-color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 12px;
+                padding: 2px 8px;
+                background-color: #1e3a8a;
+                color: #ffffff !important;
+                border-radius: 4px;
                 font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        center_layout = QVBoxLayout(center_container)
+        center_layout.setContentsMargins(6, 6, 6, 6)
+        center_layout.setSpacing(6)
+
+        # Top Live Stats Cards
+        stats_frame = QFrame()
+        stats_frame.setStyleSheet("background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px;")
+        stats_lyt = QHBoxLayout(stats_frame)
+        stats_lyt.setContentsMargins(6, 4, 6, 4)
+        stats_lyt.setSpacing(6)
+
+        self.card_account = StatCard("Mevcut Hesap", "—", "👤")
+        self.card_format = StatCard("Hedef Biçim", "ZIP", "📦")
+        self.card_remaining = StatCard("Kalan E-Posta", "—", "⏳")
+        self.card_progress = StatCard("İlerleme", "—", "📈")
+        self.card_eta = StatCard("Tahmini Süre", "—", "⏱️")
+        self.card_size = StatCard("Aktarılan Boyut", "—", "💾")
+
+        stats_lyt.addWidget(self.card_account)
+        stats_lyt.addWidget(self.card_format)
+        stats_lyt.addWidget(self.card_remaining)
+        stats_lyt.addWidget(self.card_progress)
+        stats_lyt.addWidget(self.card_eta)
+        stats_lyt.addWidget(self.card_size)
+        center_layout.addWidget(stats_frame)
+
+        # Quick Action Buttons Bar directly under Current Account stats
+        actions_bar = QFrame()
+        actions_bar.setStyleSheet("""
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 2px;
+            }
+        """)
+        actions_bar_lyt = QHBoxLayout(actions_bar)
+        actions_bar_lyt.setContentsMargins(6, 4, 6, 4)
+        actions_bar_lyt.setSpacing(6)
+
+        self.btn_export = QPushButton("⚡ Seçilenleri Başlat")
+        self.btn_export.setToolTip("Seçili kutucuğu işaretli tüm hesapların dışa aktarımını başlatır")
+        self.btn_export.setCursor(Qt.PointingHandCursor)
+        self.btn_export.setStyleSheet(self._blue_btn_style(bg="#2563eb", hover="#1d4ed8", py=5, px=10, fs=11))
+        self.btn_export.clicked.connect(self._export_selected)
+        actions_bar_lyt.addWidget(self.btn_export)
+
+        self.btn_export_all = QPushButton("🚀 Tümünü Başlat")
+        self.btn_export_all.setToolTip("Sistemdeki tüm hesapları dışa aktarır")
+        self.btn_export_all.setCursor(Qt.PointingHandCursor)
+        self.btn_export_all.setStyleSheet(self._blue_btn_style(bg="#059669", hover="#047857", py=5, px=10, fs=11))
+        self.btn_export_all.clicked.connect(self._export_all)
+        actions_bar_lyt.addWidget(self.btn_export_all)
+
+        self.btn_pause = QPushButton("⏸️ Duraklat")
+        self.btn_pause.setToolTip("Aktif aktarım işlemlerini duraklatır")
+        self.btn_pause.setCursor(Qt.PointingHandCursor)
+        self.btn_pause.setStyleSheet(self._blue_btn_style(bg="#f59e0b", hover="#d97706", py=5, px=10, fs=11))
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.clicked.connect(self._toggle_pause_export)
+        actions_bar_lyt.addWidget(self.btn_pause)
+
+        self.btn_cancel = QPushButton("⏹️ İptal Et")
+        self.btn_cancel.setToolTip("Aktif aktarım işlemlerini iptal eder")
+        self.btn_cancel.setCursor(Qt.PointingHandCursor)
+        self.btn_cancel.setStyleSheet(self._blue_btn_style(bg="#dc2626", hover="#b91c1c", py=5, px=10, fs=11))
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self._cancel_export)
+        actions_bar_lyt.addWidget(self.btn_cancel)
+
+        self.btn_dry_run = QPushButton("🔍 Inode / Önizleme")
+        self.btn_dry_run.setToolTip("Seçili hesaplar için aktarım önizlemesi ve inode kontrollerini hesaplar")
+        self.btn_dry_run.setCursor(Qt.PointingHandCursor)
+        self.btn_dry_run.setStyleSheet(self._blue_btn_style(bg="#475569", hover="#334155", py=5, px=10, fs=11))
+        self.btn_dry_run.clicked.connect(self._dry_run_preview)
+        actions_bar_lyt.addWidget(self.btn_dry_run)
+
+        self.btn_config = QPushButton("⚙️ Hedef & Filtreler...")
+        self.btn_config.setToolTip("Dışa aktarım biçimi, hedef dizin, IMAP sunucu ve filtrelerini ayarlar")
+        self.btn_config.setCursor(Qt.PointingHandCursor)
+        self.btn_config.setStyleSheet(self._blue_btn_style(bg="#0284c7", hover="#0369a1", py=5, px=10, fs=11))
+        self.btn_config.clicked.connect(self._open_config_dialog)
+        actions_bar_lyt.addWidget(self.btn_config)
+
+        self.btn_reports = QPushButton("📊 Raporlar")
+        self.btn_reports.setToolTip("Dışa aktarım sonuç raporlarını görüntüler")
+        self.btn_reports.setCursor(Qt.PointingHandCursor)
+        self.btn_reports.setStyleSheet(self._blue_btn_style(bg="#7c3aed", hover="#6d28d9", py=5, px=10, fs=11))
+        self.btn_reports.clicked.connect(self._show_reports)
+        actions_bar_lyt.addWidget(self.btn_reports)
+
+        actions_bar_lyt.addStretch()
+
+        # Log toggle button
+        self.btn_toggle_log = QPushButton("📋 Log Kutusu")
+        self.btn_toggle_log.setToolTip("Canlı dışa aktarım log tablosunu gizler/gösterir")
+        self.btn_toggle_log.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_log.setStyleSheet(self._blue_btn_style(bg="#334155", hover="#1e293b", py=5, px=10, fs=11))
+        self.btn_toggle_log.clicked.connect(self._toggle_log_visibility)
+        actions_bar_lyt.addWidget(self.btn_toggle_log)
+
+        center_layout.addWidget(actions_bar)
+
+        # Disk Connection Banner with Loading indicator
+        self.disk_status_banner = QFrame()
+        self.disk_status_banner.setObjectName("diskStatusBanner")
+        self.disk_status_banner.setStyleSheet("""
+            QFrame#diskStatusBanner {
+                background-color: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 2px;
+            }
+        """)
+        banner_layout = QHBoxLayout(self.disk_status_banner)
+        banner_layout.setContentsMargins(8, 4, 8, 4)
+        banner_layout.setSpacing(6)
+
+        self.lbl_disk_status_icon = QLabel("💾")
+        self.lbl_disk_status_icon.setStyleSheet("font-size: 14px; background: transparent;")
+        banner_layout.addWidget(self.lbl_disk_status_icon)
+
+        self.lbl_disk_status_text = QLabel("Dışa aktarım depolama ve veritabanı durumu kontrol ediliyor...")
+        self.lbl_disk_status_text.setStyleSheet("font-size: 11px; font-weight: 600; color: #1e293b; background: transparent;")
+        banner_layout.addWidget(self.lbl_disk_status_text, stretch=1)
+
+        self.btn_disk_reconnect = QPushButton("🔄 Yeniden Tara")
+        self.btn_disk_reconnect.setCursor(Qt.PointingHandCursor)
+        self.btn_disk_reconnect.setStyleSheet("""
+            QPushButton {
+                background-color: #ffffff;
+                color: #1e293b;
+                border: 1px solid #cbd5e1;
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-size: 10.5px;
                 font-weight: 600;
             }
+            QPushButton:hover { background-color: #f1f5f9; }
         """)
-        left_layout.addWidget(self.lbl_left_summary)
+        self.btn_disk_reconnect.clicked.connect(self._check_disk_and_refresh)
+        banner_layout.addWidget(self.btn_disk_reconnect)
+        center_layout.addWidget(self.disk_status_banner)
 
-    # -----------------------------------------------------------------------
-    # Orta Panel Setup (ProGrid)
-    # -----------------------------------------------------------------------
-    def _setup_center_panel(self):
-        center_layout = self.workspace.center_layout
-
-        self.grid = ProGridWidget(settings=self.settings, grid_id="export_workspace", parent=self)
-        self.account_table = self.grid.table
-
-        # Configure columns for maximum legibility and readability
-        self.account_table.setColumnCount(9)
+        # Main Table: Select Accounts
+        self.account_table = QTableWidget()
+        self.account_table.setColumnCount(4)
         self.account_table.setHorizontalHeaderLabels([
-            "Seç", "Hesap Etiketi", "E-Posta Adresi", "Domain / Grup", 
-            "Sunucu", "Yerel İstatistik", "Hedef Profil", "Durum & İlerleme", "Aksiyonlar"
+            "☑️ Seç", "Hesap Bilgileri & Domain", "Aktarım Durumu & İlerleme", "İşlemler"
         ])
-        
-        header = self.account_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.Interactive)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.Stretch)
-        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        self.account_table.setAlternatingRowColors(True)
+        self.account_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.account_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.account_table.verticalHeader().setVisible(False)
+        self.account_table.verticalHeader().setDefaultSectionSize(self._current_row_height)
 
-        self.account_table.setColumnWidth(1, 160)
-        self.account_table.setColumnWidth(2, 220)
-        self.account_table.setColumnWidth(3, 140)
-        self.account_table.setColumnWidth(4, 150)
+        self.account_table.setColumnWidth(0, 55)
+        self.account_table.setColumnWidth(1, 420)
+        self.account_table.setColumnWidth(2, 340)
+        self.account_table.setColumnWidth(3, 150)
+        self.account_table.horizontalHeader().setStretchLastSection(False)
+        self.account_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
 
-        self.grid.filter_changed.connect(self._apply_filters)
-        center_layout.addWidget(self.grid)
-
-    # -----------------------------------------------------------------------
-    # Sağ Panel Setup (İşlem & Live Logs)
-    # -----------------------------------------------------------------------
-    def _setup_right_panel(self):
-        right_layout = self.workspace.right_inner_layout
-
-        # Top Section: Metric Stat Cards
-        stats_layout = QVBoxLayout()
-        stats_layout.setSpacing(6)
-
-        row1 = QHBoxLayout()
-        self.card_total_mails = StatCard("Arşivdeki Mailler", "0000", bg_color="#3b82f6", callback=self._show_archived_emails_info)
-        self.card_exported_count = StatCard("Aktarılanlar", "0000", bg_color="#10b981", callback=self._show_exported_count_info)
-        row1.addWidget(self.card_total_mails)
-        row1.addWidget(self.card_exported_count)
-
-        row2 = QHBoxLayout()
-        self.card_error_count = StatCard("Hatalar", "0000", bg_color="#ef4444", callback=self._show_errors_info)
-        self.card_status = StatCard("Durum", "Idle", bg_color="#6366f1", callback=self._show_migration_status_info)
-        row2.addWidget(self.card_error_count)
-        row2.addWidget(self.card_status)
-
-        self.card_total_selected = StatCard("Seçilen Hesaplar", "0000", bg_color="#475569", callback=self._show_selected_accounts_info)
-
-        stats_layout.addLayout(row1)
-        stats_layout.addLayout(row2)
-        stats_layout.addWidget(self.card_total_selected)
-        right_layout.addLayout(stats_layout)
-
-        right_layout.addSpacing(6)
-
-        # Primary Action Buttons
-        self.btn_export_selected = QPushButton("🚀 SEÇİLİ HESAPLARDA DIŞA AKTAR")
-        self.btn_export_selected.setStyleSheet("""
-            QPushButton {
-                background-color: #10b981;
-                color: white;
-                font-weight: 900;
-                border: 1.5px solid #059669;
-                border-radius: 6px;
-                padding: 10px;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #059669; }
-        """)
-        self.btn_export_selected.clicked.connect(self._run_export_on_checked)
-        right_layout.addWidget(self.btn_export_selected)
-
-        self.btn_check_inodes = QPushButton("🔍 INODE / MESAJ SAYILARINI KONTROL ET")
-        self.btn_check_inodes.setStyleSheet("""
-            QPushButton {
-                background-color: #4361ee;
-                color: white;
-                font-weight: 900;
-                border: 1.5px solid #3a56d4;
-                border-radius: 6px;
-                padding: 8px;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #3a56d4; }
-        """)
-        self.btn_check_inodes.clicked.connect(self._check_inodes_and_report)
-        right_layout.addWidget(self.btn_check_inodes)
-
-        self.btn_configure = QPushButton("⚙️ HEDEF VE FİLTRE YAPILANDIRMASI")
-        self.btn_configure.setStyleSheet("""
-            QPushButton {
-                background-color: #f1f5f9;
-                color: #0f172a;
-                font-weight: 800;
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                padding: 8px;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #e2e8f0; }
-        """)
-        self.btn_configure.clicked.connect(self._open_config_dialog)
-        right_layout.addWidget(self.btn_configure)
-
-        right_layout.addSpacing(6)
-
-        # Bottom Section: Splitter for Live Mail Report & Console Log
-        right_splitter = QSplitter(Qt.Vertical)
-
-        # Inode / Mail Report Table
-        self.report_table = QTableWidget()
-        self.report_table.setColumnCount(4)
-        self.report_table.setHorizontalHeaderLabels(["Klasör / Mail", "Gönderen", "Tarih", "Durum"])
-        self.report_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.report_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.report_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.report_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.report_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.report_table.verticalHeader().setVisible(False)
-        self.report_table.setStyleSheet("""
+        self.account_table.setStyleSheet("""
             QTableWidget {
                 background-color: #ffffff;
-                color: #0f172a;
-                gridline-color: #f1f5f9;
+                alternate-background-color: #f8fafc;
+                gridline-color: #e2e8f0;
                 border: 1px solid #cbd5e1;
                 border-radius: 6px;
-                font-size: 10px;
+                color: #0f172a;
+                selection-background-color: #2563eb;
+                selection-color: #ffffff;
+                font-size: 11.5px;
+            }
+            QTableWidget::item {
+                padding: 4px 8px;
+                border-bottom: 1px solid #f1f5f9;
+                color: #0f172a;
+            }
+            QTableWidget::item:selected {
+                background-color: #2563eb;
+                color: #ffffff !important;
+            }
+            QHeaderView::section {
+                background-color: #1e3a8a;
+                color: #ffffff !important;
+                font-weight: 700;
+                font-size: 11.5px;
+                border: 1px solid #1e40af;
+                padding: 6px 8px;
+                min-height: 30px;
             }
         """)
-        right_splitter.addWidget(self.report_table)
 
-        # Log Output Console
-        self.log_output = QTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setStyleSheet("""
-            QTextEdit {
-                background: #1e293b;
+        self.account_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.account_table.customContextMenuRequested.connect(self._show_toya_grid_context_menu)
+        self.account_table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.account_table.horizontalHeader().customContextMenuRequested.connect(self._show_toya_grid_context_menu)
+        self.account_table.horizontalHeader().sectionResized.connect(self._auto_save_current_layout)
+        self.account_table.itemChanged.connect(self._on_table_item_changed)
+        self.account_table.itemSelectionChanged.connect(self._on_table_row_click)
+
+        center_layout.addWidget(self.account_table, stretch=2)
+
+        # 3. Collapsible Live Log Box
+        self.log_box = QGroupBox("📋 Dışa Aktarım Canlı Logu")
+        self.log_box.setStyleSheet("""
+            QGroupBox {
+                background: #ffffff;
+                border: 1.5px solid #cbd5e1;
+                border-radius: 8px;
+                margin-top: 4px;
+                font-weight: bold;
+                font-size: 11.5px;
+                color: #1e293b;
+            }
+        """)
+        log_layout = QVBoxLayout(self.log_box)
+        log_layout.setContentsMargins(8, 12, 8, 8)
+        log_layout.setSpacing(6)
+
+        log_toolbar = QHBoxLayout()
+        log_toolbar.setSpacing(6)
+
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("🔍 Log içinde filtrele...")
+        self.filter_input.setMinimumWidth(180)
+        self.filter_input.setStyleSheet("""
+            QLineEdit {
+                border: 1px solid #cbd5e1;
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-size: 11px;
+            }
+        """)
+
+        self.combo_page_size = QComboBox()
+        self.combo_page_size.addItems(["25", "50", "100", "200", "Tümü"])
+        self.combo_page_size.setCurrentIndex(1)
+        self.combo_page_size.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+
+        self.btn_prev_page = QPushButton("◀ Önceki")
+        self.btn_prev_page.setStyleSheet(self._blue_btn_style(py=3, px=8, fs=10))
+        self.btn_next_page = QPushButton("Sonraki ▶")
+        self.btn_next_page.setStyleSheet(self._blue_btn_style(py=3, px=8, fs=10))
+        self.label_page = QLabel("Sayfa 1 / 1")
+        self.label_page.setStyleSheet("font-size:11px;color:#4b5563;")
+
+        self.btn_clear_log = QPushButton("🧹 Temizle")
+        self.btn_clear_log.setStyleSheet(self._blue_btn_style(py=3, px=8, fs=10, bg="#ef4444", hover="#dc2626"))
+
+        log_toolbar.addWidget(self.filter_input)
+        log_toolbar.addStretch()
+        log_toolbar.addWidget(QLabel("Satır:"))
+        log_toolbar.addWidget(self.combo_page_size)
+        log_toolbar.addWidget(self.btn_prev_page)
+        log_toolbar.addWidget(self.label_page)
+        log_toolbar.addWidget(self.btn_next_page)
+        log_toolbar.addWidget(self.btn_clear_log)
+        log_layout.addLayout(log_toolbar)
+
+        self.log_table = QTableView()
+        self.log_table.setAlternatingRowColors(True)
+        self.log_table.setSelectionBehavior(QTableView.SelectRows)
+        self.log_table.setSelectionMode(QTableView.NoSelection)
+        self.log_table.setShowGrid(False)
+        self.log_table.verticalHeader().setVisible(False)
+        self.log_table.horizontalHeader().setStretchLastSection(True)
+        self.log_table.setMaximumHeight(150)
+        self.log_table.setStyleSheet("""
+            QTableView {
+                background: #1a1a2e;
                 color: #a8d8ea;
-                font-family: 'Consolas', monospace;
-                font-size: 10px;
-                border-radius: 6px;
+                font-family: 'Consolas','Courier New',monospace;
+                font-size: 10.5px;
+                border: 1px solid #2d2d44;
+                border-radius: 4px;
+                padding: 2px;
+                gridline-color: #2d2d44;
+            }
+            QTableView::item { padding: 2px 4px; }
+            QTableView::item:alternate { background: #1f1f36; }
+            QHeaderView::section {
+                background: #252542;
+                color: #c4b5e3;
+                font-weight: 600;
+                font-size: 10.5px;
+                padding: 3px 4px;
+                border: none;
+                border-bottom: 1px solid #2d2d44;
             }
         """)
-        right_splitter.addWidget(self.log_output)
+        self.log_table.setModel(self._log_proxy)
+        self.log_table.setColumnHidden(1, True)
+        self.log_table.setColumnHidden(2, True)
+        log_layout.addWidget(self.log_table)
 
-        right_splitter.setSizes([140, 100])
-        right_layout.addWidget(right_splitter, stretch=1)
+        center_layout.addWidget(self.log_box, stretch=1)
+        split_layout.addWidget(center_container, stretch=1)
 
-        # Progress bar
-        self.overall_progress = QProgressBar()
-        self.overall_progress.setRange(0, 100)
-        self.overall_progress.setValue(0)
-        self.overall_progress.setVisible(False)
-        self.overall_progress.setMaximumHeight(8)
-        self.overall_progress.setTextVisible(False)
-        right_layout.addWidget(self.overall_progress)
+        # Middle Arrow Toggle for Right Sidebar
+        self.btn_middle_toggle_right = QPushButton("▶")
+        self.btn_middle_toggle_right.setToolTip("Sağ İşlem Çekmecesini Gizle / Göster")
+        self.btn_middle_toggle_right.setFixedWidth(16)
+        self.btn_middle_toggle_right.setCursor(Qt.PointingHandCursor)
+        self.btn_middle_toggle_right.setStyleSheet("""
+            QPushButton {
+                background-color: #e2e8f0;
+                color: #334155;
+                border: 1px solid #cbd5e1;
+                border-right: none;
+                border-top-left-radius: 6px;
+                border-bottom-left-radius: 6px;
+                border-top-right-radius: 0px;
+                border-bottom-right-radius: 0px;
+                font-weight: bold;
+                font-size: 10px;
+                padding: 0px;
+                min-height: 50px;
+                max-height: 50px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+                color: #ffffff;
+                border-color: #1d4ed8;
+            }
+        """)
+        self.btn_middle_toggle_right.clicked.connect(self._toggle_right_sidebar)
+        split_layout.addWidget(self.btn_middle_toggle_right)
+
+        # 3. Right Sidebar: Actions & Profile Drawer
+        self.right_sidebar = ExportRightSidebarWidget(self)
+        self.right_sidebar.setFixedWidth(320)
+        split_layout.addWidget(self.right_sidebar)
+
+        main_vbox.addLayout(split_layout)
+
+    def _connect_signals(self):
+        # Left Sidebar Signal Connect
+        self.left_sidebar.group_selected.connect(self._on_left_sidebar_group_selected)
+
+        # Right Sidebar Action Signals Connect
+        self.right_sidebar.export_selected_requested.connect(self._export_selected)
+        self.right_sidebar.export_all_requested.connect(self._export_all)
+        self.right_sidebar.pause_requested.connect(self._toggle_pause_export)
+        self.right_sidebar.cancel_requested.connect(self._cancel_export)
+        self.right_sidebar.dry_run_requested.connect(self._dry_run_preview)
+        self.right_sidebar.export_group_requested.connect(self._export_selected_group)
+        self.right_sidebar.select_all_requested.connect(self._toggle_select_all_checkboxes)
+        self.right_sidebar.format_changed.connect(self._on_sidebar_format_changed)
+        self.right_sidebar.config_dialog_requested.connect(self._open_config_dialog)
+        self.right_sidebar.export_excel_requested.connect(self._export_to_excel)
+        self.right_sidebar.copy_emails_requested.connect(self._copy_all_emails_to_clipboard)
+        self.right_sidebar.reports_requested.connect(self._show_reports)
+        self.right_sidebar.toggle_log_requested.connect(self._toggle_log_visibility)
+        self.right_sidebar.row_height_changed.connect(self.set_row_height)
+
+        # Right Sidebar View Profile Signals Connect
+        self.right_sidebar.profile_selected.connect(self._apply_view_profile)
+        self.right_sidebar.save_profile_requested.connect(self._save_view_profile)
+        self.right_sidebar.columns_requested.connect(self._open_column_manager)
+
+        # Log Toolbar Signals
+        self.filter_input.textChanged.connect(self._on_log_filter_changed)
+        self.combo_page_size.currentIndexChanged.connect(self._on_log_page_size_changed)
+        self.btn_prev_page.clicked.connect(self._on_log_prev_page)
+        self.btn_next_page.clicked.connect(self._on_log_next_page)
+        self.btn_clear_log.clicked.connect(self._on_log_clear)
 
     # -----------------------------------------------------------------------
-    # Filters & Filtering Logic
+    # Row Height & Profile Management
+    # -----------------------------------------------------------------------
+
+    @Slot(int)
+    def set_row_height(self, height: int, auto_save: bool = True):
+        self._current_row_height = max(35, min(height, 200))
+        self.account_table.verticalHeader().setDefaultSectionSize(self._current_row_height)
+        for r in range(self.account_table.rowCount()):
+            self.account_table.setRowHeight(r, self._current_row_height)
+        if auto_save:
+            self.settings.set("export_panel_row_height", self._current_row_height)
+            self.settings.save()
+            self._auto_save_current_layout()
+
+    @Slot()
+    def _open_custom_row_height_dialog(self):
+        val, ok = QInputDialog.getInt(
+            self, "Özel Satır Yüksekliği",
+            "Lütfen satır yüksekliğini piksel (px) olarak giriniz (35 - 200):",
+            value=self._current_row_height, min=35, max=200, step=2
+        )
+        if ok:
+            self.set_row_height(val, auto_save=True)
+
+    def _auto_save_current_layout(self):
+        if not hasattr(self, 'right_sidebar') or self._is_refreshing:
+            return
+        layout_data = {
+            "col_widths": [self.account_table.columnWidth(c) for c in range(self.account_table.columnCount())],
+            "col_hidden": [self.account_table.isColumnHidden(c) for c in range(self.account_table.columnCount())],
+            "row_height": self._current_row_height,
+            "left_visible": self.left_sidebar.isVisible(),
+            "right_visible": self.right_sidebar.isVisible(),
+            "log_visible": self.log_box.isVisible(),
+        }
+        self.settings.set("export_panel_layout_auto", layout_data)
+        self.settings.save()
+
+    @Slot(str, dict)
+    def _apply_view_profile(self, name: str, profile_data: dict):
+        if not profile_data:
+            if name in ("Varsayılan (Default)", "Varsayılan"):
+                self.account_table.setColumnWidth(0, 55)
+                self.account_table.setColumnWidth(1, 420)
+                self.account_table.setColumnWidth(2, 340)
+                self.account_table.setColumnWidth(3, 150)
+                for c in range(4):
+                    self.account_table.setColumnHidden(c, False)
+                self.set_row_height(88, auto_save=True)
+                self.left_sidebar.setVisible(True)
+                self.right_sidebar.setVisible(True)
+                self.log_box.setVisible(True)
+            elif name in ("Kompakt (Compact)", "Kompakt Düzen"):
+                self.set_row_height(40, auto_save=True)
+                self.log_box.setVisible(False)
+            elif name in ("Detaylı (Detailed)", "Geniş Görünüm"):
+                self.set_row_height(110, auto_save=True)
+                self.log_box.setVisible(True)
+            elif name in ("Yönetici (Admin)", "Yönetici"):
+                self.set_row_height(88, auto_save=True)
+                self.log_box.setVisible(True)
+            return
+
+        widths = profile_data.get("col_widths", [])
+        for c, w in enumerate(widths):
+            if c < self.account_table.columnCount():
+                self.account_table.setColumnWidth(c, w)
+
+        hidden = profile_data.get("col_hidden", [])
+        for c, h in enumerate(hidden):
+            if c < self.account_table.columnCount():
+                self.account_table.setColumnHidden(c, h)
+
+        rh = profile_data.get("row_height")
+        if rh:
+            self.set_row_height(int(rh), auto_save=True)
+
+        if "left_visible" in profile_data:
+            self.left_sidebar.setVisible(profile_data["left_visible"])
+        if "right_visible" in profile_data:
+            self.right_sidebar.setVisible(profile_data["right_visible"])
+        if "log_visible" in profile_data:
+            self.log_box.setVisible(profile_data["log_visible"])
+
+    @Slot(str)
+    def _save_view_profile(self, name: str):
+        layout_data = {
+            "col_widths": [self.account_table.columnWidth(c) for c in range(self.account_table.columnCount())],
+            "col_hidden": [self.account_table.isColumnHidden(c) for c in range(self.account_table.columnCount())],
+            "row_height": self._current_row_height,
+            "left_visible": self.left_sidebar.isVisible(),
+            "right_visible": self.right_sidebar.isVisible(),
+            "log_visible": self.log_box.isVisible(),
+        }
+        profiles = self.settings.get("view_profiles_export_panel_grid", {})
+        profiles[name] = layout_data
+        self.settings.set("view_profiles_export_panel_grid", profiles)
+        self.settings.save()
+        self.right_sidebar.view_profile_widget.load_profiles()
+        QMessageBox.information(self, "Profil Kaydedildi", f"'{name}' görünüm profili başarıyla kaydedildi.")
+
+    @Slot()
+    def _open_column_manager(self):
+        col_names = [self.account_table.horizontalHeaderItem(c).text() for c in range(self.account_table.columnCount())]
+        hidden_states = [self.account_table.isColumnHidden(c) for c in range(self.account_table.columnCount())]
+        
+        dlg = ColumnManagerDialog(col_names, hidden_states, self)
+        if dlg.exec() == QDialog.Accepted:
+            new_hidden = dlg.get_hidden_states()
+            for c, is_h in enumerate(new_hidden):
+                self.account_table.setColumnHidden(c, is_h)
+            self._auto_save_current_layout()
+
+    # -----------------------------------------------------------------------
+    # Asynchronous Data Refresh & Grid Rendering
+    # -----------------------------------------------------------------------
+
+    def _check_disk_and_refresh(self):
+        self.refresh()
+
+    def _refresh_groups_sidebar(self):
+        groups_status = {}
+        all_accounts = self.settings.load_account_cache() or self.engine.list_accounts()
+        for acc in all_accounts:
+            g_name = acc.get("account_group", "").strip()
+            if not g_name and "@" in acc.get("email", ""):
+                g_name = acc["email"].split("@")[-1].strip()
+            if g_name:
+                groups_status.setdefault(g_name, {"is_active": True, "count": 0})
+                groups_status[g_name]["count"] += 1
+
+        self.left_sidebar.populate_groups(groups_status, total_accounts_count=len(all_accounts))
+
+    def refresh(self):
+        self._is_refreshing = True
+        self._refresh_groups_sidebar()
+
+        self.account_table.blockSignals(True)
+        self.account_table.setRowCount(0)
+        self._accounts_ui.clear()
+        self._stats_labels_map.clear()
+
+        try:
+            accounts = self.engine.list_accounts()
+            self.account_table.setRowCount(len(accounts))
+            self.account_table.verticalHeader().setDefaultSectionSize(self._current_row_height)
+
+            account_ids = []
+            for i, acc in enumerate(accounts):
+                acc_id = acc["id"]
+                account_ids.append(acc_id)
+                label = acc.get("label", "")
+                email = acc.get("email", "")
+                group_val = acc.get("account_group", "").strip() or "Genel"
+
+                # 1. Col 0: Checkbox (Native QTableWidgetItem)
+                chk_item = QTableWidgetItem()
+                chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                chk_item.setCheckState(Qt.Unchecked)
+                chk_item.setData(Qt.UserRole, acc_id)
+                self.account_table.setItem(i, 0, chk_item)
+
+                # 2. Col 1: Account Information & Domain Card
+                info_widget = QWidget()
+                info_widget.setStyleSheet("background: transparent;")
+                info_lyt = QVBoxLayout(info_widget)
+                info_lyt.setContentsMargins(6, 4, 6, 4)
+                info_lyt.setSpacing(2)
+
+                top_info_row = QHBoxLayout()
+                lbl_name = QLabel(f"<b>{label}</b>")
+                lbl_name.setStyleSheet("font-size: 12.5px; color: #0f172a; font-weight: 700; background: transparent;")
+                top_info_row.addWidget(lbl_name)
+
+                badge_grp = QLabel(f" {group_val} ")
+                badge_grp.setStyleSheet("""
+                    background-color: #eff6ff;
+                    color: #1d4ed8;
+                    border: 1px solid #bfdbfe;
+                    border-radius: 4px;
+                    font-size: 10px;
+                    font-weight: 600;
+                    padding: 1px 4px;
+                """)
+                top_info_row.addWidget(badge_grp)
+                top_info_row.addStretch()
+                info_lyt.addLayout(top_info_row)
+
+                lbl_email = QLabel(f"✉️ {email}")
+                lbl_email.setStyleSheet("font-size: 11px; color: #475569; background: transparent;")
+                info_lyt.addWidget(lbl_email)
+
+                lbl_disk_stat = QLabel("📁 Klasörler taranıyor...  •  📧 Yerel Mailler: —")
+                lbl_disk_stat.setStyleSheet("font-size: 10.5px; color: #059669; font-weight: 600; background: transparent;")
+                self._stats_labels_map[acc_id] = lbl_disk_stat
+                info_lyt.addWidget(lbl_disk_stat)
+                self.account_table.setCellWidget(i, 1, info_widget)
+
+                # 3. Col 2: Export Status & Progress Bar
+                prog_widget = QWidget()
+                prog_widget.setStyleSheet("background: transparent;")
+                prog_lyt = QVBoxLayout(prog_widget)
+                prog_lyt.setContentsMargins(6, 4, 6, 4)
+                prog_lyt.setSpacing(3)
+
+                status_row = QHBoxLayout()
+                lbl_status = QLabel("⏳ Bekliyor")
+                lbl_status.setStyleSheet("font-size: 11px; color: #334155; font-weight: 600; background: transparent;")
+                status_row.addWidget(lbl_status)
+                status_row.addStretch()
+                prog_lyt.addLayout(status_row)
+
+                progress_bar = QProgressBar()
+                progress_bar.setRange(0, 100)
+                progress_bar.setValue(0)
+                progress_bar.setTextVisible(True)
+                progress_bar.setFormat("0 / 0")
+                progress_bar.setStyleSheet("""
+                    QProgressBar {
+                        background-color: #e2e8f0;
+                        border: none;
+                        border-radius: 4px;
+                        height: 14px;
+                        font-size: 9.5px;
+                        font-weight: bold;
+                        text-align: center;
+                        color: #0f172a;
+                    }
+                    QProgressBar::chunk {
+                        background-color: #2563eb;
+                        border-radius: 4px;
+                    }
+                """)
+                prog_lyt.addWidget(progress_bar)
+                self.account_table.setCellWidget(i, 2, prog_widget)
+
+                # 4. Col 3: Actions
+                act_widget = QWidget()
+                act_widget.setStyleSheet("background: transparent;")
+                act_lyt = QHBoxLayout(act_widget)
+                act_lyt.setContentsMargins(4, 4, 4, 4)
+                act_lyt.setSpacing(4)
+
+                btn_start = QPushButton("▶ Başlat")
+                btn_start.setToolTip("Yalnızca bu hesabın dışa aktarımını başlat")
+                btn_start.setCursor(Qt.PointingHandCursor)
+                btn_start.setStyleSheet(self._blue_btn_style(bg="#16a34a", hover="#15803d", py=4, px=8, fs=10.5))
+                btn_start.clicked.connect(lambda checked, aid=acc_id: self._export_single_account(aid))
+                act_lyt.addWidget(btn_start)
+
+                btn_config_row = QPushButton("⚙️ Ayar")
+                btn_config_row.setToolTip("Bu hesap için hedef ve filtre yapılandırması")
+                btn_config_row.setCursor(Qt.PointingHandCursor)
+                btn_config_row.setStyleSheet(self._blue_btn_style(bg="#0284c7", hover="#0369a1", py=4, px=8, fs=10.5))
+                btn_config_row.clicked.connect(lambda checked, aid=acc_id: self._open_config_dialog(aid))
+                act_lyt.addWidget(btn_config_row)
+
+                self.account_table.setCellWidget(i, 3, act_widget)
+
+                self._accounts_ui[acc_id] = {
+                    "row": i,
+                    "chk": chk_item,
+                    "lbl_disk_stat": lbl_disk_stat,
+                    "lbl_status": lbl_status,
+                    "progress_bar": progress_bar,
+                    "btn_start": btn_start,
+                    "btn_config": btn_config_row,
+                }
+
+            self.lbl_stat_total.setText(f"📊 {len(accounts)} Hesap")
+            self.lbl_stat_selected.setText("☑️ 0 Seçili")
+
+            # Banner updating
+            self.lbl_disk_status_icon.setText("⏳")
+            self.lbl_disk_status_text.setText("💾 Diskten ve veritabanından istatistikler asenkron okunuyor... (Lütfen bekleyin)")
+
+            # Launch Asynchronous Lazy Loader Worker (No UI Freeze)
+            if self._loader_worker and self._loader_worker.isRunning():
+                self._loader_worker.quit()
+                self._loader_worker.wait()
+
+            self._loader_worker = ExportDataLoaderWorker(self.engine, account_ids, self)
+            self._loader_worker.account_loaded_signal.connect(self._on_worker_account_loaded)
+            self._loader_worker.finished_signal.connect(self._on_worker_finished)
+            self._loader_worker.start()
+
+        except Exception as e:
+            logger.exception("ExportPanel refresh error: %s", e)
+        finally:
+            self.account_table.blockSignals(False)
+            self._is_refreshing = False
+
+    @Slot(int, int, int)
+    def _on_worker_account_loaded(self, aid: int, mails_cnt: int, folders_cnt: int):
+        lbl = self._stats_labels_map.get(aid)
+        if lbl:
+            lbl.setText(f"📁 {folders_cnt} Klasör  •  📧 Yerel Arşiv: {mails_cnt:,} E-Posta")
+
+    @Slot(dict)
+    def _on_worker_finished(self, results: dict):
+        total_mails = sum(r.get("mails", 0) for r in results.values())
+        self.lbl_disk_status_icon.setText("✅")
+        self.lbl_disk_status_text.setText(f"Veritabanı ve yerel arşiv hazır. Toplam {total_mails:,} arşivlenmiş e-posta.")
+        self.card_size.set_value(f"{total_mails:,} E-Posta")
+
+    # -----------------------------------------------------------------------
+    # Filtering & Selection Handling
     # -----------------------------------------------------------------------
 
     @Slot()
-    def _apply_filters(self):
-        sel_domain = self.combo_domain.currentText()
-        sel_group = self.combo_group.currentText()
-        search_text = self.grid.input_search.text().strip().lower()
+    def _filter_table_rows(self):
+        query = self.txt_search_export.text().strip().lower()
+        active_group = self.left_sidebar.get_selected_group()
+        total_cnt = self.account_table.rowCount()
+        visible_cnt = 0
 
-        total_rows = self.account_table.rowCount()
-        visible_rows = 0
+        for r in range(total_cnt):
+            info_widget = self.account_table.cellWidget(r, 1)
+            row_text = ""
+            if info_widget:
+                for lbl in info_widget.findChildren(QLabel):
+                    row_text += " " + lbl.text().lower()
 
-        for row in range(total_rows):
-            domain_item = self.account_table.item(row, 3)
-            domain_group_str = domain_item.text() if domain_item else ""
+            matches_search = (not query) or (query in row_text)
+            matches_group = (not active_group) or (active_group == "__ALL__") or (active_group == "Tümü") or (active_group.lower() in row_text)
 
-            match_domain = (sel_domain == "Tüm Domainler" or sel_domain.lower() in domain_group_str.lower())
-            match_group = (sel_group == "Tüm Gruplar" or sel_group.lower() in domain_group_str.lower())
-
-            # Text search matching label (col 1), email (col 2), host (col 4)
-            match_text = True
-            if search_text:
-                lbl_text = self.account_table.item(row, 1).text().lower() if self.account_table.item(row, 1) else ""
-                email_text = self.account_table.item(row, 2).text().lower() if self.account_table.item(row, 2) else ""
-                host_text = self.account_table.item(row, 4).text().lower() if self.account_table.item(row, 4) else ""
-                match_text = (search_text in lbl_text or search_text in email_text or search_text in host_text)
-
-            is_visible = match_domain and match_group and match_text
-            self.account_table.setRowHidden(row, not is_visible)
+            is_visible = matches_search and matches_group
+            self.account_table.setRowHidden(r, not is_visible)
             if is_visible:
-                visible_rows += 1
+                visible_cnt += 1
 
-        self.grid.lbl_counter.setText(f"{visible_rows} / {total_rows} Kayıt")
-        self.lbl_left_summary.setText(f"Görüntülenen: {visible_rows} / {total_rows} hesap\nDomain: {sel_domain}\nGrup: {sel_group}")
+        self.lbl_stat_total.setText(f"📊 {visible_cnt} / {total_cnt} Hesap")
+        self._update_selection_count()
+
+    @Slot(str)
+    def _on_left_sidebar_group_selected(self, group_name: str):
+        self._selected_group = group_name or "__ALL__"
+        self._filter_table_rows()
+
+    @Slot(QTableWidgetItem)
+    def _on_table_item_changed(self, item: Optional[QTableWidgetItem] = None):
+        self._update_selection_count()
+
+    def _update_selection_count(self):
+        selected_cnt = 0
+        for i in range(self.account_table.rowCount()):
+            item = self.account_table.item(i, 0)
+            if item and item.checkState() == Qt.Checked:
+                selected_cnt += 1
+        self.lbl_stat_selected.setText(f"☑️ {selected_cnt} Seçili")
+
+    def _get_active_row_account_id(self) -> Optional[int]:
+        row = self.account_table.currentRow()
+        if row >= 0:
+            item = self.account_table.item(row, 0)
+            if item:
+                return item.data(Qt.UserRole)
+        return None
 
     @Slot()
-    def _reset_filters(self):
-        self.combo_domain.setCurrentIndex(0)
-        self.combo_group.setCurrentIndex(0)
-        self.grid.input_search.clear()
-        self._apply_filters()
+    def _on_table_row_click(self):
+        rows = self.account_table.selectionModel().selectedRows()
+        if rows:
+            r = rows[0].row()
+            info_widget = self.account_table.cellWidget(r, 1)
+            if info_widget:
+                labels = info_widget.findChildren(QLabel)
+                if labels:
+                    clean_text = labels[0].text().replace("<b>", "").replace("</b>", "").strip()
+                    self.card_account.set_value(clean_text)
+
+    # -----------------------------------------------------------------------
+    # Layout Toggle Functions
+    # -----------------------------------------------------------------------
+
+    @Slot()
+    def _toggle_left_sidebar(self):
+        is_visible = self.left_sidebar.isVisible()
+        self.left_sidebar.setVisible(not is_visible)
+        self.btn_toggle_left.setText("▶ Grupları Göster" if is_visible else "◀ Grupları Gizle")
+        self.btn_middle_toggle_left.setText("▶" if is_visible else "◀")
+        self._auto_save_current_layout()
+
+    @Slot()
+    def _toggle_right_sidebar(self):
+        is_visible = self.right_sidebar.isVisible()
+        self.right_sidebar.setVisible(not is_visible)
+        self.btn_toggle_right.setText("◀ İşlemler" if is_visible else "⚙️ İşlemler ▶")
+        self.btn_middle_toggle_right.setText("◀" if is_visible else "▶")
+        self._auto_save_current_layout()
+
+    @Slot()
+    def _toggle_log_visibility(self):
+        is_vis = self.log_box.isVisible()
+        self.log_box.setVisible(not is_vis)
+        self.btn_toggle_log.setText("📋 Logu Aç" if is_vis else "📋 Log Kutusu")
+        self._auto_save_current_layout()
+
+    # -----------------------------------------------------------------------
+    # Context Menu
+    # -----------------------------------------------------------------------
+
+    @Slot(QPoint)
+    def _show_toya_grid_context_menu(self, pos: QPoint):
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #ffffff;
+                color: #0f172a;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 4px;
+                font-size: 11.5px;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #2563eb;
+                color: #ffffff;
+            }
+        """)
+
+        act_export_sel = menu.addAction("⚡ Seçilenleri Dışa Aktar")
+        act_export_sel.triggered.connect(self._export_selected)
+
+        act_dry_run = menu.addAction("🔍 Inode / Önizleme Raporu...")
+        act_dry_run.triggered.connect(self._dry_run_preview)
+
+        menu.addSeparator()
+
+        act_check_all = menu.addAction("☑️ Tümünü Seç")
+        act_check_all.triggered.connect(lambda: self._set_all_checkboxes(True))
+
+        act_uncheck_all = menu.addAction("⬜ Seçimleri Temizle")
+        act_uncheck_all.triggered.connect(lambda: self._set_all_checkboxes(False))
+
+        menu.addSeparator()
+
+        act_config = menu.addAction("⚙️ Hedef & Filtreleri Yapılandır...")
+        act_config.triggered.connect(self._open_config_dialog)
+
+        h_menu = menu.addMenu("📏 Satır Yüksekliği")
+        for h in [40, 60, 88, 110]:
+            h_act = h_menu.addAction(f"{h} px {'(Varsayılan)' if h == 88 else ''}")
+            h_act.triggered.connect(lambda chk=False, val=h: self.set_row_height(val))
+        
+        act_custom_h = h_menu.addAction("Özel Yükseklik...")
+        act_custom_h.triggered.connect(self._open_custom_row_height_dialog)
+
+        menu.addSeparator()
+
+        act_cols = menu.addAction("👁️ Sütun Görünürlüğü (Kolon Aç/Kapa)...")
+        act_cols.triggered.connect(self._open_column_manager)
+
+        menu.exec(QCursor.pos())
+
+    # -----------------------------------------------------------------------
+    # Logging Operations
+    # -----------------------------------------------------------------------
+
+    @Slot(str)
+    def _on_log_message(self, msg: str):
+        now_str = datetime.now().strftime("%H:%M:%S")
+        entry = LogEntry(now_str, "INFO", "Export", msg)
+        self._log_model.append_entry(entry)
+        self.label_page.setText(f"Sayfa {self._log_proxy.current_page() + 1} / {self._log_proxy.total_pages()}")
+
+    @Slot(str)
+    def _on_log_filter_changed(self, text: str):
+        self._log_proxy.set_filter_text(text)
+        self.label_page.setText(f"Sayfa {self._log_proxy.current_page() + 1} / {self._log_proxy.total_pages()}")
+
+    @Slot(int)
+    def _on_log_page_size_changed(self, idx: int):
+        val = self.combo_page_size.currentText()
+        size = 999999 if val == "Tümü" else int(val)
+        self._log_proxy.set_page_size(size)
+        self.label_page.setText(f"Sayfa {self._log_proxy.current_page() + 1} / {self._log_proxy.total_pages()}")
+
+    @Slot()
+    def _on_log_prev_page(self):
+        curr = self._log_proxy.current_page()
+        self._log_proxy.set_page(curr - 1)
+        self.label_page.setText(f"Sayfa {self._log_proxy.current_page() + 1} / {self._log_proxy.total_pages()}")
+
+    @Slot()
+    def _on_log_next_page(self):
+        curr = self._log_proxy.current_page()
+        self._log_proxy.set_page(curr + 1)
+        self.label_page.setText(f"Sayfa {self._log_proxy.current_page() + 1} / {self._log_proxy.total_pages()}")
+
+    @Slot()
+    def _on_log_clear(self):
+        self._log_model.clear_entries()
+        self.label_page.setText("Sayfa 1 / 1")
+
+    # -----------------------------------------------------------------------
+    # Export Operations & Background Workers
+    # -----------------------------------------------------------------------
+
+    def _get_selected_account_ids(self) -> List[int]:
+        ids = []
+        for i in range(self.account_table.rowCount()):
+            item = self.account_table.item(i, 0)
+            if item and item.checkState() == Qt.Checked:
+                acc_id = item.data(Qt.UserRole)
+                if acc_id is not None:
+                    ids.append(acc_id)
+        if not ids:
+            active_id = self._get_active_row_account_id()
+            if active_id is not None:
+                ids.append(active_id)
+        return ids
 
     def _set_all_checkboxes(self, state: bool):
-        for row in range(self.account_table.rowCount()):
-            if not self.account_table.isRowHidden(row):
-                widget = self.account_table.cellWidget(row, 0)
-                if widget:
-                    chk = widget.findChild(QCheckBox)
-                    if chk:
-                        chk.setChecked(state)
-        self._update_stats_on_selection()
+        self.account_table.blockSignals(True)
+        for r in range(self.account_table.rowCount()):
+            if not self.account_table.isRowHidden(r):
+                item = self.account_table.item(r, 0)
+                if item:
+                    item.setCheckState(Qt.Checked if state else Qt.Unchecked)
+        self.account_table.blockSignals(False)
+        self._update_selection_count()
 
-    # -----------------------------------------------------------------------
-    # Helper & Slot implementations
-    # -----------------------------------------------------------------------
+    @Slot()
+    def _toggle_select_all_checkboxes(self):
+        self._all_selected_flag = not self._all_selected_flag
+        self._set_all_checkboxes(self._all_selected_flag)
+
+    @Slot(str)
+    def _on_sidebar_format_changed(self, fmt: str):
+        self._current_config["format"] = fmt
+        self.card_format.set_value(fmt)
+        self._on_log_message(f"Hedef aktarım biçimi değiştirildi: {fmt}")
 
     @Slot()
     def _open_config_dialog(self, account_id: Optional[int] = None):
         if account_id is None:
-            checked = self._get_checked_account_ids()
+            checked = self._get_selected_account_ids()
             if checked:
                 account_id = checked[0]
 
@@ -1615,237 +2810,24 @@ class ExportPanel(QWidget):
                 "since_date": f"{dialog.date_since.date().year()}-{dialog.date_since.date().month():02d}-{dialog.date_since.date().day():02d} 00:00:00" if dialog.chk_since.isChecked() else None,
                 "before_date": f"{dialog.date_before.date().year()}-{dialog.date_before.date().month():02d}-{dialog.date_before.date().day():02d} 23:59:59" if dialog.chk_before.isChecked() else None,
             }
-            self.refresh()
-            self.log_output.append("Export ayarları başarıyla güncellendi.")
+            self.card_format.set_value(fmt)
+            self._on_log_message("Dışa aktarım ayarları başarıyla güncellendi.")
 
-    @Slot(QComboBox)
-    def _open_config_dialog_for_combo(self, combo: QComboBox, account_id: Optional[int] = None):
-        selected_name = combo.currentText()
-        dialog = ExportConfigDialog(self.engine, self.settings, account_id=account_id, parent=self)
-        
-        if selected_name != "Default (ZIP)":
-            profiles = self.settings.get("export_profiles", [])
-            prof = next((p for p in profiles if isinstance(p, dict) and p.get("name") == selected_name), None)
-            if prof:
-                f_idx = dialog.combo_profile.findText(selected_name)
-                if f_idx >= 0:
-                    dialog.combo_profile.setCurrentIndex(f_idx)
-                    
-        if dialog.exec() == QDialog.Accepted:
-            self.refresh()
-
-    def _show_info_dialog(self, title: str, text: str):
-        dialog = QDialog(self)
-        dialog.setWindowTitle(title)
-        dialog.resize(550, 320)
-        dialog.setStyleSheet("QDialog { background-color: #f8fafc; } QLabel { color: #1e293b; font-weight: bold; }")
-        layout = QVBoxLayout(dialog)
-        
-        txt = QTextEdit()
-        txt.setReadOnly(True)
-        txt.setPlainText(text)
-        txt.setStyleSheet("QTextEdit { background-color: #ffffff; color: #0f172a; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; padding: 10px; }")
-        layout.addWidget(txt)
-        
-        btn = QPushButton("Kapat")
-        btn.setStyleSheet("QPushButton { background-color: #4361ee; color: white; font-weight: bold; padding: 6px 18px; border-radius: 4px; } QPushButton:hover { background-color: #3a56d4; }")
-        btn.clicked.connect(dialog.accept)
-        layout.addWidget(btn, 0, Qt.AlignCenter)
-        dialog.exec()
-
-    def _show_selected_accounts_info(self):
-        checked_ids = self._get_checked_account_ids()
-        if not checked_ids:
-            msg = "Şu anda tabloda hiçbir hesap seçili değil.\nLütfen en az bir hesabın onay kutusunu işaretleyin."
-        else:
-            msg = f"Seçilen hesap sayısı: {len(checked_ids)}\n\nHesap Listesi:\n"
-            try:
-                with self.engine.db.get_conn() as conn:
-                    placeholders = ",".join("?" for _ in checked_ids)
-                    rows = conn.execute(f"SELECT id, label, email FROM accounts WHERE id IN ({placeholders})").fetchall()
-                    for idx, r in enumerate(rows):
-                        msg += f"  {idx+1}. Etiket: {r['label']} | E-Posta: {r['email']} (ID: {r['id']})\n"
-            except Exception as e:
-                msg += f"Hesaplar yüklenirken hata oluştu: {e}"
-        self._show_info_dialog("Seçilen Hesap Detayları", msg)
-
-    def _show_archived_emails_info(self):
-        checked_ids = self._get_checked_account_ids()
-        if not checked_ids:
-            msg = "Toplam arşivlenen posta sayısını görmek için en az bir hesap seçin."
-        else:
-            msg = "Seçilen hesaplar için veritabanı istatistikleri:\n\n"
-            try:
-                with self.engine.db.get_conn() as conn:
-                    for aid in checked_ids:
-                        acc_row = conn.execute("SELECT label, email FROM accounts WHERE id=?", (aid,)).fetchone()
-                        cnt_row = conn.execute("SELECT COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (aid,)).fetchone()
-                        fld_row = conn.execute("SELECT COUNT(DISTINCT folder) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (aid,)).fetchone()
-                        
-                        label = acc_row["label"] if acc_row else f"ID: {aid}"
-                        email = acc_row["email"] if acc_row else "?"
-                        msg += f"• Hesap: {label} ({email})\n"
-                        msg += f"  - Arşivlenen Mailler: {cnt_row['cnt'] if cnt_row else 0}\n"
-                        msg += f"  - Klasörler: {fld_row['cnt'] if fld_row else 0}\n\n"
-            except Exception as e:
-                msg += f"İstatistikler sorgulanırken hata oluştu: {e}"
-        self._show_info_dialog("Arşiv Veritabanı Detayları", msg)
-
-    def _show_exported_count_info(self):
-        msg = f"Dışa Aktarım Raporu\n\nBu çalıştırmada başarıyla aktarılan toplam e-posta sayısı: {self.card_exported_count.value_label.text()}"
-        self._show_info_dialog("Aktarım İstatistikleri", msg)
-
-    def _show_errors_info(self):
-        msg = f"Hata Takip Özeti\n\nHata durumu: {self.card_error_count.value_label.text()}\nDetaylar için log konsolunu inceleyebilirsiniz."
-        self._show_info_dialog("Hata Özeti", msg)
-
-    def _show_migration_status_info(self):
-        msg = f"Mevcut Aktarım Durumu: {self.card_status.value_label.text()}\n\n- Idle: Komut bekleniyor.\n- Running: E-postalar aktarılıyor.\n- Complete: Tamamlandı."
-        self._show_info_dialog("Aktarım Durumu", msg)
-
-    @Slot()
-    def _check_inodes_and_report(self):
-        checked_ids = self._get_checked_account_ids()
-        if not checked_ids:
-            QMessageBox.warning(self, "Hesap Seçilmedi", "Lütfen sayım kontrolü için en az bir hesap seçin.")
-            return
-
-        first_checked_id = checked_ids[0]
-        row_idx = -1
-        for i in range(self.account_table.rowCount()):
-            widget = self.account_table.cellWidget(i, 0)
-            if widget:
-                chk = widget.findChild(QCheckBox)
-                if chk and chk.property("account_id") == first_checked_id:
-                    row_idx = i
-                    break
-
-        if row_idx == -1:
-            return
-
-        c = self._get_profile_for_row(row_idx)
-        fmt = c.get("format", "ZIP")
-        if fmt != "IMAP_SERVER":
-            QMessageBox.warning(self, "Desteklenmeyen Hedef", "Inode kontrolleri yalnızca hedef IMAP sunucuları için desteklenir.")
-            return
-
-        host = c.get("imap_host", "")
-        port_str = str(c.get("imap_port", "993"))
-        ssl = c.get("imap_ssl", True)
-        user = c.get("imap_username", "")
-        pwd_enc = c.get("imap_password_enc", "")
-        pwd = ""
-        if pwd_enc:
-            try:
-                pwd = self.engine.crypto.decrypt(pwd_enc)
-            except Exception:
-                pass
-
-        if not host or not user or not pwd:
-            QMessageBox.warning(self, "Eksik Kimlik Bilgileri", "Hedef IMAP sunucusu kimlik bilgileri eksik.")
-            return
-
-        self.btn_check_inodes.setEnabled(False)
-        self.btn_check_inodes.setText("⏳ Inode'lar Hesaplanıyor...")
-
-        def fetch_task():
-            try:
-                port = int(port_str) if port_str else (993 if ssl else 143)
-                if ssl:
-                    client = imaplib.IMAP4_SSL(host, port, timeout=15)
-                else:
-                    client = imaplib.IMAP4(host, port, timeout=15)
-                client.login(user, pwd)
-
-                status, data = client.list()
-                target_counts = {}
-                if status == "OK" and data:
-                    for line in data:
-                        if not line:
-                            continue
-                        line_str = line.decode('utf-8', errors='replace')
-                        m = re.search(r'"([^"]+)"$', line_str)
-                        fname = m.group(1) if m else line_str.split()[-1]
-                        st, cnt_data = client.select(f'"{fname}"', readonly=True)
-                        if st == "OK" and cnt_data:
-                            try:
-                                target_counts[fname] = int(cnt_data[0])
-                            except Exception:
-                                pass
-                client.logout()
-
-                # Populate report table
-                self.report_table.setRowCount(0)
-                with self.engine.db.get_conn() as conn:
-                    rows = conn.execute("SELECT folder, COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0 GROUP BY folder", (first_checked_id,)).fetchall()
-                    for r in rows:
-                        f_name = r["folder"]
-                        loc_cnt = r["cnt"]
-                        tgt_cnt = target_counts.get(f_name, "N/A")
-                        
-                        r_idx = self.report_table.rowCount()
-                        self.report_table.insertRow(r_idx)
-                        self.report_table.setItem(r_idx, 0, QTableWidgetItem(f_name))
-                        self.report_table.setItem(r_idx, 1, QTableWidgetItem(f"Yerel: {loc_cnt}"))
-                        self.report_table.setItem(r_idx, 2, QTableWidgetItem(f"Sunucu: {tgt_cnt}"))
-                        
-                        st_item = QTableWidgetItem("Eşleşti" if str(loc_cnt) == str(tgt_cnt) else "Farklı")
-                        st_item.setForeground(QColor("#10b981") if str(loc_cnt) == str(tgt_cnt) else QColor("#ef4444"))
-                        self.report_table.setItem(r_idx, 3, st_item)
-
-            except Exception as e:
-                self._log_signal.emit(f"❌ Inode kontolü başarısız: {e}")
-            finally:
-                self.btn_check_inodes.setEnabled(True)
-                self.btn_check_inodes.setText("🔍 INODE / MESAJ SAYILARINI KONTROL ET")
-
-        threading.Thread(target=fetch_task, daemon=True).start()
-
-    def _get_checked_account_ids(self) -> List[int]:
-        ids = []
-        for i in range(self.account_table.rowCount()):
-            widget = self.account_table.cellWidget(i, 0)
-            if widget:
-                chk = widget.findChild(QCheckBox)
-                if chk and chk.isChecked():
-                    ids.append(chk.property("account_id"))
-        return ids
-
-    def _get_profile_for_row(self, row_idx: int) -> dict:
-        prof_widget = self.account_table.cellWidget(row_idx, 6)
-        profile_name = "Default (ZIP)"
-        if prof_widget:
-            combo = prof_widget.findChild(QComboBox)
-            if combo:
-                profile_name = combo.currentText()
-        if profile_name == "Default (ZIP)":
-            return self._current_config
-        profiles = self.settings.get("export_profiles", [])
-        prof = next((p for p in profiles if isinstance(p, dict) and p.get("name") == profile_name), None)
-        return prof or {"format": "ZIP", "target_path": str(Path("data/exports"))}
-
-    def _get_export_stats_for_checked(self) -> list:
-        checked_ids = self._get_checked_account_ids()
+    def _get_export_stats_for_checked(self, account_ids: List[int]) -> list:
         stats = []
-        for idx, acc_id in enumerate(checked_ids):
-            row_idx = -1
-            for r_i in range(self.account_table.rowCount()):
-                widget = self.account_table.cellWidget(r_i, 0)
-                if widget:
-                    chk = widget.findChild(QCheckBox)
-                    if chk and chk.property("account_id") == acc_id:
-                        row_idx = r_i
-                        break
-            if row_idx == -1:
-                continue
+        c = self._current_config
+        folders = c.get("folders")
+        since_date = c.get("since_date")
+        before_date = c.get("before_date")
+        fmt = c.get("format") or "ZIP"
+        raw_path = c.get("target_path") or "data/exports"
 
-            c = self._get_profile_for_row(row_idx)
-            folders = c.get("folders")
-            since_date = c.get("since_date")
-            before_date = c.get("before_date")
+        for aid in account_ids:
+            acc = self.engine.accounts.get(aid)
+            account_label = acc.get("label", f"Hesap #{aid}") if acc else f"Hesap #{aid}"
 
             conditions = ["account_id = ?", "is_deleted = 0"]
-            params = [acc_id]
+            params = [aid]
             
             if folders:
                 placeholders = ", ".join("?" for _ in folders)
@@ -1873,37 +2855,27 @@ class ExportPanel(QWidget):
                 total_mails = 0
                 total_folders = 0
 
-            account_label = ""
-            lbl_item = self.account_table.item(row_idx, 1)
-            if lbl_item:
-                account_label = lbl_item.text()
-
-            fmt = c.get("format") or "ZIP"
-            raw_path = c.get("target_path") or "data/exports"
-            
-            acc = self.engine.accounts.get(acc_id)
             raw_sub = acc.get("export_subfolder") or "" if acc else ""
             subfolder = re.sub(r'[\/:*?"<>|]', '_', raw_sub).strip()
             
             if fmt == "IMAP_SERVER":
                 target_host = c.get("imap_host") or "Target IMAP"
-                resolved_target = f"IMAP Server: {target_host} (Alt klasör: {subfolder})" if subfolder else f"IMAP Server: {target_host}"
+                resolved_target = f"IMAP: {target_host} ({subfolder})" if subfolder else f"IMAP: {target_host}"
             else:
                 path = Path(raw_path)
                 if fmt == "DIRECTORY":
                     resolved_target = str(path / subfolder) if subfolder else str(path)
                 else:
                     if path.suffix == "":
-                        ext_map = {"ZIP": ".zip", "JSON": ".json", "MBOX": ".mbox"}
-                        filename = f"mails_{acc_id}{ext_map.get(fmt, '.zip')}"
+                        ext_map = {"ZIP": ".zip", "JSON": ".json", "MBOX": ".mbox", "PST": ".pst"}
+                        filename = f"mails_{aid}{ext_map.get(fmt, '.zip')}"
                         path = path / filename
                     resolved_target = str(path.parent / subfolder / path.name) if subfolder else str(path)
 
             stats.append({
-                "account_id": acc_id,
-                "label": account_label or f"Hesap #{acc_id}",
+                "account_id": aid,
+                "label": account_label,
                 "folders": total_folders,
-                "folders_list": folders,
                 "mails": total_mails,
                 "format": fmt,
                 "resolved_target": resolved_target,
@@ -1912,22 +2884,64 @@ class ExportPanel(QWidget):
         return stats
 
     @Slot()
-    def _run_export_on_checked(self):
-        checked_ids = self._get_checked_account_ids()
-        if not checked_ids:
-            QMessageBox.warning(self, "Hesap Seçilmedi", "Lütfen tablodan en az bir hesap işaretleyin.")
+    def _dry_run_preview(self):
+        checked = self._get_selected_account_ids()
+        if not checked:
+            checked = list(self._accounts_ui.keys())
+        if not checked:
+            QMessageBox.warning(self, "Hesap Bulunamadı", "Sistemde önizlenecek hesap bulunamadı.")
             return
 
-        stats = self._get_export_stats_for_checked()
+        previews = self._get_export_stats_for_checked(checked)
+        dlg = ExportConfirmDialog(previews, self)
+        dlg.exec()
+
+    @Slot()
+    def _export_selected(self):
+        checked = self._get_selected_account_ids()
+        if not checked:
+            QMessageBox.warning(self, "Hesap Seçilmedi", "Lütfen tablodan en az bir hesap işaretleyin.")
+            return
+        self._start_export_batch(checked)
+
+    @Slot()
+    def _export_all(self):
+        all_ids = list(self._accounts_ui.keys())
+        if not all_ids:
+            QMessageBox.warning(self, "Hesap Yok", "Dışa aktarılacak hesap bulunamadı.")
+            return
+        self._start_export_batch(all_ids)
+
+    @Slot()
+    def _export_selected_group(self):
+        active_group = self.left_sidebar.get_selected_group()
+        if not active_group or active_group == "__ALL__" or active_group == "Tümü":
+            self._export_selected()
+            return
+        
+        group_ids = []
+        for aid, ui in self._accounts_ui.items():
+            if not self.account_table.isRowHidden(ui["row"]):
+                group_ids.append(aid)
+        
+        if not group_ids:
+            QMessageBox.warning(self, "Hesap Yok", f"'{active_group}' grubunda hesap bulunamadı.")
+            return
+        self._start_export_batch(group_ids)
+
+    def _export_single_account(self, account_id: int):
+        self._start_export_batch([account_id])
+
+    def _start_export_batch(self, account_ids: List[int]):
+        stats = self._get_export_stats_for_checked(account_ids)
         
         dialog = ExportConfirmDialog(stats, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        # Prepare export tasks on the main GUI thread
         tasks = []
         for st in stats:
-            acc_id = st["account_id"]
+            aid = st["account_id"]
             c = st.get("config") or {}
             fmt = c.get("format", "ZIP")
             resolved_target = st.get("resolved_target") or c.get("target_path") or "data/exports"
@@ -1951,21 +2965,20 @@ class ExportPanel(QWidget):
                         pass
 
                 if not imap_host or not imap_username or not imap_password:
-                    self.log_output.append(f"⚠️ Hesap ID {acc_id} atlanıyor: IMAP kimlik bilgileri eksik.")
+                    self._on_log_message(f"⚠️ Hesap ID {aid} atlanıyor: IMAP kimlik bilgileri eksik.")
                     continue
                 try:
                     imap_port = int(port_str) if port_str else 993
                 except ValueError:
-                    self.log_output.append(f"⚠️ Hesap ID {acc_id} atlanıyor: Port biçim hatası.")
+                    self._on_log_message(f"⚠️ Hesap ID {aid} atlanıyor: Port biçim hatası.")
                     continue
 
             folders = c.get("folders")
             since_date = c.get("since_date")
             before_date = c.get("before_date")
-            server_host_filter = c.get("server_host")
 
             tasks.append({
-                "acc_id": acc_id,
+                "acc_id": aid,
                 "fmt": fmt,
                 "target_path": target_path,
                 "folders": folders,
@@ -1976,377 +2989,231 @@ class ExportPanel(QWidget):
                 "imap_ssl": imap_ssl,
                 "imap_username": imap_username,
                 "imap_password": imap_password,
-                "server_host": server_host_filter,
             })
 
         if not tasks:
             QMessageBox.warning(self, "Geçersiz Konfigürasyon", "Seçili hesaplar için geçerli bir dışa aktarım konfigürasyonu bulunamadı.")
             return
 
-        self.btn_export_selected.setEnabled(False)
-        self.btn_configure.setEnabled(False)
-        self.card_status.set_value("Running")
-        self.overall_progress.setVisible(True)
-        self.overall_progress.setValue(0)
+        self._session_reports.clear()
+        self._is_paused = False
+        self._pause_event.set()
+        self._cancel_event.clear()
 
-        self.log_output.append(f"=== {len(tasks)} adet hesap için dışa aktarım başlatılıyor ===")
+        self.btn_export.setEnabled(False)
+        self.btn_export_all.setEnabled(False)
+        self.btn_pause.setEnabled(True)
+        self.btn_cancel.setEnabled(True)
+        self.right_sidebar.btn_pause.setEnabled(True)
+        self.right_sidebar.btn_cancel.setEnabled(True)
 
-        self.report_table.setColumnCount(4)
-        self.report_table.setHorizontalHeaderLabels(["Klasör / Mail", "Gönderen", "Tarih", "Durum"])
-        self.report_table.setRowCount(0)
+        self.lbl_stat_active.setText(f"🟢 {len(tasks)} Aktarılıyor")
+        self._on_log_message(f"=== {len(tasks)} adet hesap için dışa aktarım başlatılıyor ===")
 
         def run_all():
             try:
-                total_tasks = len(tasks)
                 for idx, task in enumerate(tasks):
-                    acc_id = task["acc_id"]
-                    cancel_event = threading.Event()
-                    self._active_exports[acc_id] = {
-                        "cancel_event": cancel_event,
-                        "status": "Starting",
-                    }
-
-                    def make_cb(aid):
+                    if self._cancel_event.is_set():
+                        break
+                    
+                    self._pause_event.wait()
+                    aid = task["acc_id"]
+                    
+                    def make_cb(acc_id):
                         def cb(current, total, email_meta=None):
-                            self._progress_signal.emit(aid, "Dışa Aktarılıyor", current, total, email_meta)
+                            self._account_progress_signal.emit(acc_id, "Dışa Aktarılıyor", current, total, email_meta)
                         return cb
 
                     try:
                         report = self.engine.export_mails(
-                            account_id=acc_id,
+                            account_id=aid,
                             format_type=task["fmt"],
                             output_path=task["target_path"],
                             folders=task["folders"],
                             since_date=task["since_date"],
                             before_date=task["before_date"],
-                            progress_callback=make_cb(acc_id),
+                            progress_callback=make_cb(aid),
                             imap_host=task["imap_host"],
                             imap_port=task["imap_port"],
                             imap_ssl=task["imap_ssl"],
                             imap_username=task["imap_username"],
                             imap_password=task["imap_password"],
-                            server_host=task.get("server_host"),
                         )
-                        self._export_done_signal.emit(acc_id, report)
+                        self._account_export_done_signal.emit(aid, report)
                     except Exception as exc:
-                        logger.exception("Export failed for account %d: %s", acc_id, exc)
-                        self._export_error_signal.emit(acc_id, str(exc))
+                        logger.exception("Export failed for account %d: %s", aid, exc)
+                        self._account_export_error_signal.emit(aid, str(exc))
 
-                    pct = int((idx + 1) * 100 / total_tasks)
-                    self._overall_progress_signal.emit(pct)
             finally:
                 self._export_all_finished_signal.emit()
 
         threading.Thread(target=run_all, daemon=True).start()
 
     @Slot(int, str, int, int, object)
-    def _on_export_progress(self, account_id: int, status_text: str, current: int, total: int, email_meta: object):
-        ui = self._accounts_ui.get(account_id)
+    def _on_account_progress(self, aid: int, status_text: str, current: int, total: int, email_meta: object):
+        ui = self._accounts_ui.get(aid)
         if ui:
-            ui["lbl_status"].setText(f"{status_text} ({current}/{total})")
+            ui["lbl_status"].setText(f"⏳ {status_text} ({current}/{total})")
             ui["progress_bar"].setRange(0, total if total > 0 else 100)
             ui["progress_bar"].setValue(current)
             left = max(0, total - current)
-            ui["progress_bar"].setFormat(f"{current} / {left}")
-        self.card_exported_count.set_value(str(current))
+            ui["progress_bar"].setFormat(f"{current} / {left} Kaldı")
+            self.card_progress.set_value(f"{current} / {total}")
+            self.card_remaining.set_value(f"{left}")
 
         if email_meta and isinstance(email_meta, dict):
-            row = self.report_table.rowCount()
-            self.report_table.insertRow(row)
-            subj = str(email_meta.get('subject', '') or '')[:20]
-            fld = str(email_meta.get('folder', '') or '')
-            sender = str(email_meta.get('sender', '') or '')[:20]
-            dt = str(email_meta.get('date', '') or '')[:10]
-            self.report_table.setItem(row, 0, QTableWidgetItem(f"{fld} / {subj}"))
-            self.report_table.setItem(row, 1, QTableWidgetItem(sender))
-            self.report_table.setItem(row, 2, QTableWidgetItem(dt))
-            
-            st = str(email_meta.get("status", "Dışa Aktarıldı"))
-            st_item = QTableWidgetItem(st)
-            if "Mevcut" in st or "Duplicate" in st:
-                st_item.setForeground(QColor("#f59e0b"))
-            elif "Gönderildi" in st or "Exported" in st or "Aktarıldı" in st:
-                st_item.setForeground(QColor("#10b981"))
-            elif "Hata" in st or "Error" in st:
-                st_item.setForeground(QColor("#ef4444"))
-            self.report_table.setItem(row, 3, st_item)
-            self.report_table.scrollToBottom()
+            subj = str(email_meta.get('subject', '') or '')[:30]
+            self._on_log_message(f"[{aid}] Aktarıldı: {subj}")
 
-    @Slot(int)
-    def _on_overall_progress(self, pct: int):
-        self.overall_progress.setValue(pct)
+    @Slot(int, object)
+    def _on_account_export_done(self, aid: int, report: dict):
+        ui = self._accounts_ui.get(aid)
+        if ui:
+            ui["lbl_status"].setText("✅ Tamamlandı")
+            ui["progress_bar"].setRange(0, 100)
+            ui["progress_bar"].setValue(100)
+            ui["progress_bar"].setFormat("Tamamlandı")
+        
+        self._session_reports.append(report)
+        exported = report.get('exported', 0) if isinstance(report, dict) else getattr(report, 'exported', 0)
+        self._on_log_message(f"✅ Hesap ID {aid} aktarımı tamamlandı ({exported} e-posta).")
+
+    @Slot(int, str)
+    def _on_account_export_error(self, aid: int, err_msg: str):
+        ui = self._accounts_ui.get(aid)
+        if ui:
+            ui["lbl_status"].setText("❌ Hata")
+            ui["lbl_status"].setStyleSheet("color: #dc2626; font-weight: bold;")
+        self._on_log_message(f"❌ Hesap ID {aid} aktarım hatası: {err_msg}")
 
     @Slot()
     def _on_export_all_finished(self):
-        self.card_status.set_value("Idle")
-        self.btn_export_selected.setEnabled(True)
-        self.btn_configure.setEnabled(True)
-        self.overall_progress.setVisible(False)
+        self.btn_export.setEnabled(True)
+        self.btn_export_all.setEnabled(True)
+        self.btn_pause.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
+        self.right_sidebar.btn_pause.setEnabled(False)
+        self.right_sidebar.btn_cancel.setEnabled(False)
+        self.lbl_stat_active.setText("🟢 0 Aktarılıyor")
+        self.card_progress.set_value("Tamamlandı")
 
-    @Slot(int, object)
-    def _on_export_done(self, account_id: int, report: dict):
-        ui = self._accounts_ui.get(account_id)
-        if ui:
-            ui["btn_start"].setEnabled(True)
-            ui["lbl_status"].setText("Done")
-            ui["progress_bar"].setRange(0, 100)
-            ui["progress_bar"].setValue(100)
-            ui["progress_bar"].setFormat("Done")
-        self._active_exports.pop(account_id, None)
-        self.log_output.append(f"✅ Hesap ID {account_id} dışa aktarımı tamamlandı: {report.get('exported', 0)} aktarıldı, {report.get('errors', 0)} hata.")
-        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
+        if self._session_reports:
+            dlg = ExportFinishedDialog(self)
+            if dlg.exec() == QDialog.Accepted:
+                self._show_reports()
 
-    @Slot(int, str)
-    def _on_export_error(self, account_id: int, err_msg: str):
-        ui = self._accounts_ui.get(account_id)
-        if ui:
-            ui["btn_start"].setEnabled(True)
-            ui["lbl_status"].setText("Error")
-            ui["progress_bar"].setRange(0, 100)
-            ui["progress_bar"].setValue(0)
-        self._active_exports.pop(account_id, None)
-        self.log_output.append(f"❌ Hesap ID {account_id} aktarımı başarısız: {err_msg}")
-        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
-        self.card_error_count.set_value("Error")
+    @Slot()
+    def _toggle_pause_export(self):
+        self._is_paused = not self._is_paused
+        if self._is_paused:
+            self._pause_event.clear()
+            self.btn_pause.setText("▶️ Devam Et")
+            self.right_sidebar.btn_pause.setText("▶️ Devam Et")
+            self._on_log_message("⏸️ Aktarım işlemleri kullanıcı tarafından duraklatıldı.")
+        else:
+            self._pause_event.set()
+            self.btn_pause.setText("⏸️ Duraklat")
+            self.right_sidebar.btn_pause.setText("⏸️ Tümünü Duraklat")
+            self._on_log_message("▶️ Aktarım işlemleri devam ettiriliyor.")
 
-    @Slot(str)
-    def _on_log_message(self, msg: str):
-        self.log_output.append(msg)
-        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
+    @Slot()
+    def _cancel_export(self):
+        reply = QMessageBox.question(self, "İptal Et", "Aktif dışa aktarım işlemlerini iptal etmek istiyor musunuz?", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self._cancel_event.set()
+            self._pause_event.set()
+            self._on_log_message("⏹️ Aktarım iptal isteği gönderildi...")
 
-    def _update_stats_on_selection(self):
-        checked = self._get_checked_account_ids()
-        self.card_total_selected.set_value(str(len(checked)))
-        total_mails = 0
-        if checked:
-            try:
-                with self.engine.db.get_conn() as conn:
-                    placeholders = ",".join("?" for _ in checked)
-                    row = conn.execute(f"SELECT COUNT(*) as cnt FROM mail_metadata WHERE account_id IN ({placeholders}) AND is_deleted=0", checked).fetchone()
-                    total_mails = row["cnt"] if row else 0
-            except Exception:
-                pass
-        self.card_total_mails.set_value(str(total_mails))
+    @Slot()
+    def _show_reports(self):
+        if not self._session_reports:
+            QMessageBox.information(self, "Rapor Yok", "Bu oturumda henüz tamamlanmış bir dışa aktarım raporu bulunmuyor.")
+            return
+        dlg = ExportReportsDialog(self._session_reports, self)
+        dlg.exec()
 
-    # -----------------------------------------------------------------------
-    # Data Refresh & Grid Rendering
-    # -----------------------------------------------------------------------
-
-    def refresh(self):
-        self.account_table.blockSignals(True)
-        self.account_table.setRowCount(0)
-        self._accounts_ui.clear()
-        
+    @Slot()
+    def _export_to_excel(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Excel / CSV Olarak Kaydet", "export_accounts.csv", "CSV Files (*.csv);;Excel Files (*.xlsx)")
+        if not path:
+            return
         try:
-            accounts = self.engine.list_accounts()
-            self.account_table.setRowCount(len(accounts))
-            
-            profiles = self.settings.get("export_profiles", [])
-            profile_names = [p.get("name") for p in profiles if isinstance(p, dict) and p.get("name")]
-            
-            domains = set()
-            groups = set()
-
-            for i, acc in enumerate(accounts):
-                acc_id = acc["id"]
-                label = acc.get("label", "")
-                email = acc.get("email", "")
-                host = acc.get("imap_host", "")
-                group_val = acc.get("account_group", "").strip()
-                
-                domain_val = email.split("@")[-1] if "@" in email else "Diğer"
-                domains.add(domain_val)
-                if group_val:
-                    groups.add(group_val)
-
-                # Query counts
-                local_mails_cnt = 0
-                folders_cnt = 0
-                try:
-                    with self.engine.db.get_conn() as conn:
-                        row_mails = conn.execute("SELECT COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (acc_id,)).fetchone()
-                        local_mails_cnt = row_mails["cnt"] if row_mails else 0
-                        row_folders = conn.execute("SELECT COUNT(DISTINCT folder) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (acc_id,)).fetchone()
-                        folders_cnt = row_folders["cnt"] if row_folders else 0
-                except Exception:
-                    pass
-
-                # Col 0: Checkbox
-                chk_widget = QWidget()
-                chk_widget.setStyleSheet("background: transparent;")
-                chk_layout = QHBoxLayout(chk_widget)
-                chk_layout.setContentsMargins(0, 0, 0, 0)
-                
-                chk = QCheckBox()
-                chk.setStyleSheet("""
-                    QCheckBox::indicator {
-                        width: 18px;
-                        height: 18px;
-                        border: 2px solid #4361ee;
-                        border-radius: 4px;
-                        background-color: #ffffff;
-                    }
-                    QCheckBox::indicator:checked {
-                        background-color: #10b981;
-                        border-color: #10b981;
-                        image: url("data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22white%22%20stroke-width%3D%224%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpolyline%20points%3D%2220%206%209%2017%204%2012%22%3E%3C%2Fpolyline%3E%3C%2Fsvg%3E");
-                    }
-                """)
-                chk.setProperty("account_id", acc_id)
-                chk.setChecked(False)
-                chk.toggled.connect(lambda checked: self._update_stats_on_selection())
-                chk_layout.addWidget(chk, 0, Qt.AlignCenter)
-                self.account_table.setCellWidget(i, 0, chk_widget)
-
-                # Col 1: Account Label (Crisp & Bold)
-                item_label = QTableWidgetItem(label)
-                item_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
-                item_label.setForeground(QColor("#1e293b"))
-                self.account_table.setItem(i, 1, item_label)
-
-                # Col 2: Email Address (High Contrast, Readable)
-                item_email = QTableWidgetItem(email)
-                item_email.setFont(QFont("Segoe UI", 10))
-                item_email.setForeground(QColor("#0369a1"))
-                self.account_table.setItem(i, 2, item_email)
-
-                # Col 3: Domain / Group
-                dom_grp_str = f"{domain_val} | {group_val}" if group_val else domain_val
-                item_dom = QTableWidgetItem(dom_grp_str)
-                item_dom.setFont(QFont("Segoe UI", 9))
-                item_dom.setForeground(QColor("#475569"))
-                self.account_table.setItem(i, 3, item_dom)
-
-                # Col 4: Host
-                item_host = QTableWidgetItem(host)
-                item_host.setFont(QFont("Segoe UI", 9))
-                item_host.setForeground(QColor("#64748b"))
-                self.account_table.setItem(i, 4, item_host)
-
-                # Col 5: Stats
-                stats_str = f"📁 {folders_cnt} klasör  |  📧 {local_mails_cnt} mail"
-                item_stats = QTableWidgetItem(stats_str)
-                item_stats.setFont(QFont("Segoe UI", 9, QFont.Bold))
-                item_stats.setForeground(QColor("#047857"))
-                self.account_table.setItem(i, 5, item_stats)
-
-                # Col 6: Export Profile Dropdown + ⚙️ Button
-                prof_widget = QWidget()
-                prof_widget.setStyleSheet("background: transparent;")
-                prof_layout = QHBoxLayout(prof_widget)
-                prof_layout.setContentsMargins(2, 2, 2, 2)
-                prof_layout.setSpacing(4)
-                
-                combo = QComboBox()
-                combo.setStyleSheet("""
-                    QComboBox {
-                        background-color: #ffffff;
-                        color: #0f172a;
-                        border: 1px solid #cbd5e1;
-                        border-radius: 4px;
-                        padding: 3px;
-                        font-size: 11px;
-                        min-width: 110px;
-                    }
-                """)
-                combo.addItem("Default (ZIP)")
-                for name in profile_names:
-                    combo.addItem(name)
-                
-                btn_edit_prof = QPushButton("⚙")
-                btn_edit_prof.setToolTip("Profili Düzenle")
-                btn_edit_prof.setCursor(Qt.PointingHandCursor)
-                btn_edit_prof.setStyleSheet("QPushButton { background-color: #f1f5f9; color: #0f172a; border: 1px solid #cbd5e1; border-radius: 4px; font-weight: bold; font-size: 11px; padding: 3px; min-width: 22px; max-width: 22px; } QPushButton:hover { background-color: #cbd5e1; }")
-                btn_edit_prof.clicked.connect(lambda checked, c=combo, aid=acc_id: self._open_config_dialog_for_combo(c, aid))
-                
-                prof_layout.addWidget(combo, stretch=1)
-                prof_layout.addWidget(btn_edit_prof)
-                self.account_table.setCellWidget(i, 6, prof_widget)
-
-                # Col 7: Progress & Status
-                prog_widget = QWidget()
-                prog_widget.setStyleSheet("background: transparent;")
-                prog_layout = QVBoxLayout(prog_widget)
-                prog_layout.setContentsMargins(4, 2, 4, 2)
-                prog_layout.setSpacing(2)
-                
-                lbl_status = QLabel("Bekliyor")
-                lbl_status.setStyleSheet("color: #475569; font-size: 10px; background: transparent;")
-                progress_bar = QProgressBar()
-                progress_bar.setRange(0, 100)
-                progress_bar.setValue(0)
-                progress_bar.setTextVisible(True)
-                progress_bar.setFormat("0 / 0")
-                progress_bar.setStyleSheet("""
-                    QProgressBar {
-                        background: #e2e8f0;
-                        border: none;
-                        border-radius: 3px;
-                        height: 10px;
-                        font-size: 8px;
-                        text-align: center;
-                        color: #1e293b;
-                    }
-                    QProgressBar::chunk {
-                        background: #4361ee;
-                        border-radius: 3px;
-                    }
-                """)
-                prog_layout.addWidget(lbl_status)
-                prog_layout.addWidget(progress_bar)
-                self.account_table.setCellWidget(i, 7, prog_widget)
-
-                # Col 8: Actions
-                actions_widget = QWidget()
-                actions_widget.setStyleSheet("background: transparent;")
-                actions_layout = QHBoxLayout(actions_widget)
-                actions_layout.setContentsMargins(2, 2, 2, 2)
-                actions_layout.setSpacing(4)
-                
-                btn_start = QPushButton("▶")
-                btn_start.setToolTip("Bu Hesap İçin Aktarımı Başlat")
-                btn_start.setStyleSheet("background:#10b981; color:white; font-size:10px; font-weight:bold; padding:3px 6px; border-radius:3px;")
-                btn_start.clicked.connect(lambda checked, aid=acc_id: self._run_individual_export(aid))
-                
-                actions_layout.addWidget(btn_start)
-                self.account_table.setCellWidget(i, 8, actions_widget)
-
-                self._accounts_ui[acc_id] = {
-                    "chk": chk,
-                    "lbl_status": lbl_status,
-                    "progress_bar": progress_bar,
-                    "btn_start": btn_start,
-                }
-
-            # Update Domain & Group Combo boxes
-            self.combo_domain.blockSignals(True)
-            self.combo_domain.clear()
-            self.combo_domain.addItem("Tüm Domainler")
-            for d in sorted(domains):
-                self.combo_domain.addItem(d)
-            self.combo_domain.blockSignals(False)
-
-            self.combo_group.blockSignals(True)
-            self.combo_group.clear()
-            self.combo_group.addItem("Tüm Gruplar")
-            for g in sorted(groups):
-                self.combo_group.addItem(g)
-            self.combo_group.blockSignals(False)
-
-            self.grid.update_counter()
-            self._apply_filters()
-
+            import csv
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Hesap ID", "Hesap Etiketi", "E-Posta", "Domain/Grup", "Klasör Sayısı", "Mail Sayısı"])
+                accounts = self.engine.list_accounts()
+                with self.engine.db.get_conn() as conn:
+                    for acc in accounts:
+                        aid = acc["id"]
+                        row_m = conn.execute("SELECT COUNT(*) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (aid,)).fetchone()
+                        row_f = conn.execute("SELECT COUNT(DISTINCT folder) as cnt FROM mail_metadata WHERE account_id=? AND is_deleted=0", (aid,)).fetchone()
+                        m_cnt = row_m["cnt"] if row_m else 0
+                        f_cnt = row_f["cnt"] if row_f else 0
+                        writer.writerow([aid, acc.get("label", ""), acc.get("email", ""), acc.get("account_group", ""), f_cnt, m_cnt])
+            QMessageBox.information(self, "Başarılı", f"Hesap listesi başarıyla kaydedildi:\n{path}")
         except Exception as e:
-            logger.error("Hesap listesi yenilenirken hata oluştu: %s", e)
-        finally:
-            self.account_table.blockSignals(False)
+            QMessageBox.critical(self, "Hata", f"Dosya kaydedilemedi: {e}")
 
-    def _run_individual_export(self, account_id: int):
-        for i in range(self.account_table.rowCount()):
-            widget = self.account_table.cellWidget(i, 0)
-            if widget:
-                chk = widget.findChild(QCheckBox)
-                if chk:
-                    chk.setChecked(chk.property("account_id") == account_id)
-        self._update_stats_on_selection()
-        self._run_export_on_checked()
+    @Slot()
+    def _copy_all_emails_to_clipboard(self):
+        accounts = self.engine.list_accounts()
+        emails = [acc.get("email", "") for acc in accounts if acc.get("email")]
+        if emails:
+            QApplication.clipboard().setText("\n".join(emails))
+            QMessageBox.information(self, "Kopyalandı", f"Toplam {len(emails)} adet e-posta adresi panoya kopyalandı.")
+        else:
+            QMessageBox.warning(self, "Bulunamadı", "Kopyalanacak e-posta adresi bulunamadı.")
+
+    # -----------------------------------------------------------------------
+    # Helper Button Styles
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _toggle_btn_style() -> str:
+        return """
+            QPushButton {
+                background-color: #f1f5f9;
+                color: #1e293b;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11.5px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background-color: #e2e8f0; border-color: #94a3b8; }
+        """
+
+    @staticmethod
+    def _badge_style(bg: str = "#e0e7ff", fg: str = "#1e3a8a") -> str:
+        return f"""
+            QLabel {{
+                background-color: {bg};
+                color: {fg};
+                border-radius: 6px;
+                padding: 4px 8px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+        """
+
+    @staticmethod
+    def _blue_btn_style(bg: str = "#2563eb", hover: str = "#1d4ed8", py: int = 4, px: int = 8, fs: float = 11) -> str:
+        return f"""
+            QPushButton {{
+                background-color: {bg};
+                color: #ffffff;
+                font-weight: 700;
+                font-size: {fs}px;
+                padding: {py}px {px}px;
+                border-radius: 6px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: {hover};
+            }}
+            QPushButton:disabled {{
+                background-color: #cbd5e1;
+                color: #94a3b8;
+            }}
+        """

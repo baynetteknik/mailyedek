@@ -16,6 +16,9 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from core.crypto_utils import CryptoManager
 from core.database import DatabaseManager
 from core.event_bus import EventBus, Event, Events, get_event_bus
+from core.auth_manager import AuthManager, SessionManager
+from infrastructure.disk_watcher import DiskWatcher
+from infrastructure.email_notifier import EmailNotifier
 from domain.repositories import (
     IAccountRepository, IMailRepository, ISyncStateRepository,
     IAttachmentRepository, IDeduplicationRepository,
@@ -33,6 +36,8 @@ from usecases.backup_usecase import ArchiveFilter
 from usecases.backup_usecase import BackupUseCase
 from usecases.restore_usecase import RestoreUseCase
 from usecases.export_usecase import ExportUseCase
+from usecases.sql_backup_usecase import SqlBackupUseCase
+from usecases.vhdx_backup_usecase import VhdxBackupUseCase
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +57,9 @@ class MailEngine:
         self.db = DatabaseManager(db_path=db_path)
         self.event_bus = get_event_bus()
         self.reporter = ReportGenerator()
+        self.auth = AuthManager.get_instance(self.db)
+        self.disk_watcher = DiskWatcher()
+        self.email_notifier = EmailNotifier()
 
         # Repositories
         self.accounts = SqliteAccountRepository(self.db)
@@ -85,6 +93,18 @@ class MailEngine:
             event_bus=self.event_bus,
             crypto=self.crypto,
             provider_registry=self.provider_registry,
+        )
+        self.sql_backup_usecase = SqlBackupUseCase(
+            db=self.db,
+            audit_repo=self.audit,
+            event_bus=self.event_bus,
+            crypto=self.crypto,
+        )
+        self.vhdx_backup_usecase = VhdxBackupUseCase(
+            db=self.db,
+            audit_repo=self.audit,
+            event_bus=self.event_bus,
+            crypto=self.crypto,
         )
         self.restore_usecase = RestoreUseCase(
             db=self.db,
@@ -367,6 +387,90 @@ class MailEngine:
             credentials_path=credentials_path,
         )
         return report.__dict__
+
+    # ------------------------------------------------------------------
+    # SQL Database Backup operations
+    # ------------------------------------------------------------------
+
+    def test_sql_connection(
+        self, engine_type: str, host: str, port: int = 1433,
+        auth_type: str = "windows", username: str = "", password: str = "",
+        database_name: str = "master"
+    ) -> tuple[bool, str]:
+        return self.sql_backup_usecase.test_connection(
+            engine_type=engine_type,
+            host=host,
+            port=port,
+            auth_type=auth_type,
+            username=username,
+            password=password,
+            database_name=database_name,
+        )
+
+    def list_sql_databases(
+        self, engine_type: str, host: str, port: int = 1433,
+        auth_type: str = "windows", username: str = "", password: str = ""
+    ) -> List[str]:
+        return self.sql_backup_usecase.list_databases(
+            engine_type=engine_type,
+            host=host,
+            port=port,
+            auth_type=auth_type,
+            username=username,
+            password=password,
+        )
+
+    def save_sql_job(self, job_data: Dict[str, Any]) -> int:
+        return self.sql_backup_usecase.save_job(job_data)
+
+    def get_sql_job(self, job_id: int) -> Optional[Dict[str, Any]]:
+        return self.sql_backup_usecase.get_job(job_id)
+
+    def list_sql_jobs(self) -> List[Dict[str, Any]]:
+        return self.sql_backup_usecase.list_jobs()
+
+    def delete_sql_job(self, job_id: int) -> bool:
+        return self.sql_backup_usecase.delete_job(job_id)
+
+    def run_sql_backup(
+        self, job_params: Union[int, Dict[str, Any]],
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> Dict[str, Any]:
+        report = self.sql_backup_usecase.execute_backup(job_params, progress_callback=progress_callback)
+        return report.__dict__
+
+    # ------------------------------------------------------------------
+    # VHDX & Hyper-V Virtual Disk Backup operations
+    # ------------------------------------------------------------------
+
+    def list_hyperv_vms(self) -> List[Dict[str, Any]]:
+        return self.vhdx_backup_usecase.list_hyperv_vms()
+
+    def save_vhdx_job(self, job_data: Dict[str, Any]) -> int:
+        return self.vhdx_backup_usecase.save_job(job_data)
+
+    def get_vhdx_job(self, job_id: int) -> Optional[Dict[str, Any]]:
+        return self.vhdx_backup_usecase.get_job(job_id)
+
+    def list_vhdx_jobs(self) -> List[Dict[str, Any]]:
+        return self.vhdx_backup_usecase.list_jobs()
+
+    def delete_vhdx_job(self, job_id: int) -> bool:
+        return self.vhdx_backup_usecase.delete_job(job_id)
+
+    def run_vhdx_backup(
+        self, job_params: Union[int, Dict[str, Any]],
+        progress_callback: Optional[Callable[[str, float, float], None]] = None
+    ) -> Dict[str, Any]:
+        report = self.vhdx_backup_usecase.execute_backup(job_params, progress_callback=progress_callback)
+        return report.__dict__
+
+    # ------------------------------------------------------------------
+    # Unified Backup History
+    # ------------------------------------------------------------------
+
+    def list_backup_history(self, limit: int = 100, offset: int = 0, job_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self.db.list_backup_history(limit=limit, offset=offset, job_type=job_type)
 
     # ------------------------------------------------------------------
     # Restore operations
@@ -745,6 +849,110 @@ class MailEngine:
         }
 
     # ------------------------------------------------------------------
+    # User Management & Authentication (RBAC)
+    # ------------------------------------------------------------------
+
+    def login(self, username: str, password: str) -> tuple[bool, Optional[Any], str]:
+        """Authenticate user by username and password."""
+        return self.auth.login(username, password)
+
+    def logout(self) -> None:
+        """Clear active user session."""
+        self.auth.logout()
+
+    def get_current_user(self) -> Optional[Any]:
+        """Get currently logged-in user."""
+        return self.auth.current_user
+
+    def has_permission(self, permission: str) -> bool:
+        """Check if current active user has specific permission."""
+        return self.auth.has_permission(permission)
+
+    def list_users(self) -> List[Dict[str, Any]]:
+        """List all users in the system."""
+        return self.auth.list_users()
+
+    def create_user(self, username: str, password: str, role: str = "OPERATOR",
+                    full_name: str = "", email: str = "") -> tuple[bool, str, Optional[int]]:
+        """Create a new user."""
+        return self.auth.create_user(username=username, password=password, role=role,
+                                     full_name=full_name, email=email)
+
+    def update_user_password(self, user_id: int, new_password: str) -> tuple[bool, str]:
+        """Update password for a user."""
+        return self.auth.update_user_password(user_id, new_password)
+
+    def delete_user(self, user_id: int) -> tuple[bool, str]:
+        """Delete a user."""
+        return self.auth.delete_user(user_id)
+
+    # ------------------------------------------------------------------
+    # Disk Management & USB Arrival Watcher
+    # ------------------------------------------------------------------
+
+    def list_available_drives(self) -> List[Dict[str, Any]]:
+        """List all accessible drives with metadata (label, free space, drive type)."""
+        return self.disk_watcher.list_drives()
+
+    def scan_drive_backups(
+        self,
+        drive_path: str,
+        max_depth: int = 3,
+        progress_callback: Optional[Callable[[int, str, Optional[Dict[str, Any]]], None]] = None,
+    ) -> Dict[str, Any]:
+        """Scan a drive or folder to find all SQL, VHDX, and Mail archives."""
+        return self.disk_watcher.scan_drive_backups(
+            drive_path, max_depth=max_depth, progress_callback=progress_callback
+        )
+
+    def start_disk_watcher(self, callback: Callable[[Dict[str, Any]], None], poll_interval: float = 3.0) -> None:
+        """Start background watcher for USB / external drive insertions."""
+        self.disk_watcher.start_watching(callback, poll_interval=poll_interval)
+
+    def stop_disk_watcher(self) -> None:
+        """Stop background disk arrival watcher."""
+        self.disk_watcher.stop_watching()
+
+    # ------------------------------------------------------------------
+    # SMTP Notification Settings
+    # ------------------------------------------------------------------
+
+    def get_smtp_settings(self) -> Dict[str, Any]:
+        """Retrieve stored SMTP notification settings."""
+        from core.settings import AppSettings
+        settings = AppSettings()
+        return settings.get("smtp_notifications", {
+            "enabled": False,
+            "host": "",
+            "port": 587,
+            "use_tls": True,
+            "username": "",
+            "password": "",
+            "from_address": "",
+            "to_addresses": [],
+            "notify_on_success": True,
+            "notify_on_failure": True,
+        })
+
+    def save_smtp_settings(self, config: Dict[str, Any]) -> None:
+        """Save SMTP notification settings."""
+        from core.settings import AppSettings
+        settings = AppSettings()
+        settings.set("smtp_notifications", config)
+        settings.save()
+
+    def test_smtp_connection(self, config: Optional[Dict[str, Any]] = None, recipient: Optional[str] = None) -> tuple[bool, str]:
+        """Send a test email using provided or saved SMTP configuration."""
+        if config is None:
+            config = self.get_smtp_settings()
+        from domain.entities import SmtpNotificationConfig
+        smtp_cfg = SmtpNotificationConfig.from_dict(config)
+        to_email = recipient or (smtp_cfg.to_addresses[0] if smtp_cfg.to_addresses else smtp_cfg.username)
+        if not to_email:
+            return False, "Alıcı e-posta adresi belirtilmedi."
+        return self.email_notifier.test_connection(smtp_cfg, to_email)
+
+    # ------------------------------------------------------------------
     # Event bus
     # ------------------------------------------------------------------
 
@@ -758,5 +966,9 @@ class MailEngine:
 
     def shutdown(self) -> None:
         """Gracefully shut down the engine."""
+        try:
+            self.stop_disk_watcher()
+        except Exception:
+            pass
         self.db.close()
         logger.info("MailEngine shut down")

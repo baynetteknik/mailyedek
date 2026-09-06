@@ -22,13 +22,14 @@ class TestServerMigration(unittest.TestCase):
         self.db = self.engine.db
 
     def tearDown(self):
-        if hasattr(self.db, "_local") and hasattr(self.db._local, "conn") and self.db._local.conn:
-            try:
-                self.db._local.conn.close()
-                self.db._local.conn = None
-            except Exception:
-                pass
-        self.temp_dir.cleanup()
+        try:
+            self.engine.db.close()
+        except Exception:
+            pass
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
 
     def test_server_migration_flow(self):
         # 1. Add account on old server

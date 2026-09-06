@@ -245,7 +245,116 @@ class DatabaseManager:
                 );
                 CREATE INDEX IF NOT EXISTS idx_server_profiles_account
                     ON account_server_profiles(account_id);
+
+                -- Users & Role-Based Access Control
+                CREATE TABLE IF NOT EXISTS users (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username        TEXT NOT NULL UNIQUE,
+                    password_hash   TEXT NOT NULL,
+                    salt            TEXT NOT NULL,
+                    full_name       TEXT DEFAULT '',
+                    email           TEXT DEFAULT '',
+                    role            TEXT NOT NULL DEFAULT 'OPERATOR',
+                    is_active       INTEGER NOT NULL DEFAULT 1,
+                    last_login      TEXT,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                -- SQL Backup Jobs
+                CREATE TABLE IF NOT EXISTS sql_backup_jobs (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name            TEXT NOT NULL,
+                    engine_type     TEXT NOT NULL DEFAULT 'mssql',
+                    host            TEXT NOT NULL DEFAULT 'localhost',
+                    port            INTEGER NOT NULL DEFAULT 1433,
+                    auth_type       TEXT NOT NULL DEFAULT 'windows',
+                    username_enc    TEXT DEFAULT '',
+                    password_enc    TEXT DEFAULT '',
+                    database_name   TEXT NOT NULL,
+                    backup_type     TEXT NOT NULL DEFAULT 'FULL',
+                    dest_dir        TEXT NOT NULL,
+                    compress        INTEGER NOT NULL DEFAULT 1,
+                    compress_mode   TEXT DEFAULT 'compressed',
+                    verify          INTEGER NOT NULL DEFAULT 1,
+                    retention_mode  TEXT DEFAULT 'count',
+                    retention_value INTEGER NOT NULL DEFAULT 10,
+                    retention_days  INTEGER NOT NULL DEFAULT 30,
+                    auto_on_usb_connect INTEGER DEFAULT 0,
+                    target_drive_label TEXT DEFAULT '',
+                    cloud_target    TEXT DEFAULT 'none',
+                    schedule_cron   TEXT DEFAULT '',
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                -- VHDX & Hyper-V Backup Jobs
+                CREATE TABLE IF NOT EXISTS vhdx_backup_jobs (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name            TEXT NOT NULL,
+                    mode            TEXT NOT NULL DEFAULT 'direct_file',
+                    vm_name         TEXT DEFAULT '',
+                    source_path     TEXT DEFAULT '',
+                    dest_dir        TEXT NOT NULL,
+                    use_vss         INTEGER NOT NULL DEFAULT 1,
+                    compress        INTEGER NOT NULL DEFAULT 0,
+                    compress_mode   TEXT DEFAULT 'raw',
+                    verify_hash     INTEGER NOT NULL DEFAULT 1,
+                    retention_mode  TEXT DEFAULT 'count',
+                    retention_value INTEGER NOT NULL DEFAULT 10,
+                    retention_days  INTEGER NOT NULL DEFAULT 30,
+                    auto_on_usb_connect INTEGER DEFAULT 0,
+                    target_drive_label TEXT DEFAULT '',
+                    cloud_target    TEXT DEFAULT 'none',
+                    schedule_cron   TEXT DEFAULT '',
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                -- Unified Backup History
+                CREATE TABLE IF NOT EXISTS general_backup_history (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_type        TEXT NOT NULL,
+                    job_name        TEXT NOT NULL,
+                    status          TEXT NOT NULL,
+                    source          TEXT DEFAULT '',
+                    target_file     TEXT DEFAULT '',
+                    size_bytes      INTEGER DEFAULT 0,
+                    duration_seconds REAL DEFAULT 0.0,
+                    error_message   TEXT DEFAULT '',
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_backup_hist_type_ts
+                    ON general_backup_history(job_type, created_at DESC);
             """)
+
+            # Auto-seed default admin user if users table is empty
+            try:
+                user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                if user_count == 0:
+                    from core.auth_manager import hash_password
+                    pwd_hash, salt = hash_password("admin123")
+                    conn.execute(
+                        """INSERT INTO users (username, password_hash, salt, full_name, email, role, is_active)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        ("admin", pwd_hash, salt, "Sistem Yöneticisi", "admin@localhost", "ADMIN", 1)
+                    )
+            except Exception as exc:
+                logger.warning("Failed to seed initial admin user: %s", exc)
+
+            # Migrations for jobs table new columns
+            for table in ["sql_backup_jobs", "vhdx_backup_jobs"]:
+                for col, typ in [
+                    ("retention_mode", "TEXT DEFAULT 'count'"),
+                    ("retention_value", "INTEGER DEFAULT 10"),
+                    ("compress_mode", "TEXT DEFAULT 'compressed'"),
+                    ("auto_on_usb_connect", "INTEGER DEFAULT 0"),
+                    ("target_drive_label", "TEXT DEFAULT ''")
+                ]:
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+                    except sqlite3.OperationalError:
+                        pass
             try:
                 conn.execute("ALTER TABLE accounts ADD COLUMN export_subfolder TEXT DEFAULT ''")
             except sqlite3.OperationalError as exc:
@@ -896,7 +1005,239 @@ class DatabaseManager:
                 "account_ids": account_ids,
             }
 
+    # ------------------------------------------------------------------
+    # User & RBAC Management
+    # ------------------------------------------------------------------
+
+    def save_user(self, user_data: Dict[str, Any]) -> int:
+        """Create or update a user."""
+        user_id = user_data.get("id")
+        fields = {
+            "username": user_data.get("username", "").strip(),
+            "full_name": user_data.get("full_name", "").strip(),
+            "email": user_data.get("email", "").strip(),
+            "role": user_data.get("role", "OPERATOR"),
+            "is_active": 1 if user_data.get("is_active", True) else 0,
+            "updated_at": datetime.now().isoformat(),
+        }
+
+        # If password hash is provided
+        if "password_hash" in user_data and user_data["password_hash"]:
+            fields["password_hash"] = user_data["password_hash"]
+        if "salt" in user_data and user_data["salt"]:
+            fields["salt"] = user_data["salt"]
+
+        with self.get_conn() as conn:
+            if user_id:
+                set_clause = ", ".join(f"{k} = ?" for k in fields.keys())
+                values = list(fields.values()) + [user_id]
+                conn.execute(f"UPDATE users SET {set_clause} WHERE id = ?", values)
+                return user_id
+            else:
+                fields["created_at"] = datetime.now().isoformat()
+                cols = ", ".join(fields.keys())
+                placeholders = ", ".join("?" for _ in fields)
+                cursor = conn.execute(
+                    f"INSERT INTO users ({cols}) VALUES ({placeholders})",
+                    list(fields.values())
+                )
+                return cursor.lastrowid
+
+    def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        with self.get_conn() as conn:
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        with self.get_conn() as conn:
+            row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+            return dict(row) if row else None
+
+    def list_users(self) -> List[Dict[str, Any]]:
+        with self.get_conn() as conn:
+            rows = conn.execute("SELECT id, username, full_name, email, role, is_active, last_login, created_at FROM users ORDER BY id ASC").fetchall()
+            return [dict(r) for r in rows]
+
+    def delete_user(self, user_id: int) -> bool:
+        with self.get_conn() as conn:
+            cursor = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            return cursor.rowcount > 0
+
+    def update_user_password(self, user_id: int, password_hash: str, salt: str) -> bool:
+        with self.get_conn() as conn:
+            cursor = conn.execute(
+                "UPDATE users SET password_hash = ?, salt = ?, updated_at = ? WHERE id = ?",
+                (password_hash, salt, datetime.now().isoformat(), user_id)
+            )
+            return cursor.rowcount > 0
+
+    def update_user_last_login(self, user_id: int) -> None:
+        with self.get_conn() as conn:
+            conn.execute(
+                "UPDATE users SET last_login = ? WHERE id = ?",
+                (datetime.now().isoformat(), user_id)
+            )
+
+    # ------------------------------------------------------------------
+    # SQL Backup Jobs Management
+    # ------------------------------------------------------------------
+
+    def save_sql_backup_job(self, job_data: Dict[str, Any]) -> int:
+        """Create or update a SQL backup job."""
+        job_id = job_data.get("id")
+        fields = {
+            "name": job_data.get("name", "SQL Backup"),
+            "engine_type": job_data.get("engine_type", "mssql"),
+            "host": job_data.get("host", "localhost"),
+            "port": int(job_data.get("port", 1433)),
+            "auth_type": job_data.get("auth_type", "windows"),
+            "username_enc": job_data.get("username_enc", ""),
+            "password_enc": job_data.get("password_enc", ""),
+            "database_name": job_data.get("database_name", ""),
+            "backup_type": job_data.get("backup_type", "FULL"),
+            "dest_dir": str(job_data.get("dest_dir", "data/backups/sql")),
+            "compress": 1 if job_data.get("compress", True) else 0,
+            "compress_mode": str(job_data.get("compress_mode", "compressed")),
+            "verify": 1 if job_data.get("verify", True) else 0,
+            "retention_mode": str(job_data.get("retention_mode", "count")),
+            "retention_value": int(job_data.get("retention_value", 10)),
+            "retention_days": int(job_data.get("retention_days", 30)),
+            "auto_on_usb_connect": 1 if job_data.get("auto_on_usb_connect", False) else 0,
+            "target_drive_label": str(job_data.get("target_drive_label", "")),
+            "cloud_target": job_data.get("cloud_target", "none"),
+            "schedule_cron": job_data.get("schedule_cron", ""),
+            "updated_at": datetime.now().isoformat(),
+        }
+
+        with self.get_conn() as conn:
+            if job_id:
+                set_clause = ", ".join(f"{k} = ?" for k in fields.keys())
+                values = list(fields.values()) + [job_id]
+                conn.execute(f"UPDATE sql_backup_jobs SET {set_clause} WHERE id = ?", values)
+                return job_id
+            else:
+                fields["created_at"] = datetime.now().isoformat()
+                cols = ", ".join(fields.keys())
+                placeholders = ", ".join("?" for _ in fields)
+                cursor = conn.execute(
+                    f"INSERT INTO sql_backup_jobs ({cols}) VALUES ({placeholders})",
+                    list(fields.values())
+                )
+                return cursor.lastrowid
+
+    def get_sql_backup_job(self, job_id: int) -> Optional[Dict[str, Any]]:
+        with self.get_conn() as conn:
+            row = conn.execute("SELECT * FROM sql_backup_jobs WHERE id = ?", (job_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_sql_backup_jobs(self) -> List[Dict[str, Any]]:
+        with self.get_conn() as conn:
+            rows = conn.execute("SELECT * FROM sql_backup_jobs ORDER BY id ASC").fetchall()
+            return [dict(r) for r in rows]
+
+    def delete_sql_backup_job(self, job_id: int) -> bool:
+        with self.get_conn() as conn:
+            cursor = conn.execute("DELETE FROM sql_backup_jobs WHERE id = ?", (job_id,))
+            return cursor.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # VHDX & Hyper-V Backup Jobs Management
+    # ------------------------------------------------------------------
+
+    def save_vhdx_backup_job(self, job_data: Dict[str, Any]) -> int:
+        """Create or update a VHDX backup job."""
+        job_id = job_data.get("id")
+        fields = {
+            "name": job_data.get("name", "VHDX Backup"),
+            "mode": job_data.get("mode", "direct_file"),
+            "vm_name": job_data.get("vm_name", ""),
+            "source_path": job_data.get("source_path", ""),
+            "dest_dir": str(job_data.get("dest_dir", "data/backups/vhdx")),
+            "use_vss": 1 if job_data.get("use_vss", True) else 0,
+            "compress": 1 if job_data.get("compress", False) else 0,
+            "compress_mode": str(job_data.get("compress_mode", "raw")),
+            "verify_hash": 1 if job_data.get("verify_hash", True) else 0,
+            "retention_mode": str(job_data.get("retention_mode", "count")),
+            "retention_value": int(job_data.get("retention_value", 10)),
+            "retention_days": int(job_data.get("retention_days", 30)),
+            "auto_on_usb_connect": 1 if job_data.get("auto_on_usb_connect", False) else 0,
+            "target_drive_label": str(job_data.get("target_drive_label", "")),
+            "cloud_target": job_data.get("cloud_target", "none"),
+            "schedule_cron": job_data.get("schedule_cron", ""),
+            "updated_at": datetime.now().isoformat(),
+        }
+
+        with self.get_conn() as conn:
+            if job_id:
+                set_clause = ", ".join(f"{k} = ?" for k in fields.keys())
+                values = list(fields.values()) + [job_id]
+                conn.execute(f"UPDATE vhdx_backup_jobs SET {set_clause} WHERE id = ?", values)
+                return job_id
+            else:
+                fields["created_at"] = datetime.now().isoformat()
+                cols = ", ".join(fields.keys())
+                placeholders = ", ".join("?" for _ in fields)
+                cursor = conn.execute(
+                    f"INSERT INTO vhdx_backup_jobs ({cols}) VALUES ({placeholders})",
+                    list(fields.values())
+                )
+                return cursor.lastrowid
+
+    def get_vhdx_backup_job(self, job_id: int) -> Optional[Dict[str, Any]]:
+        with self.get_conn() as conn:
+            row = conn.execute("SELECT * FROM vhdx_backup_jobs WHERE id = ?", (job_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_vhdx_backup_jobs(self) -> List[Dict[str, Any]]:
+        with self.get_conn() as conn:
+            rows = conn.execute("SELECT * FROM vhdx_backup_jobs ORDER BY id ASC").fetchall()
+            return [dict(r) for r in rows]
+
+    def delete_vhdx_backup_job(self, job_id: int) -> bool:
+        with self.get_conn() as conn:
+            cursor = conn.execute("DELETE FROM vhdx_backup_jobs WHERE id = ?", (job_id,))
+            return cursor.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Unified Backup History
+    # ------------------------------------------------------------------
+
+    def add_backup_history_entry(
+        self,
+        job_type: str,
+        job_name: str,
+        status: str,
+        source: str = "",
+        target_file: str = "",
+        size_bytes: int = 0,
+        duration_seconds: float = 0.0,
+        error_message: str = "",
+    ) -> int:
+        with self.get_conn() as conn:
+            cursor = conn.execute(
+                """INSERT INTO general_backup_history
+                   (job_type, job_name, status, source, target_file, size_bytes, duration_seconds, error_message, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job_type, job_name, status, source, target_file, size_bytes, duration_seconds, error_message, datetime.now().isoformat())
+            )
+            return cursor.lastrowid
+
+    def list_backup_history(self, limit: int = 100, offset: int = 0, job_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self.get_conn() as conn:
+            if job_type:
+                rows = conn.execute(
+                    "SELECT * FROM general_backup_history WHERE job_type = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (job_type, limit, offset)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM general_backup_history ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (limit, offset)
+                ).fetchall()
+            return [dict(r) for r in rows]
+
     def close(self) -> None:
         if hasattr(self._local, "conn") and self._local.conn:
             self._local.conn.close()
             self._local.conn = None
+

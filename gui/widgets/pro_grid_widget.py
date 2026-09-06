@@ -41,19 +41,28 @@ class ProHeaderView(QHeaderView):
         menu.setTitle("Sütun Görünürlüğü")
         menu.setStyleSheet("""
             QMenu {
-                background-color: #ffffff;
-                color: #0f172a;
-                border: 1px solid #cbd5e1;
+                background-color: #1e3a8a;
+                color: #ffffff;
+                border: 1px solid #3b82f6;
                 border-radius: 6px;
-                padding: 4px;
+                padding: 6px;
+                font-weight: 600;
+                font-size: 12px;
             }
             QMenu::item {
-                padding: 6px 20px 6px 10px;
+                padding: 6px 20px 6px 12px;
                 border-radius: 4px;
+                background-color: transparent;
+                color: #ffffff;
             }
             QMenu::item:selected {
-                background-color: #f1f5f9;
-                color: #4361ee;
+                background-color: #2563eb;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #3b82f6;
+                margin: 4px 8px;
             }
         """)
 
@@ -132,14 +141,14 @@ class ProGridWidget(QWidget):
             QLineEdit {
                 background-color: #f8fafc;
                 color: #0f172a;
-                border: 1px solid #cbd5e1;
+                border: 1.5px solid #cbd5e1;
                 border-radius: 5px;
                 padding: 5px 10px;
-                font-size: 11px;
+                font-size: 11.5px;
                 min-width: 180px;
             }
             QLineEdit:focus {
-                border-color: #4361ee;
+                border-color: #2563eb;
                 background-color: #ffffff;
             }
         """)
@@ -148,7 +157,7 @@ class ProGridWidget(QWidget):
 
         # Row Counter Label
         self.lbl_counter = QLabel("0 / 0 Kayıt")
-        self.lbl_counter.setStyleSheet("font-size: 11px; font-weight: bold; color: #64748b; background: transparent;")
+        self.lbl_counter.setStyleSheet("font-size: 11.5px; font-weight: bold; color: #475569; background: transparent;")
         tb_layout.addWidget(self.lbl_counter)
 
         tb_layout.addStretch()
@@ -177,7 +186,7 @@ class ProGridWidget(QWidget):
         main_layout.addWidget(self.toolbar_frame)
 
         # -------------------------------------------------------------------
-        # QTableWidget Engine
+        # QTableWidget Engine (TOYA DBGrid Standard)
         # -------------------------------------------------------------------
         self.table = QTableWidget()
         
@@ -187,17 +196,17 @@ class ProGridWidget(QWidget):
         custom_header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         custom_header.setStyleSheet("""
             QHeaderView::section {
-                background-color: #f1f5f9;
-                color: #334155;
+                background-color: #2563eb;
+                color: #ffffff;
                 font-weight: 700;
-                border: none;
-                border-bottom: 2px solid #cbd5e1;
+                font-size: 12px;
+                border: 1px solid #1d4ed8;
                 padding: 6px 10px;
-                font-size: 11px;
+                min-height: 36px;
+                height: 36px;
             }
             QHeaderView::section:hover {
-                background-color: #e2e8f0;
-                color: #0f172a;
+                background-color: #1e3a8a;
             }
         """)
         custom_header.save_requested.connect(self.save_grid_state)
@@ -219,14 +228,16 @@ class ProGridWidget(QWidget):
                 border-radius: 6px;
                 color: #0f172a;
                 font-size: 12px;
+                selection-background-color: #3b82f6;
+                selection-color: #ffffff;
             }
             QTableWidget::item {
-                padding: 4px 8px;
+                padding: 6px 10px;
                 border-bottom: 1px solid #f1f5f9;
             }
             QTableWidget::item:selected {
-                background-color: #e0e7ff;
-                color: #1e1b4b;
+                background-color: #3b82f6;
+                color: #ffffff;
             }
         """)
 
@@ -235,13 +246,13 @@ class ProGridWidget(QWidget):
     def _btn_toolbar_style(self) -> str:
         return """
             QPushButton {
-                background-color: #f8fafc;
+                background-color: #ffffff;
                 color: #334155;
                 font-weight: 600;
                 font-size: 11px;
                 border: 1px solid #cbd5e1;
                 border-radius: 5px;
-                padding: 4px 10px;
+                padding: 5px 12px;
             }
             QPushButton:hover {
                 background-color: #f1f5f9;

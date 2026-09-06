@@ -70,84 +70,19 @@ def main():
 
     # Load settings for custom data path
     settings = AppSettings()
-    
-    # Check if data path fell back because it was not accessible (e.g., missing or renamed folder)
-    raw_path = settings._data.get("data_path")
-    if raw_path:
-        raw_path_obj = Path(raw_path)
-        path_missing = False
-        try:
-            path_missing = not raw_path_obj.exists()
-        except OSError:
-            path_missing = True
-
-        if path_missing:
-            from PySide6.QtWidgets import QFileDialog
-            reply = QMessageBox.warning(
-                None,
-                "Veri Dizini Bulunamadı",
-                f"Yapılandırılmış veri dizini ({raw_path}) bulunamadı veya taşındı/yeniden adlandırıldı.\n\n"
-                "Lütfen bu veri dizininin yeni yerini seçin.",
-                QMessageBox.Ok | QMessageBox.Cancel
-            )
-            if reply == QMessageBox.Ok:
-                parent_dir = ""
-                try:
-                    if raw_path_obj.parent.exists():
-                        parent_dir = str(raw_path_obj.parent)
-                except OSError:
-                    pass
-                if not parent_dir:
-                    parent_dir = str(Path.cwd())
-
-                folder = QFileDialog.getExistingDirectory(
-                    None, "Yeni Veri Dizinini (Ana Depolama Alanı) Seçin", parent_dir
-                )
-                if folder:
-                    new_path = Path(folder).resolve()
-                    settings.set_data_path(new_path)
-
-                    # Update storage locations paths if they point to or are inside the old path
-                    locs = settings.get("storage_locations", [])
-                    updated_locs = []
-                    for loc in locs:
-                        loc_path = loc.get("path", "")
-                        if loc_path:
-                            try:
-                                if Path(loc_path).resolve() == raw_path_obj.resolve():
-                                    loc["path"] = str(new_path)
-                                elif str(Path(loc_path).resolve()).startswith(str(raw_path_obj.resolve())):
-                                    rel = Path(loc_path).resolve().relative_to(raw_path_obj.resolve())
-                                    loc["path"] = str(new_path / rel)
-                            except Exception:
-                                pass
-                        updated_locs.append(loc)
-                    settings.set("storage_locations", updated_locs)
-                    settings.save()
-
-                    QMessageBox.information(
-                        None,
-                        "Veri Dizini Güncellendi",
-                        f"Veri dizini '{new_path}' olarak güncellendi.\nUygulama şimdi yeniden başlatılacaktır.",
-                        QMessageBox.Ok
-                    )
-                    # Restart app
-                    import subprocess
-                    subprocess.Popen([sys.executable] + sys.argv)
-                    sys.exit(0)
-                else:
-                    sys.exit(0)
-            else:
-                sys.exit(0)
-
     actual_path = settings.data_path()
-
     db_path = settings.db_path()
     key_file = settings.key_file_path()
-    logger.info("Data path: %s", actual_path)
+    logger.info("Starting Mail Archive system with data path: %s", actual_path)
 
-    # Create and show main window
+    # Create main window
     window = MainWindow(db_path=db_path, key_file=key_file, settings=settings)
+
+    # Prompt user authentication at startup
+    if not window.prompt_login():
+        logger.info("Login cancelled by user, closing application.")
+        sys.exit(0)
+
     window.show()
 
     sys.exit(app.exec())
