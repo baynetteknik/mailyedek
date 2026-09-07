@@ -242,7 +242,8 @@ class SyncUseCase:
                     continue
 
                 _log(f"  Checking folder '{folder_name}'...", log_callback)
-                state = self._sync_state_repo.get(acc["id"], folder_name)
+                imap_host = acc.get("imap_host", "")
+                state = self._sync_state_repo.get(acc["id"], folder_name, server_host=imap_host)
                 since_uid = state["last_uid"] if state else 0
                 search_since_uid = 0 if (since_date or before_date) else since_uid
                 uids = provider.fetch_uids(folder_name, search_since_uid, since_date=since_date, before_date=before_date, archive_unread=archive_unread)
@@ -250,10 +251,16 @@ class SyncUseCase:
                 # Fetch archived UIDs from local DB to filter
                 try:
                     with self._db.get_conn() as conn:
-                        existing_rows = conn.execute(
-                            "SELECT uid FROM mail_metadata WHERE account_id=? AND folder=? AND is_deleted=0",
-                            (acc["id"], folder_name)
-                        ).fetchall()
+                        if imap_host:
+                            existing_rows = conn.execute(
+                                "SELECT uid FROM mail_metadata WHERE account_id=? AND server_host=? AND (folder=? OR folder=?) AND is_deleted=0",
+                                (acc["id"], imap_host, folder_name, translate_folder_name(folder_name, "tr"))
+                            ).fetchall()
+                        else:
+                            existing_rows = conn.execute(
+                                "SELECT uid FROM mail_metadata WHERE account_id=? AND (folder=? OR folder=?) AND is_deleted=0",
+                                (acc["id"], folder_name, translate_folder_name(folder_name, "tr"))
+                            ).fetchall()
                         archived_uids = {r["uid"] for r in existing_rows}
                 except Exception:
                     archived_uids = set()
@@ -454,7 +461,7 @@ class SyncUseCase:
             with self._db.get_conn() as conn:
                 if imap_host:
                     existing_rows = conn.execute(
-                        "SELECT uid FROM mail_metadata WHERE account_id=? AND (server_host=? OR server_host='') AND (folder=? OR folder=?) AND is_deleted=0",
+                        "SELECT uid FROM mail_metadata WHERE account_id=? AND server_host=? AND (folder=? OR folder=?) AND is_deleted=0",
                         (account_id, imap_host, folder_name, display_folder)
                     ).fetchall()
                 else:
@@ -468,8 +475,8 @@ class SyncUseCase:
 
         result["already_archived"] = len(archived_uids)
 
-        # Get previous sync state
-        state = self._sync_state_repo.get(account_id, folder_name)
+        # Get previous sync state for this server host
+        state = self._sync_state_repo.get(account_id, folder_name, server_host=imap_host)
 
         # Select folder
         _log(f"    [{folder_name}] Selecting folder...", log_callback)
@@ -510,7 +517,7 @@ class SyncUseCase:
              log_callback)
 
         if not new_uids:
-            self._sync_state_repo.upsert(account_id, folder_name, max(uids, default=since_uid), uid_validity)
+            self._sync_state_repo.upsert(account_id, folder_name, max(uids, default=since_uid), uid_validity, server_host=imap_host)
             return result
 
         last_uid = since_uid
@@ -694,7 +701,7 @@ class SyncUseCase:
                 last_uid = max(max_uid_on_server, last_uid)
         finally:
             # Update sync state to the last successfully processed UID
-            self._sync_state_repo.upsert(account_id, folder_name, last_uid, uid_validity)
+            self._sync_state_repo.upsert(account_id, folder_name, last_uid, uid_validity, server_host=imap_host)
             _log(f"    [{folder_name}] Sync state updated: last_uid={last_uid}", log_callback)
 
         _log(f"    [{folder_name}] === Folder done: {result['fetched']} new, "

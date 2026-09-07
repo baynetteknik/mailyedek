@@ -185,8 +185,8 @@ class ImapClient(MailProvider):
     # Connection management
     # ------------------------------------------------------------------
 
-    def connect(self, host: str, port: int, use_ssl: bool,
-                username: str, password: str, timeout: Optional[int] = None) -> bool:
+    def connect_with_details(self, host: str, port: int, use_ssl: bool,
+                             username: str, password: str, timeout: Optional[int] = None) -> Tuple[bool, str]:
         self._host = host
         self._port = port
         self._use_ssl = use_ssl
@@ -205,12 +205,28 @@ class ImapClient(MailProvider):
             self._conn.login(username, password)
             logger.info("Connected to %s:%d as %s", host, port,
                         self._mask_username(username))
-            return True
+            return True, "OK"
 
-        except (imaplib.IMAP4.error, OSError, ConnectionError) as exc:
-            logger.error("IMAP connection failed to %s:%d — %s", host, port, exc)
+        except imaplib.IMAP4.error as exc:
+            err_msg = str(exc)
+            logger.error("IMAP authentication error to %s:%d — %s", host, port, err_msg)
             self._conn = None
-            return False
+            return False, f"Kimlik Doğrulama Hatası (Kullanıcı adı veya şifre geçersiz): {err_msg}"
+        except (OSError, ConnectionError) as exc:
+            err_msg = str(exc)
+            logger.error("IMAP socket/network error to %s:%d — %s", host, port, err_msg)
+            self._conn = None
+            return False, f"Ağ / Bağlantı Hatası (Sunucuya erişilemiyor veya port kapalı): {err_msg}"
+        except Exception as exc:
+            err_msg = str(exc)
+            logger.error("IMAP connection failed to %s:%d — %s", host, port, err_msg)
+            self._conn = None
+            return False, f"Bağlantı Hatası: {err_msg}"
+
+    def connect(self, host: str, port: int, use_ssl: bool,
+                username: str, password: str, timeout: Optional[int] = None) -> bool:
+        ok, _ = self.connect_with_details(host, port, use_ssl, username, password, timeout=timeout)
+        return ok
 
     def disconnect(self) -> None:
         if self._conn:

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from core.mail_engine import MailEngine
 from core.reporter import ReportGenerator
 from gui.dialogs.report_preview_dialog import ReportPreviewDialog
+from gui.dialogs.delete_confirm_dialog import DeleteConfirmDialog
 
 logger = logging.getLogger(__name__)
 
@@ -994,6 +995,13 @@ class ReportPanel(QWidget):
 
     def _load_reports_history(self):
         """Asynchronous history loading using ReportLoaderWorker without blocking the main UI thread."""
+        if hasattr(self, "_loader_worker") and self._loader_worker and self._loader_worker.isRunning():
+            return
+
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+            parent_mw.notify_disk_reading("💾 Disk Okunuyor", "Rapor dosyaları ve denetim geçmişi taranıyor...")
+
         self.btn_refresh_reports.setEnabled(False)
         self.log_output.append("Rapor geçmişi arka planda yükleniyor...")
 
@@ -1009,11 +1017,15 @@ class ReportPanel(QWidget):
         self.log_output.append(f"Toplam {len(reports)} adet rapor geçmişi başarıyla yüklendi.")
         self._filter_reports()
 
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+            parent_mw.notify_disk_ready(f"Toplam {len(reports)} adet rapor geçmişi yüklendi.")
+
     @Slot(str)
     def _on_reports_load_failed_gui(self, err_msg: str):
         self.btn_refresh_reports.setEnabled(True)
         self.log_output.append(f"HATA: Rapor geçmişi yüklenemedi: {err_msg}")
-        QMessageBox.warning(self, "Hata", f"Rapor geçmişi yüklenirken hata oluştu:\n{err_msg}")
+        logger.warning("Rapor geçmişi yüklenemedi: %s", err_msg)
 
     @Slot(str)
     def _on_top_search_changed(self, text: str):
@@ -1496,12 +1508,16 @@ class ReportPanel(QWidget):
         if not r or r.get("is_virtual"):
             return
 
-        confirm = QMessageBox.question(
-            self, "Rapor Sil", 
-            "Seçili raporu diskten silmek istediğinize emin misiniz?",
-            QMessageBox.Yes | QMessageBox.No
+        report_title = str(r.get("account_label") or r.get("account") or r.get("type", "Rapor"))
+        file_path = str(r.get("file_path", ""))
+        confirmed = DeleteConfirmDialog.confirm_deletion(
+            parent=self,
+            item_name=report_title,
+            item_type="Rapor Dosyası",
+            details=f"Rapor: {report_title}\nDosya Yolu: {file_path}\nBu rapor dosyası (.json ve .html) diskten kalıcı olarak silinecektir.",
+            warning_text="Bu işlem geri alınamaz! Rapor geçmişi listesinden de kaldırılacaktır."
         )
-        if confirm == QMessageBox.Yes:
+        if confirmed:
             try:
                 if r.get("file_path") and os.path.exists(r["file_path"]):
                     os.unlink(r["file_path"])
@@ -1932,6 +1948,10 @@ class ReportPanel(QWidget):
         self.btn_generate_custom.setEnabled(False)
         self.log_output.append("Özel analiz raporu oluşturuluyor...")
 
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+            parent_mw.notify_disk_reading("💾 Disk Okunuyor", "Özel analiz raporu oluşturuluyor...")
+
         kwargs = {
             "account_id": account_id,
             "account_group": account_group,
@@ -1950,6 +1970,10 @@ class ReportPanel(QWidget):
     def _on_custom_worker_finished(self, res: dict):
         self.btn_generate_custom.setEnabled(True)
         self._last_custom_report_res = res
+
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+            parent_mw.notify_disk_ready("Özel analiz raporu hazırlandı.")
 
         if res.get("total_mails", 0) == 0:
             QMessageBox.information(
@@ -2498,6 +2522,15 @@ class ReportPanel(QWidget):
         dialog.exec()
 
     def refresh(self):
+        self.combo_sync_account.blockSignals(True)
+        self.combo_sync_group.blockSignals(True)
+        self.combo_custom_account.blockSignals(True)
+        self.combo_custom_group.blockSignals(True)
+        self.group_filter_list.blockSignals(True)
+        self.custom_group_filter_list.blockSignals(True)
+        self.stats_group_filter_list.blockSignals(True)
+        self.acc_rep_group_filter_list.blockSignals(True)
+
         self.combo_sync_account.clear()
         self.combo_sync_group.clear()
         self.combo_custom_account.clear()
@@ -2569,7 +2602,23 @@ class ReportPanel(QWidget):
                 item_grp4.setData(Qt.UserRole, f"GROUP:{grp}")
                 self.acc_rep_group_filter_list.addItem(item_grp4)
 
+            self.combo_sync_account.blockSignals(False)
+            self.combo_sync_group.blockSignals(False)
+            self.combo_custom_account.blockSignals(False)
+            self.combo_custom_group.blockSignals(False)
+            self.group_filter_list.blockSignals(False)
+            self.custom_group_filter_list.blockSignals(False)
+            self.stats_group_filter_list.blockSignals(False)
+            self.acc_rep_group_filter_list.blockSignals(False)
+
             self._load_reports_history()
             self._load_account_reports()
         except Exception as exc:
+            self.combo_sync_account.blockSignals(False)
+            self.combo_sync_group.blockSignals(False)
+            self.combo_custom_account.blockSignals(False)
+            self.combo_custom_group.blockSignals(False)
+            self.group_filter_list.blockSignals(False)
+            self.custom_group_filter_list.blockSignals(False)
+            self.stats_group_filter_list.blockSignals(False)
             logger.error("Refresh error: %s", exc)

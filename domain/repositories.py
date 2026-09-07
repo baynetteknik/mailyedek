@@ -68,18 +68,18 @@ class IMailRepository(ABC):
 
 class ISyncStateRepository(ABC):
     @abstractmethod
-    def get(self, account_id: int, folder: str) -> Optional[Dict]: ...
+    def get(self, account_id: int, folder: str, server_host: str = "") -> Optional[Dict]: ...
 
     @abstractmethod
     def update(self, account_id: int, folder: str,
-               last_uid: int, uid_validity: int = 0, mail_count: int = 0) -> None: ...
+               last_uid: int, uid_validity: int = 0, mail_count: int = 0, server_host: str = "") -> None: ...
 
     def upsert(self, account_id: int, folder: str,
-               last_uid: int, uid_validity: int = 0, mail_count: int = 0) -> None:
-        self.update(account_id, folder, last_uid, uid_validity, mail_count)
+               last_uid: int, uid_validity: int = 0, mail_count: int = 0, server_host: str = "") -> None:
+        self.update(account_id, folder, last_uid, uid_validity, mail_count, server_host=server_host)
 
     @abstractmethod
-    def reset_sync_state(self, account_id: int, reason: str = "server_migration") -> int: ...
+    def reset_sync_state(self, account_id: int, reason: str = "server_migration", server_host: str = "") -> int: ...
 
 
 

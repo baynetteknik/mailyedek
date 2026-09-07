@@ -136,7 +136,8 @@ class DatabaseManager:
                     is_deleted      INTEGER DEFAULT 0,
                     is_duplicate    INTEGER DEFAULT 0,
                     fetched_at      TEXT NOT NULL DEFAULT (datetime('now')),
-                    UNIQUE(account_id, folder, uid)
+                    server_host     TEXT DEFAULT '',
+                    UNIQUE(account_id, server_host, folder, uid)
                 );
 
                 -- Raw email content (stored optionally, can be reconstructed)
@@ -166,7 +167,7 @@ class DatabaseManager:
                     PRIMARY KEY (mail_id, attachment_id)
                 );
 
-                -- Delta sync state per account/folder
+                -- Delta sync state per account/folder/server_host
                 CREATE TABLE IF NOT EXISTS sync_state (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_id      INTEGER NOT NULL REFERENCES accounts(id),
@@ -175,7 +176,8 @@ class DatabaseManager:
                     uid_validity    INTEGER DEFAULT 0,
                     last_sync_at    TEXT,
                     mail_count      INTEGER DEFAULT 0,
-                    UNIQUE(account_id, folder)
+                    server_host     TEXT DEFAULT '',
+                    UNIQUE(account_id, server_host, folder)
                 );
 
                 -- Deduplication registry (hash-based)
@@ -212,7 +214,7 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS idx_mail_account_folder
                     ON mail_metadata(account_id, folder);
                 CREATE INDEX IF NOT EXISTS idx_mail_uid
-                    ON mail_metadata(account_id, folder, uid);
+                    ON mail_metadata(account_id, server_host, folder, uid);
                 CREATE INDEX IF NOT EXISTS idx_mail_message_id
                     ON mail_metadata(message_id);
                 CREATE INDEX IF NOT EXISTS idx_mail_account_deleted
@@ -225,8 +227,10 @@ class DatabaseManager:
                     ON mail_metadata(has_attachments);
                 CREATE INDEX IF NOT EXISTS idx_mail_duplicate
                     ON mail_metadata(is_duplicate);
+                CREATE INDEX IF NOT EXISTS idx_mail_server_host
+                    ON mail_metadata(account_id, server_host);
                 CREATE INDEX IF NOT EXISTS idx_sync_state_lookup
-                    ON sync_state(account_id, folder);
+                    ON sync_state(account_id, server_host, folder);
                 CREATE INDEX IF NOT EXISTS idx_audit_action_ts
                     ON audit_log(action, timestamp DESC);
 
@@ -375,6 +379,120 @@ class DatabaseManager:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     logger.warning("Failed to add server_host column to sync_state: %s", exc)
+
+            # Multi-server UNIQUE constraint migration for mail_metadata & sync_state
+            try:
+                meta_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='mail_metadata'").fetchone()
+                if meta_row and meta_row[0]:
+                    meta_sql = meta_row[0]
+                    normalized_sql = meta_sql.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
+                    if "UNIQUE(account_id,server_host,folder,uid)" not in normalized_sql:
+                        logger.info("Migrating mail_metadata to UNIQUE(account_id, server_host, folder, uid)...")
+                        conn.execute("""
+                            UPDATE mail_metadata 
+                            SET server_host = (SELECT imap_host FROM accounts WHERE accounts.id = mail_metadata.account_id)
+                            WHERE (server_host IS NULL OR server_host = '')
+                              AND account_id IN (SELECT id FROM accounts)
+                        """)
+                        
+                        conn.execute("PRAGMA foreign_keys = OFF")
+                        conn.execute("""
+                            CREATE TABLE mail_metadata_v2 (
+                                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                                account_id      INTEGER NOT NULL REFERENCES accounts(id),
+                                folder          TEXT NOT NULL DEFAULT 'INBOX',
+                                uid             INTEGER NOT NULL,
+                                message_id      TEXT,
+                                subject         TEXT,
+                                sender          TEXT,
+                                recipients      TEXT,
+                                cc              TEXT,
+                                bcc             TEXT,
+                                date            TEXT,
+                                internal_date   TEXT,
+                                flags           TEXT DEFAULT '',
+                                size_bytes      INTEGER DEFAULT 0,
+                                has_attachments INTEGER DEFAULT 0,
+                                sha256_hash     TEXT,
+                                is_deleted      INTEGER DEFAULT 0,
+                                is_duplicate    INTEGER DEFAULT 0,
+                                fetched_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                                server_host     TEXT DEFAULT '',
+                                UNIQUE(account_id, server_host, folder, uid)
+                            )
+                        """)
+                        conn.execute("""
+                            INSERT OR IGNORE INTO mail_metadata_v2 (
+                                id, account_id, folder, uid, message_id, subject, sender, recipients,
+                                cc, bcc, date, internal_date, flags, size_bytes, has_attachments,
+                                sha256_hash, is_deleted, is_duplicate, fetched_at, server_host
+                            )
+                            SELECT 
+                                id, account_id, folder, uid, message_id, subject, sender, recipients,
+                                cc, bcc, date, internal_date, flags, size_bytes, has_attachments,
+                                sha256_hash, is_deleted, is_duplicate, fetched_at, COALESCE(server_host, '')
+                            FROM mail_metadata
+                        """)
+                        conn.execute("DROP TABLE mail_metadata")
+                        conn.execute("ALTER TABLE mail_metadata_v2 RENAME TO mail_metadata")
+                        
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_account_folder ON mail_metadata(account_id, folder)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_uid ON mail_metadata(account_id, server_host, folder, uid)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_message_id ON mail_metadata(message_id)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_account_deleted ON mail_metadata(account_id, is_deleted)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_date ON mail_metadata(date)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_sender ON mail_metadata(sender)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_has_attachments ON mail_metadata(has_attachments)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_duplicate ON mail_metadata(is_duplicate)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_mail_server_host ON mail_metadata(account_id, server_host)")
+                        conn.execute("PRAGMA foreign_keys = ON")
+                        logger.info("mail_metadata migration completed successfully.")
+            except Exception as m_err:
+                logger.warning("Failed to migrate mail_metadata table: %s", m_err)
+
+            try:
+                sync_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_state'").fetchone()
+                if sync_row and sync_row[0]:
+                    sync_sql = sync_row[0]
+                    normalized_sync = sync_sql.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
+                    if "UNIQUE(account_id,server_host,folder)" not in normalized_sync:
+                        logger.info("Migrating sync_state to UNIQUE(account_id, server_host, folder)...")
+                        conn.execute("""
+                            UPDATE sync_state 
+                            SET server_host = (SELECT imap_host FROM accounts WHERE accounts.id = sync_state.account_id)
+                            WHERE (server_host IS NULL OR server_host = '')
+                              AND account_id IN (SELECT id FROM accounts)
+                        """)
+                        
+                        conn.execute("PRAGMA foreign_keys = OFF")
+                        conn.execute("""
+                            CREATE TABLE sync_state_v2 (
+                                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                                account_id      INTEGER NOT NULL REFERENCES accounts(id),
+                                folder          TEXT NOT NULL DEFAULT 'INBOX',
+                                last_uid        INTEGER DEFAULT 0,
+                                uid_validity    INTEGER DEFAULT 0,
+                                last_sync_at    TEXT,
+                                mail_count      INTEGER DEFAULT 0,
+                                server_host     TEXT DEFAULT '',
+                                UNIQUE(account_id, server_host, folder)
+                            )
+                        """)
+                        conn.execute("""
+                            INSERT OR IGNORE INTO sync_state_v2 (
+                                id, account_id, folder, last_uid, uid_validity, last_sync_at, mail_count, server_host
+                            )
+                            SELECT 
+                                id, account_id, folder, last_uid, uid_validity, last_sync_at, mail_count, COALESCE(server_host, '')
+                            FROM sync_state
+                        """)
+                        conn.execute("DROP TABLE sync_state")
+                        conn.execute("ALTER TABLE sync_state_v2 RENAME TO sync_state")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_state_lookup ON sync_state(account_id, server_host, folder)")
+                        conn.execute("PRAGMA foreign_keys = ON")
+                        logger.info("sync_state migration completed successfully.")
+            except Exception as s_err:
+                logger.warning("Failed to migrate sync_state table: %s", s_err)
 
             # Self-healing: Ensure every existing account has at least 1 server profile in account_server_profiles
             try:
@@ -563,11 +681,20 @@ class DatabaseManager:
         """Insert or update mail metadata. Returns the mail_metadata.id."""
         fields.setdefault("fetched_at", datetime.utcnow().isoformat())
         server_host = fields.get("server_host", "")
+        if not server_host:
+            try:
+                acc = self.get_account(account_id)
+                if acc and acc.get("imap_host"):
+                    server_host = acc["imap_host"]
+                    fields["server_host"] = server_host
+            except Exception:
+                pass
+
         with self.transaction() as conn:
             if server_host:
                 existing = conn.execute(
-                    "SELECT id FROM mail_metadata WHERE account_id=? AND folder=? AND uid=? AND server_host=?",
-                    (account_id, folder, uid, server_host)
+                    "SELECT id FROM mail_metadata WHERE account_id=? AND server_host=? AND folder=? AND uid=?",
+                    (account_id, server_host, folder, uid)
                 ).fetchone()
             else:
                 existing = conn.execute(
@@ -594,9 +721,14 @@ class DatabaseManager:
         with self.get_conn() as conn:
             if server_host:
                 row = conn.execute(
-                    "SELECT * FROM mail_metadata WHERE account_id=? AND folder=? AND uid=? AND server_host=?",
-                    (account_id, folder, uid, server_host)
+                    "SELECT * FROM mail_metadata WHERE account_id=? AND server_host=? AND folder=? AND uid=?",
+                    (account_id, server_host, folder, uid)
                 ).fetchone()
+                if not row:
+                    row = conn.execute(
+                        "SELECT * FROM mail_metadata WHERE account_id=? AND folder=? AND uid=? AND (server_host='' OR server_host IS NULL)",
+                        (account_id, folder, uid)
+                    ).fetchone()
             else:
                 row = conn.execute(
                     "SELECT * FROM mail_metadata WHERE account_id=? AND folder=? AND uid=?",
@@ -622,44 +754,69 @@ class DatabaseManager:
     # Sync state operations
     # ------------------------------------------------------------------
 
-    def get_sync_state(self, account_id: int, folder: str) -> Optional[Dict[str, Any]]:
+    def get_sync_state(self, account_id: int, folder: str, server_host: str = "") -> Optional[Dict[str, Any]]:
         with self.get_conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM sync_state WHERE account_id=? AND folder=?",
-                (account_id, folder)
-            ).fetchone()
+            if server_host:
+                row = conn.execute(
+                    "SELECT * FROM sync_state WHERE account_id=? AND server_host=? AND folder=?",
+                    (account_id, server_host, folder)
+                ).fetchone()
+                if not row:
+                    row = conn.execute(
+                        "SELECT * FROM sync_state WHERE account_id=? AND folder=? AND (server_host='' OR server_host IS NULL)",
+                        (account_id, folder)
+                    ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM sync_state WHERE account_id=? AND folder=?",
+                    (account_id, folder)
+                ).fetchone()
             return dict(row) if row else None
 
     def update_sync_state(self, account_id: int, folder: str,
                           last_uid: int, uid_validity: int, mail_count: int,
                           server_host: str = "") -> None:
+        if not server_host:
+            try:
+                acc = self.get_account(account_id)
+                if acc and acc.get("imap_host"):
+                    server_host = acc["imap_host"]
+            except Exception:
+                server_host = ""
+
         with self.transaction() as conn:
             conn.execute(
                 """INSERT INTO sync_state (account_id, folder, last_uid, uid_validity,
                                            last_sync_at, mail_count, server_host)
                    VALUES (?, ?, ?, ?, datetime('now'), ?, ?)
-                   ON CONFLICT(account_id, folder) DO UPDATE SET
+                   ON CONFLICT(account_id, server_host, folder) DO UPDATE SET
                        last_uid=excluded.last_uid,
                        uid_validity=excluded.uid_validity,
                        last_sync_at=excluded.last_sync_at,
-                       mail_count=excluded.mail_count,
-                       server_host=excluded.server_host""",
+                       mail_count=excluded.mail_count""",
                 (account_id, folder, last_uid, uid_validity, mail_count, server_host)
             )
 
-    def reset_account_sync_state(self, account_id: int, reason: str = "server_migration") -> int:
-        """Reset last_uid and uid_validity for an account to force a fresh re-sync of UIDs from a new server,
+    def reset_account_sync_state(self, account_id: int, reason: str = "server_migration", server_host: str = "") -> int:
+        """Reset last_uid and uid_validity for an account (or specific server_host) to force a fresh re-sync of UIDs,
         without deleting any previously archived mail_metadata or raw messages.
         """
         with self.transaction() as conn:
-            cur = conn.execute(
-                "UPDATE sync_state SET last_uid = 0, uid_validity = 0, last_sync_at = datetime('now') "
-                "WHERE account_id = ?",
-                (account_id,)
-            )
+            if server_host:
+                cur = conn.execute(
+                    "UPDATE sync_state SET last_uid = 0, uid_validity = 0, last_sync_at = datetime('now') "
+                    "WHERE account_id = ? AND (server_host = ? OR server_host = '')",
+                    (account_id, server_host)
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE sync_state SET last_uid = 0, uid_validity = 0, last_sync_at = datetime('now') "
+                    "WHERE account_id = ?",
+                    (account_id,)
+                )
             affected = cur.rowcount
-            logger.info("Reset sync state for account %d (affected %d folders, reason: %s)",
-                        account_id, affected, reason)
+            logger.info("Reset sync state for account %d (affected %d folders, reason: %s, server: %s)",
+                        account_id, affected, reason, server_host or "all")
             return affected
 
     # ------------------------------------------------------------------

@@ -1,5 +1,6 @@
 """
-search_panel.py — Redesigned search panel with advanced filters and Thunderbid-style email preview.
+search_panel.py — Full-text search panel with ToyaDbGrid, per-column filters,
+integrated pagination, asynchronous query execution, and rich email preview.
 """
 
 import email
@@ -13,20 +14,47 @@ from email.header import decode_header
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, Slot, QDate, QUrl, QEvent
+from PySide6.QtCore import Qt, Slot, Signal, QThread, QDate, QUrl, QEvent
 from PySide6.QtGui import QFont, QColor, QDesktopServices, QStandardItemModel, QStandardItem
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit,
     QGroupBox, QTextBrowser, QMessageBox, QComboBox, QDateEdit,
     QCheckBox, QSplitter, QFrame, QListWidget, QListWidgetItem,
-    QAbstractItemView, QListView,
+    QAbstractItemView, QListView, QFileDialog
 )
 
 from core.mail_engine import MailEngine
 from core.settings import AppSettings
+from gui.widgets.toya_grid_widget import ToyaDbGrid
 
 logger = logging.getLogger(__name__)
+
+GLOBAL_MSG_STYLE = """
+    QMessageBox, QDialog, QFileDialog {
+        background-color: #ffffff;
+        color: #0f172a;
+    }
+    QMessageBox QLabel, QDialog QLabel, QFileDialog QLabel {
+        color: #0f172a;
+        font-weight: 500;
+        font-size: 13px;
+    }
+    QMessageBox QPushButton, QDialog QPushButton, QFileDialog QPushButton {
+        background-color: #2563eb;
+        color: #ffffff;
+        font-weight: 600;
+        font-size: 12px;
+        border: none;
+        border-radius: 6px;
+        padding: 6px 16px;
+        min-width: 85px;
+        min-height: 28px;
+    }
+    QMessageBox QPushButton:hover, QDialog QPushButton:hover, QFileDialog QPushButton:hover {
+        background-color: #1d4ed8;
+    }
+"""
 
 
 class CheckableComboBox(QComboBox):
@@ -122,10 +150,10 @@ class CheckableComboBox(QComboBox):
         if callable(self.on_selection_changed):
             self.on_selection_changed()
 
-# BTN styling helpers
+
 BTN_STYLE_BLUE = """
     QPushButton {
-        background-color: #4361ee;
+        background-color: #2563eb;
         color: white;
         font-weight: 600;
         padding: 5px 12px;
@@ -134,7 +162,7 @@ BTN_STYLE_BLUE = """
         border: none;
     }
     QPushButton:hover {
-        background-color: #3a56d4;
+        background-color: #1d4ed8;
     }
 """
 
@@ -155,18 +183,151 @@ BTN_STYLE_OUTLINE = """
 """
 
 
+class SearchDataLoaderWorker(QThread):
+    """Background worker to query accounts, domains, distinct folders, and mail counts."""
+    data_loaded_signal = Signal(object, object, object, object)  # accounts, domains, folders, mail_counts
+    error_signal = Signal(str)
+
+    def __init__(self, engine: MailEngine, account_id: Optional[int] = None, sel_domain: Optional[str] = None, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.account_id = account_id
+        self.sel_domain = sel_domain
+
+    def run(self):
+        try:
+            accounts = self.engine.list_accounts()
+            domains = set()
+            for acc in accounts:
+                email_str = acc.get("email", "")
+                dom = email_str.split("@")[-1].strip().lower() if "@" in email_str else (acc.get("account_group", "").strip() or "Diğer")
+                if dom:
+                    domains.add(dom)
+
+            # Query distinct folders and account mail counts
+            from infrastructure.imap_client import format_folder_display_name
+            folders = []
+            mail_counts = {}
+            with self.engine.db.get_conn() as conn:
+                count_rows = conn.execute(
+                    "SELECT account_id, COUNT(*) as cnt FROM mail_metadata WHERE is_deleted = 0 GROUP BY account_id"
+                ).fetchall()
+                for cr in count_rows:
+                    mail_counts[cr["account_id"]] = cr["cnt"]
+
+                params = []
+                where_clauses = ["is_deleted = 0"]
+
+                if self.account_id:
+                    where_clauses.append("account_id = ?")
+                    params.append(self.account_id)
+                elif self.sel_domain:
+                    matching_ids = []
+                    for acc in accounts:
+                        email_str = acc.get("email", "")
+                        acc_dom = email_str.split("@")[-1].strip().lower() if "@" in email_str else (acc.get("account_group", "").strip() or "Diğer")
+                        if self.sel_domain and acc_dom == self.sel_domain.lower():
+                            matching_ids.append(acc.get("id"))
+                    if matching_ids:
+                        placeholders = ", ".join("?" for _ in matching_ids)
+                        where_clauses.append(f"account_id IN ({placeholders})")
+                        params.extend(matching_ids)
+
+                where_sql = " AND ".join(where_clauses)
+                rows = conn.execute(
+                    f"SELECT DISTINCT folder FROM mail_metadata WHERE {where_sql} ORDER BY folder ASC",
+                    params
+                ).fetchall()
+                for r in rows:
+                    orig = r["folder"]
+                    disp = format_folder_display_name(orig)
+                    folders.append((orig, disp))
+
+            self.data_loaded_signal.emit(accounts, sorted(domains), folders, mail_counts)
+        except Exception as e:
+            logger.exception("SearchDataLoaderWorker error: %s", e)
+            self.error_signal.emit(str(e))
+
+
+class SearchExecutionWorker(QThread):
+    """Background worker to execute FTS5 search queries asynchronously."""
+    results_ready_signal = Signal(list)
+    error_signal = Signal(str)
+
+    def __init__(self, engine: MailEngine, search_params: dict, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.params = search_params
+
+    def run(self):
+        try:
+            results = self.engine.search(
+                query=self.params.get("query", ""),
+                limit=self.params.get("limit", 1000),
+                account_id=self.params.get("account_id"),
+                folder=self.params.get("folder"),
+                since_date=self.params.get("since_date"),
+                before_date=self.params.get("before_date"),
+                has_attachments=self.params.get("has_attachments"),
+                unread_only=self.params.get("unread_only")
+            )
+
+            sel_domain = self.params.get("sel_domain")
+            if sel_domain and sel_domain != "__ALL__":
+                accounts_map = {a["id"]: a for a in self.engine.list_accounts()}
+                filtered_results = []
+                for r in results:
+                    acc_id = r.get("account_id")
+                    acc = accounts_map.get(acc_id) if acc_id else None
+                    if acc:
+                        email_str = acc.get("email", "")
+                        acc_dom = email_str.split("@")[-1].strip().lower() if "@" in email_str else (acc.get("account_group", "").strip() or "Diğer")
+                        if acc_dom != sel_domain.lower():
+                            continue
+                    filtered_results.append(r)
+                results = filtered_results
+
+            self.results_ready_signal.emit(results)
+        except Exception as e:
+            logger.exception("SearchExecutionWorker error: %s", e)
+            self.error_signal.emit(str(e))
+
+
 class SearchPanel(QWidget):
-    """Full-text search panel with advanced metadata filters, 3-panel workspace layout, and rich preview."""
+    """Full-text search panel with ToyaDbGrid, per-column filtering, pagination, and preview."""
+
+    COLUMNS = ["Tarih", "Hesap", "Kimden", "Alıcı", "Konu", "Klasör", "Boyut", "Ek"]
+    DEFAULT_WIDTHS = [95, 110, 120, 120, 160, 75, 55, 35]
 
     def __init__(self, engine: MailEngine, parent=None):
         super().__init__(parent)
         self.engine = engine
         self.settings = AppSettings()
-        self._results: List[Dict[str, Any]] = []
+        
+        self._all_accounts: List[Dict[str, Any]] = []
+        self._accounts_by_id: Dict[int, Dict[str, Any]] = {}
+        self._account_mail_counts: Dict[int, int] = {}
+        self._all_results: List[Dict[str, Any]] = []
+        self._filtered_results: List[Dict[str, Any]] = []
+        self._column_filters: Dict[int, str] = {}
         self._current_attachments: List[Dict[str, Any]] = []
         self._raw_mode = False
+
+        self._loader_worker: Optional[SearchDataLoaderWorker] = None
+        self._search_worker: Optional[SearchExecutionWorker] = None
+
         self._setup_ui()
         self.refresh()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "db_grid") and hasattr(self.db_grid, "filter_bar"):
+            self.db_grid.filter_bar.adjust_positions()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, "db_grid") and hasattr(self.db_grid, "filter_bar"):
+            self.db_grid.filter_bar.adjust_positions()
 
     def _setup_ui(self):
         main_layout = QVBoxLayout(self)
@@ -181,24 +342,19 @@ class SearchPanel(QWidget):
         ws.btn_toggle_right.setText("📧 Sağ Önizleme Paneli")
 
         # -------------------------------------------------------------------
-        # 1. SOL PANEL: Domain, Grup, Hesap, Klasör ve Tarih Filtreleri
+        # 1. SOL PANEL: Domain, Hesap, Klasör ve Tarih Filtreleri
         # -------------------------------------------------------------------
         ws.left_group.setTitle("🌐 Domain & Filtre Seçenekleri")
         left_layout = ws.left_inner_layout
 
         left_layout.addWidget(QLabel("🌐 Domain Filtresi:"))
         self.combo_domain = QComboBox()
-        self.combo_domain.currentIndexChanged.connect(self._on_filter_account_changed)
+        self.combo_domain.currentIndexChanged.connect(self._on_domain_filter_changed)
         left_layout.addWidget(self.combo_domain)
-
-        left_layout.addWidget(QLabel("👥 Grup Filtresi:"))
-        self.combo_group = QComboBox()
-        self.combo_group.currentIndexChanged.connect(self._on_filter_account_changed)
-        left_layout.addWidget(self.combo_group)
 
         left_layout.addWidget(QLabel("👤 Hesap Seçimi:"))
         self.combo_account = QComboBox()
-        self.combo_account.currentIndexChanged.connect(self._on_filter_account_changed)
+        self.combo_account.currentIndexChanged.connect(self._on_account_filter_changed)
         left_layout.addWidget(self.combo_account)
 
         left_layout.addWidget(QLabel("📁 Klasör Filtresi (Açılır Çoklu Seçim):"))
@@ -265,7 +421,7 @@ class SearchPanel(QWidget):
         left_layout.addStretch()
 
         # -------------------------------------------------------------------
-        # 2. ORTA PANEL: Arama Girişi & Sonuç Tablosu
+        # 2. ORTA PANEL: Arama Girişi & ToyaDbGrid
         # -------------------------------------------------------------------
         center_layout = ws.center_layout
 
@@ -295,33 +451,16 @@ class SearchPanel(QWidget):
 
         center_layout.addWidget(search_box)
 
-        self.label_count = QLabel("0 sonuç bulundu")
-        self.label_count.setStyleSheet("font-size: 12px; color: #2563eb; font-weight: bold;")
-        center_layout.addWidget(self.label_count)
+        # TOYA DBGRID Component (Table + Per-Column Search Row + Pagination Bar)
+        self.db_grid = ToyaDbGrid(parent=self, enable_pagination=True)
+        self.db_grid.set_columns(self.COLUMNS, self.DEFAULT_WIDTHS)
+        self.table = self.db_grid.table
 
-        self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels([
-            "Tarih", "Hesap", "Kimden", "Konu", "Klasör", "Ek"
-        ])
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSortingEnabled(True)
-        self.table.setStyleSheet("""
-            QTableWidget {
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                background-color: #ffffff;
-                color: #0f172a;
-                font-size: 11px;
-            }
-            QTableWidget::item { padding: 6px 8px; }
-            QTableWidget::item:selected { background-color: #cbd5e1; color: #000000; }
-        """)
-        center_layout.addWidget(self.table, stretch=1)
+        self.db_grid.filter_bar.filter_changed.connect(self._on_column_filter_changed)
+        self.db_grid.page_changed.connect(self._on_page_changed)
+        self.db_grid.selection_changed.connect(self._on_table_selection_changed)
+
+        center_layout.addWidget(self.db_grid, stretch=1)
 
         # -------------------------------------------------------------------
         # 3. SAĞ PANEL: Önizleme & Hızlı Dışa Aktarım İşlemleri
@@ -430,12 +569,13 @@ class SearchPanel(QWidget):
 
         # Load persisted layout splitter state
         ws.load_splitter_state(self.settings, "search_workspace")
-        ws.splitter.splitterMoved.connect(lambda *args: ws.save_splitter_state(self.settings, "search_workspace"))
+        ws.splitter.splitterMoved.connect(lambda *args: (ws.save_splitter_state(self.settings, "search_workspace"), self.db_grid.filter_bar.adjust_positions()))
 
         def _on_search_panel_toggled(panel_name: str, visible: bool):
             self.settings.set(f"search_{panel_name}_visible", visible)
             self.settings.save()
             ws.save_splitter_state(self.settings, "search_workspace")
+            self.db_grid.filter_bar.adjust_positions()
 
         ws.panel_toggled.connect(_on_search_panel_toggled)
 
@@ -443,7 +583,6 @@ class SearchPanel(QWidget):
         self.btn_search.clicked.connect(self._search)
         self.btn_rebuild.clicked.connect(self._rebuild_index)
         self.input_query.returnPressed.connect(self._search)
-        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         
         self.btn_save_eml.clicked.connect(self._save_eml)
         self.btn_print.clicked.connect(self._print_mail)
@@ -457,116 +596,156 @@ class SearchPanel(QWidget):
     # ------------------------------------------------------------------
 
     def refresh(self):
-        self.combo_account.blockSignals(True)
-        self.combo_account.clear()
-        self.combo_account.addItem("👤 Tüm Hesaplar", None)
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+            parent_mw.notify_disk_reading("💾 Disk Okunuyor", "Arama filtreleri ve hesap klasörleri taranıyor...")
+
+        if self._loader_worker and self._loader_worker.isRunning():
+            self._loader_worker.quit()
+            self._loader_worker.wait()
+
+        account_id = self.combo_account.currentData() if hasattr(self, "combo_account") else None
+        sel_domain = self.combo_domain.currentData() if hasattr(self, "combo_domain") else None
+
+        self._loader_worker = SearchDataLoaderWorker(self.engine, account_id, sel_domain, self)
+        self._loader_worker.data_loaded_signal.connect(self._on_filters_loaded)
+        self._loader_worker.start()
+
+    @Slot(object, object, object, object)
+    def _on_filters_loaded(self, accounts: list, domains: list, folders: list, mail_counts: dict = None):
+        self._all_accounts = accounts
+        self._accounts_by_id = {a["id"]: a for a in accounts if "id" in a}
+        self._account_mail_counts = mail_counts or {}
 
         self.combo_domain.blockSignals(True)
+        cur_dom = self.combo_domain.currentData()
         self.combo_domain.clear()
         self.combo_domain.addItem("🌐 Tüm Domainler", None)
+        for d in domains:
+            self.combo_domain.addItem(f"🌐 {d}", d)
+        if cur_dom is not None:
+            idx = self.combo_domain.findData(cur_dom)
+            if idx >= 0:
+                self.combo_domain.setCurrentIndex(idx)
+        self.combo_domain.blockSignals(False)
 
-        self.combo_group.blockSignals(True)
-        self.combo_group.clear()
-        self.combo_group.addItem("👥 Tüm Gruplar", None)
+        self._populate_accounts_for_current_domain()
+        self._populate_folder_items(folders)
 
-        domains = set()
-        groups = set()
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+            parent_mw.notify_disk_ready("Arama filtreleri ve hesaplar hazır.")
 
-        try:
-            accounts = self.engine.list_accounts()
-            for acc in accounts:
-                acc_id = acc.get("id")
-                label = acc.get("label") or acc.get("email")
-                self.combo_account.addItem(f"👤 {label}", acc_id)
-
-                dom = acc.get("domain")
-                if not dom and acc.get("email") and "@" in acc.get("email"):
-                    dom = acc.get("email").split("@")[-1].strip().lower()
-                if dom:
-                    domains.add(dom)
-
-                grp = acc.get("account_group") or acc.get("group_name") or acc.get("group")
-                if grp:
-                    groups.add(grp)
-
-            for d in sorted(domains):
-                self.combo_domain.addItem(f"🌐 {d}", d)
-            for g in sorted(groups):
-                self.combo_group.addItem(f"👥 {g}", g)
-
-        except Exception as exc:
-            logger.error("Failed to load accounts in search: %s", exc)
-        finally:
-            self.combo_account.blockSignals(False)
-            self.combo_domain.blockSignals(False)
-            self.combo_group.blockSignals(False)
-
-        self._load_folders_for_selected_account()
-
-    @Slot()
-    def _on_filter_account_changed(self):
-        self._load_folders_for_selected_account()
         self._search()
 
-    def _load_folders_for_selected_account(self):
+    def _populate_accounts_for_current_domain(self):
+        """Filters self.combo_account to show only accounts for the currently selected domain."""
+        if not hasattr(self, "combo_account") or not hasattr(self, "combo_domain"):
+            return
+
+        sel_domain = self.combo_domain.currentData()
+        cur_acc = self.combo_account.currentData()
+
+        # Filter accounts matching selected domain
+        matching_accounts = []
+        for acc in self._all_accounts:
+            email_str = acc.get("email", "")
+            dom = email_str.split("@")[-1].strip().lower() if "@" in email_str else (acc.get("account_group", "").strip() or "Diğer")
+            if not sel_domain or dom == sel_domain.lower():
+                matching_accounts.append(acc)
+
+        self.combo_account.blockSignals(True)
+        self.combo_account.clear()
+        
+        if sel_domain:
+            self.combo_account.addItem(f"👤 Tüm Hesaplar ({len(matching_accounts)})", None)
+        else:
+            self.combo_account.addItem("👤 Tüm Hesaplar", None)
+
+        for acc in matching_accounts:
+            acc_id = acc.get("id")
+            email_str = acc.get("email", "")
+            lbl = acc.get("label", "").strip()
+            mail_cnt = self._account_mail_counts.get(acc_id, 0)
+            status_prefix = "⚠️ " if mail_cnt == 0 else "👤 "
+            if lbl and lbl.lower() != email_str.lower():
+                display_label = f"{status_prefix}{lbl} <{email_str}>"
+            else:
+                display_label = f"{status_prefix}{email_str or f'Hesap #{acc_id}'}"
+            if mail_cnt == 0:
+                display_label += " (Senkronize Edilmedi)"
+            self.combo_account.addItem(display_label, acc_id)
+
+        # Restore previously selected account if it belongs to this domain
+        if cur_acc is not None:
+            idx = self.combo_account.findData(cur_acc)
+            if idx >= 0:
+                self.combo_account.setCurrentIndex(idx)
+            else:
+                self.combo_account.setCurrentIndex(0)
+        else:
+            self.combo_account.setCurrentIndex(0)
+
+        self.combo_account.blockSignals(False)
+
+    def _populate_folder_items(self, folders: list):
         if not hasattr(self, "combo_folder"):
             return
         model = self.combo_folder.model()
         model.clear()
+        for orig_folder, display_name in folders:
+            item = QStandardItem(display_name)
+            item.setData(orig_folder, Qt.UserRole)
+            item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            standard_keywords = ["inbox", "sent", "draft", "spam", "junk", "trash", "archive", 
+                               "gelen", "giden", "gönderilen", "taslak", "çöp", "arşiv", "istenmeyen"]
+            is_standard = any(w in display_name.lower() for w in standard_keywords)
+            item.setCheckState(Qt.Checked if is_standard else Qt.Unchecked)
+            model.appendRow(item)
+        self.combo_folder._update_display_text()
 
+    @Slot()
+    def _on_domain_filter_changed(self):
+        self._populate_accounts_for_current_domain()
+        self._load_folders_for_selected_account()
+        self._search()
+
+    @Slot()
+    def _on_account_filter_changed(self):
+        account_id = self.combo_account.currentData() if hasattr(self, "combo_account") else None
+        if account_id:
+            mail_cnt = self._account_mail_counts.get(account_id, 0)
+            if mail_cnt == 0:
+                acc = self._accounts_by_id.get(account_id, {})
+                label = acc.get("label") or acc.get("email") or f"Hesap #{account_id}"
+                email_str = acc.get("email", "")
+                reply = QMessageBox.question(
+                    self,
+                    "⚠️ E-Postalar Senkronize Edilmemiş",
+                    f"'{label}' ({email_str}) hesabı ile ilgili mailler henüz sunucudan senkronize edilmemiştir.\n\n"
+                    "Arama yapabilmek ve e-postaları arşive dahil etmek için şimdi senkronizasyon (eşitleme) işlemini başlatmak ister misiniz?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    parent_mw = self.window()
+                    if parent_mw and hasattr(parent_mw, "_navigate"):
+                        parent_mw._navigate("sync")
+                        return
+
+        self._load_folders_for_selected_account()
+        self._search()
+
+    def _load_folders_for_selected_account(self):
         account_id = self.combo_account.currentData() if hasattr(self, "combo_account") else None
         sel_domain = self.combo_domain.currentData() if hasattr(self, "combo_domain") else None
-        sel_group = self.combo_group.currentData() if hasattr(self, "combo_group") else None
 
-        try:
-            from infrastructure.imap_client import format_folder_display_name
-            with self.engine.db.get_conn() as conn:
-                params = []
-                where_clauses = ["is_deleted = 0"]
+        if self._loader_worker and self._loader_worker.isRunning():
+            self._loader_worker.quit()
+            self._loader_worker.wait()
 
-                if account_id:
-                    where_clauses.append("account_id = ?")
-                    params.append(account_id)
-                elif sel_domain or sel_group:
-                    matching_ids = []
-                    for acc in self.engine.list_accounts():
-                        acc_dom = acc.get("domain") or (acc.get("email").split("@")[-1] if acc.get("email") and "@" in acc.get("email") else "")
-                        acc_grp = acc.get("account_group") or acc.get("group_name") or acc.get("group") or ""
-                        if sel_domain and acc_dom != sel_domain:
-                            continue
-                        if sel_group and acc_grp != sel_group:
-                            continue
-                        matching_ids.append(acc.get("id"))
-                    if matching_ids:
-                        placeholders = ", ".join("?" for _ in matching_ids)
-                        where_clauses.append(f"account_id IN ({placeholders})")
-                        params.extend(matching_ids)
-
-                where_sql = " AND ".join(where_clauses)
-                rows = conn.execute(
-                    f"SELECT DISTINCT folder FROM mail_metadata WHERE {where_sql} ORDER BY folder ASC",
-                    params
-                ).fetchall()
-
-            for r in rows:
-                orig_folder = r["folder"]
-                display_name = format_folder_display_name(orig_folder)
-                
-                item = QStandardItem(display_name)
-                item.setData(orig_folder, Qt.UserRole)
-                item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                
-                standard_keywords = ["inbox", "sent", "draft", "spam", "junk", "trash", "archive", 
-                                   "gelen", "giden", "gönderilen", "taslak", "çöp", "arşiv", "istenmeyen"]
-                is_standard = any(w in display_name.lower() for w in standard_keywords)
-                
-                item.setCheckState(Qt.Checked if is_standard else Qt.Unchecked)
-                model.appendRow(item)
-
-            self.combo_folder._update_display_text()
-
-        except Exception as exc:
-            logger.error("Failed to load search folder list: %s", exc)
+        self._loader_worker = SearchDataLoaderWorker(self.engine, account_id, sel_domain, self)
+        self._loader_worker.data_loaded_signal.connect(lambda accs, doms, flds, counts: self._populate_folder_items(flds))
+        self._loader_worker.start()
 
     def _select_all_folders(self):
         if hasattr(self, "combo_folder"):
@@ -594,11 +773,10 @@ class SearchPanel(QWidget):
     @Slot()
     def _reset_filters(self):
         self.combo_domain.blockSignals(True)
-        self.combo_group.blockSignals(True)
         self.combo_account.blockSignals(True)
         
         self.combo_domain.setCurrentIndex(0)
-        self.combo_group.setCurrentIndex(0)
+        self._populate_accounts_for_current_domain()
         self.combo_account.setCurrentIndex(0)
         self.combo_attachments.setCurrentIndex(0)
         self.combo_read.setCurrentIndex(0)
@@ -607,128 +785,182 @@ class SearchPanel(QWidget):
         self.input_query.clear()
 
         self.combo_domain.blockSignals(False)
-        self.combo_group.blockSignals(False)
         self.combo_account.blockSignals(False)
 
         self._load_folders_for_selected_account()
         self._search()
 
     # ------------------------------------------------------------------
-    # Search implementation
+    # Search implementation & Pagination Slicing
     # ------------------------------------------------------------------
 
     @Slot()
     def _search(self):
         query = self.input_query.text().strip()
         
-        # Resolve filter params
-        account_id = self.combo_account.currentData()
+        account_id = self.combo_account.currentData() if hasattr(self, "combo_account") else None
         folder = self._get_selected_folders()
         
         since_date = None
-        if self.chk_since.isChecked():
+        if hasattr(self, "chk_since") and self.chk_since.isChecked():
             since_date = self.date_since.date().toString("yyyy-MM-dd 00:00:00")
             
         before_date = None
-        if self.chk_before.isChecked():
+        if hasattr(self, "chk_before") and self.chk_before.isChecked():
             before_date = self.date_before.date().toString("yyyy-MM-dd 23:59:59")
 
-        att_idx = self.combo_attachments.currentIndex()
+        att_idx = self.combo_attachments.currentIndex() if hasattr(self, "combo_attachments") else 0
         has_attachments = None
         if att_idx == 1:
             has_attachments = True
         elif att_idx == 2:
             has_attachments = False
 
-        read_idx = self.combo_read.currentIndex()
+        read_idx = self.combo_read.currentIndex() if hasattr(self, "combo_read") else 0
         unread_only = None
         if read_idx == 1:
             unread_only = True
         elif read_idx == 2:
             unread_only = False
 
-        try:
-            results = self.engine.search(
-                query=query,
-                limit=300,
-                account_id=account_id,
-                folder=folder,
-                since_date=since_date,
-                before_date=before_date,
-                has_attachments=has_attachments,
-                unread_only=unread_only
-            )
+        sel_domain = self.combo_domain.currentData() if hasattr(self, "combo_domain") else None
 
-            sel_domain = self.combo_domain.currentData()
-            sel_group = self.combo_group.currentData()
+        search_params = {
+            "query": query,
+            "limit": 1000,
+            "account_id": account_id,
+            "folder": folder,
+            "since_date": since_date,
+            "before_date": before_date,
+            "has_attachments": has_attachments,
+            "unread_only": unread_only,
+            "sel_domain": sel_domain,
+        }
 
-            if sel_domain or sel_group:
-                filtered_results = []
-                for r in results:
-                    acc_id = r.get("account_id")
-                    acc = self.engine.accounts.get(acc_id) if acc_id else None
-                    if acc:
-                        if sel_domain and acc.get("domain") != sel_domain:
-                            continue
-                        if sel_group and acc.get("group_name") != sel_group:
-                            continue
-                    filtered_results.append(r)
-                results = filtered_results
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+            parent_mw.notify_disk_reading("💾 Disk Okunuyor", "FTS5 arama veritabanında taranıyor...")
 
-            self.label_count.setText(f"{len(results)} sonuç bulundu")
-            self._results = results
-            
-            self.table.setRowCount(0)
-            self.table.setRowCount(len(results))
+        if hasattr(self, "btn_search"):
+            self.btn_search.setEnabled(False)
+            self.btn_search.setText("⏳ Aranıyor...")
 
-            for i, r in enumerate(results):
-                # Format Date
-                date_val = (r.get("date") or "")[:10]
-                self.table.setItem(i, 0, QTableWidgetItem(date_val))
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.quit()
+            self._search_worker.wait()
 
-                # Account
-                acc_id = r.get("account_id")
-                acc_label = f"#{acc_id}"
-                acc = self.engine.accounts.get(acc_id)
-                if acc:
-                    acc_label = acc.get("label", acc_label)
-                self.table.setItem(i, 1, QTableWidgetItem(acc_label))
+        self._search_worker = SearchExecutionWorker(self.engine, search_params, self)
+        self._search_worker.results_ready_signal.connect(self._on_search_results_ready)
+        self._search_worker.error_signal.connect(self._on_search_error)
+        self._search_worker.start()
 
-                # From
-                self.table.setItem(i, 2, QTableWidgetItem((r.get("sender") or "")[:35]))
-                
-                # Subject
-                self.table.setItem(i, 3, QTableWidgetItem((r.get("subject") or "")[:60]))
-                
-                # Folder
-                self.table.setItem(i, 4, QTableWidgetItem(r.get("folder", "")))
+    @Slot(list)
+    def _on_search_results_ready(self, results: list):
+        if hasattr(self, "btn_search"):
+            self.btn_search.setEnabled(True)
+            self.btn_search.setText("🔍 Ara")
 
-                # Attachment
-                has_att = r.get("has_attachments", 0)
-                self.table.setItem(i, 5, QTableWidgetItem("📎" if has_att else ""))
+        self._all_results = results
+        
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(results))
 
-                # Bind metadata inside UserRole
-                for col in range(6):
-                    self.table.item(i, col).setData(Qt.UserRole, r)
+        for i, r in enumerate(results):
+            # Column 0: Date
+            date_val = (r.get("date") or "")[:19]
+            self.table.setItem(i, 0, QTableWidgetItem(date_val))
 
-            self.table.resizeColumnsToContents()
-            self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-            
-            if results:
-                self.table.selectRow(0)
-            else:
-                self._clear_preview()
+            # Column 1: Account
+            acc_id = r.get("account_id")
+            acc_label = f"#{acc_id}" if acc_id else "—"
+            acc = self._accounts_by_id.get(acc_id) if acc_id else None
+            if acc:
+                email_str = acc.get("email", "").strip()
+                lbl = acc.get("label", "").strip()
+                if lbl and lbl.lower() != email_str.lower():
+                    acc_label = f"{lbl} <{email_str}>"
+                else:
+                    acc_label = email_str or acc_label
+            self.table.setItem(i, 1, QTableWidgetItem(acc_label))
 
-        except Exception as exc:
-            QMessageBox.critical(self, "Arama Hatası", f"İşlem başarısız oldu:\n{exc}")
+            # Column 2: Sender
+            self.table.setItem(i, 2, QTableWidgetItem(r.get("sender") or ""))
+
+            # Column 3: Recipients
+            self.table.setItem(i, 3, QTableWidgetItem(r.get("recipients") or ""))
+
+            # Column 4: Subject
+            self.table.setItem(i, 4, QTableWidgetItem(r.get("subject") or "(Konu Yok)"))
+
+            # Column 5: Folder
+            self.table.setItem(i, 5, QTableWidgetItem(r.get("folder", "")))
+
+            # Column 6: Size
+            size_str = self._fmt_size(r.get("size_bytes", 0))
+            self.table.setItem(i, 6, QTableWidgetItem(size_str))
+
+            # Column 7: Attachment
+            has_att = bool(r.get("has_attachments", 0))
+            att_item = QTableWidgetItem("📎" if has_att else "")
+            att_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 7, att_item)
+
+            # Store metadata dictionary on row items
+            for col in range(len(self.COLUMNS)):
+                item = self.table.item(i, col)
+                if item:
+                    item.setData(Qt.UserRole, r)
+
+        self.table.blockSignals(False)
+        self.db_grid._apply_row_filters()
+
+        if results:
+            self.table.selectRow(0)
+            self._on_table_selection_changed()
+        else:
+            self._clear_preview()
+
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+            parent_mw.notify_disk_ready(f"{len(results)} e-posta bulundu.", auto_dismiss_seconds=3)
+
+    @Slot(int, str)
+    def _on_column_filter_changed(self, col_idx: int, filter_text: str):
+        pass
+
+    @Slot(int, int)
+    def _on_page_changed(self, current_page: int, page_size: int):
+        pass
+
+    @Slot(str)
+    def _on_search_error(self, err_msg: str):
+        if hasattr(self, "btn_search"):
+            self.btn_search.setEnabled(True)
+            self.btn_search.setText("🔍 Ara")
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Critical)
+        msg.setWindowTitle("Arama Hatası")
+        msg.setText(f"Arama işlemi gerçekleştirilirken bir hata oluştu:\n\n{err_msg}")
+        msg.setStyleSheet(GLOBAL_MSG_STYLE)
+        msg.exec()
 
     @Slot()
     def _rebuild_index(self):
         try:
             self.engine.db.rebuild_fts_index()
-            QMessageBox.information(self, "Başarılı", "FTS5 Arama İndeksi başarıyla yeniden oluşturuldu.")
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Başarılı")
+            msg.setText("FTS5 Arama İndeksi başarıyla yeniden oluşturuldu.")
+            msg.setStyleSheet(GLOBAL_MSG_STYLE)
+            msg.exec()
         except Exception as exc:
-            QMessageBox.critical(self, "Hata", str(exc))
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Critical)
+            msg.setWindowTitle("Hata")
+            msg.setText(str(exc))
+            msg.setStyleSheet(GLOBAL_MSG_STYLE)
+            msg.exec()
 
     # ------------------------------------------------------------------
     # Selection & Preview Renderer
@@ -749,11 +981,15 @@ class SearchPanel(QWidget):
     @Slot()
     def _on_table_selection_changed(self):
         row = self.table.currentRow()
-        if row < 0 or row >= len(self._results):
+        if row < 0 or row >= self.table.rowCount():
             self._clear_preview()
             return
 
-        r = self.table.item(row, 0).data(Qt.UserRole)
+        item = self.table.item(row, 0)
+        if not item:
+            return
+
+        r = item.data(Qt.UserRole)
         if not r:
             return
 
@@ -790,8 +1026,11 @@ class SearchPanel(QWidget):
                 self.preview_browser.setHtml(f"<p style='color:red;'>Ham e-posta ayrıştırılamadı: {e}</p>")
         else:
             self.preview_browser.setHtml(
-                "<div style='text-align:center;padding:40px;color:#999;'>"
-                "<p>E-posta ham içeriği yerel veritabanında bulunamadı.</p></div>"
+                "<div style='text-align:center;padding:40px;color:#64748b;'>"
+                "<h3>⚠️ E-Posta Önizlemesi Çevrimdışı</h3>"
+                "<p>Bu e-postanın tam gövde metni ve ekleri arşiv diskinde saklanmaktadır.<br/>"
+                "İçeriği görüntülemek için lütfen yapılandırılmış harici yedekleme diskinizi takınız.</p>"
+                "</div>"
             )
 
     def _render_message(self, msg):
@@ -862,7 +1101,7 @@ class SearchPanel(QWidget):
                 text = str(raw_data)
             self.preview_browser.setPlainText(text[:60000])
         else:
-            self.preview_browser.setPlainText("Ham veri bulunamadı.")
+            self.preview_browser.setPlainText("Ham veri bulunamadı (Yedekleme diski takılı olmayabilir).")
 
     # ------------------------------------------------------------------
     # Actions
@@ -871,27 +1110,52 @@ class SearchPanel(QWidget):
     @Slot()
     def _save_eml(self):
         row = self.table.currentRow()
-        if row < 0:
+        if row < 0 or row >= self.table.rowCount():
             return
-        r = self.table.item(row, 0).data(Qt.UserRole)
+        item = self.table.item(row, 0)
+        if not item:
+            return
+        r = item.data(Qt.UserRole)
         if not r:
             return
 
         try:
             raw_data = self.engine.mails.get_raw(r["id"])
             if not raw_data:
-                QMessageBox.warning(self, "Hata", "E-postanın ham verisi veritabanında yok.")
+                disk_str = self.settings.configured_data_path_str()
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Warning)
+                msg.setWindowTitle("Ham Veri Bulunamadı")
+                msg.setText(
+                    f"E-postanın ham içeriği (.eml) yerel veritabanında veya arşiv diskinde bulunamadı.\n\n"
+                    f"Arşiv diskiniz (<b>{disk_str}</b>) takılı değil veya e-posta gövdesi henüz senkronize edilmemiş olabilir."
+                )
+                msg.setStyleSheet(GLOBAL_MSG_STYLE)
+                msg.exec()
                 return
-                
+
             cleaned_subj = re.sub(r'[\\/*?:"<>|]', "", r.get("subject") or "mail")[:50]
-            default_name = f"{r.get('uid')}_{cleaned_subj}.eml"
-            
-            path, _ = QFileDialog.getSaveFileName(self, "E-postayı EML olarak kaydet", default_name, "EML Dosyaları (*.eml)")
+            default_name = f"{r.get('uid', 'mail')}_{cleaned_subj}.eml"
+
+            path, _ = QFileDialog.getSaveFileName(
+                self, "E-postayı EML Olarak Kaydet", default_name, "EML Dosyaları (*.eml);;Tüm Dosyalar (*.*)"
+            )
             if path:
                 Path(path).write_bytes(raw_data)
-                QMessageBox.information(self, "Başarılı", "E-posta başarıyla kaydedildi.")
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Information)
+                msg.setWindowTitle("Başarılı")
+                msg.setText("E-posta (.eml) başarıyla dışa aktarıldı.")
+                msg.setStyleSheet(GLOBAL_MSG_STYLE)
+                msg.exec()
         except Exception as e:
-            QMessageBox.critical(self, "Kaydetme Başarısız", str(e))
+            logger.exception("EML export error: %s", e)
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Critical)
+            msg.setWindowTitle("Kaydetme Başarısız")
+            msg.setText(f"E-posta kaydedilirken bir hata oluştu:\n{e}")
+            msg.setStyleSheet(GLOBAL_MSG_STYLE)
+            msg.exec()
 
     @Slot()
     def _print_mail(self):
@@ -899,19 +1163,27 @@ class SearchPanel(QWidget):
             from PySide6.QtPrintSupport import QPrinter, QPrintDialog
             printer = QPrinter()
             dialog = QPrintDialog(printer, self)
+            dialog.setStyleSheet(GLOBAL_MSG_STYLE)
             if dialog.exec() == QPrintDialog.Accepted:
                 self.preview_browser.print_(printer)
         except Exception as e:
-            QMessageBox.critical(self, "Yazdırma Hatası", f"Yazdırılamadı: {e}")
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Critical)
+            msg.setWindowTitle("Yazdırma Hatası")
+            msg.setText(f"Yazdırılamadı:\n{e}")
+            msg.setStyleSheet(GLOBAL_MSG_STYLE)
+            msg.exec()
 
     @Slot(bool)
     def _toggle_raw_mode(self, checked: bool):
         self._raw_mode = checked
         row = self.table.currentRow()
-        if row >= 0:
-            r = self.table.item(row, 0).data(Qt.UserRole)
-            if r:
-                self._load_mail_preview(r)
+        if row >= 0 and row < self.table.rowCount():
+            item = self.table.item(row, 0)
+            if item:
+                r = item.data(Qt.UserRole)
+                if r:
+                    self._load_mail_preview(r)
 
     @Slot()
     def _open_selected_attachment(self):
@@ -926,7 +1198,12 @@ class SearchPanel(QWidget):
             temp_file.write_bytes(att["data"])
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(temp_file)))
         except Exception as e:
-            QMessageBox.critical(self, "Hata", f"Dosya açılamadı: {e}")
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Critical)
+            msg.setWindowTitle("Hata")
+            msg.setText(f"Dosya açılamadı:\n{e}")
+            msg.setStyleSheet(GLOBAL_MSG_STYLE)
+            msg.exec()
 
     @Slot()
     def _save_selected_attachment(self):
@@ -938,9 +1215,19 @@ class SearchPanel(QWidget):
         if path:
             try:
                 Path(path).write_bytes(att["data"])
-                QMessageBox.information(self, "Başarılı", "Ek başarıyla kaydedildi.")
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Information)
+                msg.setWindowTitle("Başarılı")
+                msg.setText("Ek başarıyla kaydedildi.")
+                msg.setStyleSheet(GLOBAL_MSG_STYLE)
+                msg.exec()
             except Exception as e:
-                QMessageBox.critical(self, "Hata", str(e))
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Critical)
+                msg.setWindowTitle("Hata")
+                msg.setText(str(e))
+                msg.setStyleSheet(GLOBAL_MSG_STYLE)
+                msg.exec()
 
     # ------------------------------------------------------------------
     # Static Parsers
@@ -979,6 +1266,8 @@ class SearchPanel(QWidget):
 
     @staticmethod
     def _fmt_size(size: int) -> str:
+        if not size:
+            return "0 B"
         for unit in ["B", "KB", "MB"]:
             if size < 1024:
                 return f"{size:.1f} {unit}"

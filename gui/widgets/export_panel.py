@@ -34,6 +34,7 @@ from gui.widgets.view_profile_widget import ViewProfileWidget, SaveLayoutProfile
 from gui.widgets.account_group_sidebar_widget import AccountGroupSidebarWidget, CollapsibleSection
 from gui.widgets.export_right_sidebar_widget import ExportRightSidebarWidget
 from infrastructure.imap_client import format_folder_display_name, decode_imap_utf7
+from gui.dialogs.delete_confirm_dialog import DeleteConfirmDialog
 
 logger = logging.getLogger(__name__)
 
@@ -810,7 +811,14 @@ class ExportConfigDialog(QDialog):
             return
 
         name = srv.get("name")
-        if QMessageBox.question(self, "Silmeyi Onayla", f"'{name}' sunucu şablonunu silmek istiyor musunuz?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+        confirmed = DeleteConfirmDialog.confirm_deletion(
+            parent=self,
+            item_name=name,
+            item_type="Hedef Sunucu Şablonu",
+            details=f"Şablon Adı: {name}\nSunucu: {srv.get('host', '')}:{srv.get('port', '')}\nKullanıcı: {srv.get('username', '')}",
+            warning_text="Bu sunucu şablonu kayıtlı şablonlar listesinden silinecektir."
+        )
+        if confirmed:
             servers = self.settings.get("saved_target_servers", [])
             servers = [s for s in servers if isinstance(s, dict) and s.get("name") != name]
             self.settings.set("saved_target_servers", servers)
@@ -869,8 +877,15 @@ class ExportConfigDialog(QDialog):
         if not prof or not isinstance(prof, dict):
             return
 
-        reply = QMessageBox.question(self, "Sil", f"'{prof.get('name')}' profilini silmek istediğinizden emin misiniz?")
-        if reply == QMessageBox.Yes:
+        prof_name = prof.get("name", "Dışa Aktarım Profili")
+        confirmed = DeleteConfirmDialog.confirm_deletion(
+            parent=self,
+            item_name=prof_name,
+            item_type="Dışa Aktarım Profili",
+            details=f"Profil Adı: {prof_name}\nBiçim: {prof.get('format', 'ZIP')}\nHedef: {prof.get('target_path', '') or prof.get('imap_host', '')}",
+            warning_text="Bu profil kaydı ve filtreleme kuralları kalıcı olarak silinecektir."
+        )
+        if confirmed:
             profiles = self.settings.get("export_profiles", [])
             profiles = [p for p in profiles if p.get("name") != prof.get("name")]
             self.settings.set("export_profiles", profiles)
@@ -2376,6 +2391,10 @@ class ExportPanel(QWidget):
         self._is_refreshing = True
         self._refresh_groups_sidebar()
 
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+            parent_mw.notify_disk_reading("💾 Disk Okunuyor", "Dışa aktarım hesapları ve disk veritabanı taranıyor...")
+
         self.account_table.blockSignals(True)
         self.account_table.setRowCount(0)
         self._accounts_ui.clear()
@@ -2543,6 +2562,10 @@ class ExportPanel(QWidget):
         self.lbl_disk_status_icon.setText("✅")
         self.lbl_disk_status_text.setText(f"Veritabanı ve yerel arşiv hazır. Toplam {total_mails:,} arşivlenmiş e-posta.")
         self.card_size.set_value(f"{total_mails:,} E-Posta")
+
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+            parent_mw.notify_disk_ready(f"Dışa aktarım arşivi hazır. Toplam {total_mails:,} arşivlenmiş e-posta.")
 
     # -----------------------------------------------------------------------
     # Filtering & Selection Handling

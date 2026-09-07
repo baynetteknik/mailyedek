@@ -160,6 +160,36 @@ class VhdxBackupUseCase:
 
         return report
 
+    def restore_backup(
+        self,
+        source_backup_path: str,
+        target_dest_path: str,
+        mode: str = "custom",
+        progress_callback: Optional[Callable[[str, float, float], None]] = None,
+    ) -> Dict[str, Any]:
+        """Restore a VHDX / Hyper-V backup."""
+        res = self._client.restore_vhdx_file(
+            source_backup_path=source_backup_path,
+            target_dest_path=target_dest_path,
+            mode=mode,
+            progress_callback=progress_callback,
+        )
+
+        # Audit log entry
+        self._audit_repo.append(
+            "restore.vhdx",
+            details={
+                "source": source_backup_path,
+                "target": res.get("target_file", target_dest_path),
+                "mode": mode,
+                "status": res.get("status", "SUCCESS"),
+                "size_bytes": res.get("size_bytes", 0),
+                "duration_seconds": res.get("duration_seconds", 0),
+            }
+        )
+
+        return res
+
     def _enforce_retention(
         self, dest_dir: Path, stem_match: str, retention_mode: str,
         retention_value: int, retention_days: int,

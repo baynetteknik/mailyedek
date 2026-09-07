@@ -12,7 +12,7 @@ import shutil
 from pathlib import Path
 from typing import Optional, List, Dict
 
-from PySide6.QtCore import Qt, Slot, QSize, Signal
+from PySide6.QtCore import Qt, Slot, QSize, Signal, QThread
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QLabel, QFrame,
@@ -24,8 +24,64 @@ from PySide6.QtWidgets import (
 from core.settings import AppSettings, StorageLocation
 from core.mail_engine import MailEngine
 from infrastructure.network_analyzer import PortListenerThread
+from gui.dialogs.delete_confirm_dialog import DeleteConfirmDialog
 
 logger = logging.getLogger(__name__)
+
+
+class SettingsDataLoaderWorker(QThread):
+    """Background worker to query users, SMTP settings, storage stats and disk usage."""
+    data_loaded_signal = Signal(dict)
+    error_signal = Signal(str)
+
+    def __init__(self, engine: Optional[MailEngine], settings: AppSettings, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.settings = settings
+
+    def run(self):
+        try:
+            users = []
+            if self.engine:
+                users = self.engine.list_users()
+
+            smtp_cfg = {}
+            if self.engine:
+                smtp_cfg = self.engine.get_smtp_settings()
+
+            locations = [StorageLocation("Default", str(self.settings.data_path()))]
+            locations.extend(self.settings.storage_locations())
+
+            loc_status = []
+            for loc in locations:
+                exists = Path(loc.path).exists()
+                loc_status.append({"name": loc.name, "path": loc.path, "exists": exists})
+
+            # Disk info
+            disk_info = {}
+            try:
+                path = self.settings.data_path()
+                total, used, free = shutil.disk_usage(path)
+                disk_info = {
+                    "drive": str(path.drive or path.anchor),
+                    "total_gb": total / (1024 ** 3),
+                    "used_gb": used / (1024 ** 3),
+                    "free_gb": free / (1024 ** 3),
+                    "used_pct": int((used / total) * 100) if total > 0 else 0
+                }
+            except Exception as e:
+                disk_info = {"error": str(e)}
+
+            self.data_loaded_signal.emit({
+                "users": users,
+                "smtp": smtp_cfg,
+                "locations": loc_status,
+                "disk_info": disk_info
+            })
+        except Exception as e:
+            logger.exception("SettingsDataLoaderWorker error: %s", e)
+            self.error_signal.emit(str(e))
+
 
 
 class SettingsPanel(QWidget):
@@ -40,6 +96,7 @@ class SettingsPanel(QWidget):
         self.settings = settings
         self.engine = engine
         self._listener_thread: Optional[PortListenerThread] = None
+        self._loader_worker: Optional[SettingsDataLoaderWorker] = None
         self._git_done_signal.connect(self._on_git_done)
         self._setup_done_signal.connect(self._on_setup_done)
         self._setup_ui()
@@ -528,7 +585,17 @@ class SettingsPanel(QWidget):
                     self.txt_storage_log.append(f"Yeni depolama konumu eklendi: {name} -> {folder}")
 
     def _remove_storage_location(self, name: str):
-        if QMessageBox.question(self, "Silmeyi Onayla", f"'{name}' depolama konumunu listeden kaldırmak istiyor musunuz?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+        locs = self.settings.storage_locations()
+        matched = [l for l in locs if l.name == name]
+        path_info = matched[0].path if matched else name
+        confirmed = DeleteConfirmDialog.confirm_deletion(
+            parent=self,
+            item_name=name,
+            item_type="Depolama Konumu",
+            details=f"Konum Adı: {name}\nKlasör Yolu: {path_info}\nBu konum depolama konumları listesinden kaldırılacaktır.",
+            warning_text="Yalnızca liste kaydı silinir. Fiziksel diskteki arşiv verileri korunur."
+        )
+        if confirmed:
             self.settings.remove_storage_location(name)
             self._refresh_locations_table()
             if hasattr(self, "txt_storage_log"):
@@ -820,7 +887,15 @@ class SettingsPanel(QWidget):
     def _delete_git_remote(self):
         import subprocess
         from core.version import REPO_ROOT
-        if QMessageBox.question(self, "Silmeyi Onayla", "Git 'origin' remote bağlantısını kaldırmak istiyor musunuz?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+        remote_url = self.input_git_remote.text().strip()
+        confirmed = DeleteConfirmDialog.confirm_deletion(
+            parent=self,
+            item_name="origin (Git Remote)",
+            item_type="Git Remote Bağlantısı",
+            details=f"Uzak Sunucu URL: {remote_url or 'Tanımlı değil'}\nGit 'origin' remote bağlantısı yerel depodan kaldırılacaktır.",
+            warning_text="Bu işlem yalnızca uzak sunucu bağlantı adresini kaldırır, yerel commit geçmişini silmez."
+        )
+        if confirmed:
             try:
                 subprocess.run(["git", "remote", "remove", "origin"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=5)
                 self.input_git_remote.clear()
@@ -1247,8 +1322,14 @@ class SettingsPanel(QWidget):
                 QMessageBox.warning(self, "Hata", msg)
 
     def _delete_user_clicked(self, user_id: int, username: str):
-        reply = QMessageBox.question(self, "Kullanıcı Sil", f"'{username}' kullanıcısını silmek istediğinize emin misiniz?", QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
+        confirmed = DeleteConfirmDialog.confirm_deletion(
+            parent=self,
+            item_name=username,
+            item_type="Kullanıcı Hesabı",
+            details=f"Kullanıcı ID: {user_id}\nKullanıcı Adı: {username}\nBu kullanıcı hesabı ve atanmış tüm yetkileri kalıcı olarak silinecektir.",
+            warning_text="Bu işlem geri alınamaz! Kullanıcı sisteme tekrar giriş yapamayacaktır."
+        )
+        if confirmed:
             ok, msg = self.engine.delete_user(user_id)
             if ok:
                 self._refresh_users()
@@ -1411,10 +1492,132 @@ class SettingsPanel(QWidget):
             self.btn_test_smtp.setText("📨 Test E-Postası Gönder")
 
     def refresh(self):
-        """Refresh users, SMTP config, and storage stats."""
-        self._refresh_users()
-        self._load_smtp_settings()
-        self._update_disk_space_info()
+        """Refresh users, SMTP config, and storage stats asynchronously."""
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+            parent_mw.notify_disk_reading("💾 Disk Okunuyor", "Kullanıcılar, SMTP ve disk durumu taranıyor...")
+
+        if self._loader_worker and self._loader_worker.isRunning():
+            self._loader_worker.quit()
+            self._loader_worker.wait()
+
+        self._loader_worker = SettingsDataLoaderWorker(self.engine, self.settings, parent=self)
+        self._loader_worker.data_loaded_signal.connect(self._on_settings_data_loaded)
+        self._loader_worker.error_signal.connect(self._on_settings_data_error)
+        self._loader_worker.start()
+
+    @Slot(dict)
+    def _on_settings_data_loaded(self, data: dict):
+        users = data.get("users", [])
+        if hasattr(self, "table_users"):
+            self.table_users.setRowCount(len(users))
+            for i, u in enumerate(users):
+                self.table_users.setItem(i, 0, QTableWidgetItem(str(u.get("id", ""))))
+                self.table_users.setItem(i, 1, QTableWidgetItem(u.get("username", "")))
+                self.table_users.setItem(i, 2, QTableWidgetItem(u.get("full_name", "") or "-"))
+
+                role = u.get("role", "OPERATOR")
+                role_item = QTableWidgetItem(role)
+                if role == "ADMIN":
+                    role_item.setForeground(QColor("#7c3aed"))
+                    role_item.setFont(QFont("", -1, QFont.Bold))
+                elif role == "OPERATOR":
+                    role_item.setForeground(QColor("#0284c7"))
+                else:
+                    role_item.setForeground(QColor("#64748b"))
+                self.table_users.setItem(i, 3, role_item)
+
+                self.table_users.setItem(i, 4, QTableWidgetItem(u.get("email", "") or "-"))
+                self.table_users.setItem(i, 5, QTableWidgetItem(u.get("last_login_at", "")[:19] or "Hiç giriş yapmadı"))
+
+                act_w = QWidget()
+                act_l = QHBoxLayout(act_w)
+                act_l.setContentsMargins(2, 2, 2, 2)
+                act_l.setSpacing(4)
+
+                btn_pass = QPushButton("🔑 Şifre")
+                btn_pass.setStyleSheet("background-color: #f59e0b; color: white; padding: 2px 6px; font-size: 11px;")
+                uid = u.get("id")
+                uname = u.get("username")
+                btn_pass.clicked.connect(lambda _, uid=uid, uname=uname: self._change_user_password(uid, uname))
+                act_l.addWidget(btn_pass)
+
+                if uname != "admin":
+                    btn_del = QPushButton("🗑 Sil")
+                    btn_del.setStyleSheet("background-color: #ef4444; color: white; padding: 2px 6px; font-size: 11px;")
+                    btn_del.clicked.connect(lambda _, uid=uid, uname=uname: self._delete_user_clicked(uid, uname))
+                    act_l.addWidget(btn_del)
+
+                self.table_users.setCellWidget(i, 6, act_w)
+
+        # SMTP config
+        cfg = data.get("smtp", {})
+        if cfg and hasattr(self, "chk_smtp_enabled"):
+            self.chk_smtp_enabled.setChecked(cfg.get("enabled", False))
+            self.txt_smtp_host.setText(cfg.get("host", ""))
+            self.spin_smtp_port.setValue(cfg.get("port", 587))
+            self.chk_smtp_tls.setChecked(cfg.get("use_tls", True))
+            self.txt_smtp_user.setText(cfg.get("username", ""))
+            self.txt_smtp_pass.setText(cfg.get("password", ""))
+            self.txt_smtp_from.setText(cfg.get("from_address", ""))
+            to_list = cfg.get("to_addresses", [])
+            self.txt_smtp_to.setText(", ".join(to_list) if isinstance(to_list, list) else str(to_list))
+            self.chk_notify_success.setChecked(cfg.get("notify_on_success", True))
+            self.chk_notify_failure.setChecked(cfg.get("notify_on_failure", True))
+
+        # Locations
+        loc_status = data.get("locations", [])
+        if hasattr(self, "tbl_locations"):
+            self.tbl_locations.setRowCount(0)
+            for idx, loc in enumerate(loc_status):
+                self.tbl_locations.insertRow(idx)
+                self.tbl_locations.setItem(idx, 0, QTableWidgetItem(loc["name"]))
+                self.tbl_locations.setItem(idx, 1, QTableWidgetItem(loc["path"]))
+
+                exists = loc["exists"]
+                st_item = QTableWidgetItem("🟢 Erişilebilir" if exists else "🔴 Bulunamadı")
+                st_item.setForeground(QColor("#10b981") if exists else QColor("#ef4444"))
+                st_item.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                self.tbl_locations.setItem(idx, 2, st_item)
+
+                if loc["name"] == "Default":
+                    lbl_def = QLabel("— Varsayılan —")
+                    lbl_def.setAlignment(Qt.AlignCenter)
+                    lbl_def.setStyleSheet("color: #64748b; font-size: 10px;")
+                    self.tbl_locations.setCellWidget(idx, 3, lbl_def)
+                else:
+                    btn_del = QPushButton("Sil")
+                    btn_del.setStyleSheet("background: #ef4444; color: white; font-weight: bold; padding: 2px 8px; font-size: 10px; border-radius: 3px;")
+                    btn_del.clicked.connect(lambda _, name=loc["name"]: self._remove_storage_location(name))
+                    self.tbl_locations.setCellWidget(idx, 3, btn_del)
+
+        # Disk info
+        disk_info = data.get("disk_info", {})
+        if "error" not in disk_info and "total_gb" in disk_info:
+            drive = disk_info.get("drive", "")
+            total_gb = disk_info.get("total_gb", 0)
+            used_gb = disk_info.get("used_gb", 0)
+            free_gb = disk_info.get("free_gb", 0)
+            used_pct = disk_info.get("used_pct", 0)
+
+            if hasattr(self, "lbl_disk_info"):
+                self.lbl_disk_info.setText(
+                    f"Sürücü: {drive}  |  Toplam: {total_gb:.1f} GB  |  "
+                    f"Kullanılan: {used_gb:.1f} GB ({used_pct}%)  |  Boş Alan: {free_gb:.1f} GB"
+                )
+            if hasattr(self, "progress_disk"):
+                self.progress_disk.setValue(used_pct)
+
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+            parent_mw.notify_disk_ready("Sistem ayarları ve kullanıcılar yüklendi.")
+
+    @Slot(str)
+    def _on_settings_data_error(self, err_msg: str):
+        parent_mw = self.window()
+        if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+            parent_mw.notify_disk_ready("Ayarlar yüklenemedi.")
+        logger.error("SettingsPanel data loading error: %s", err_msg)
 
     def apply_permissions(self, role: str):
         """Restrict RBAC tab and settings depending on role."""

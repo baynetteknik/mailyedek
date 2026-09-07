@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
     QGroupBox, QMessageBox, QListWidget, QListWidgetItem,
     QAbstractItemView, QFrame, QTableView, QComboBox, QLineEdit,
     QDialog, QDialogButtonBox, QCheckBox, QDateEdit, QTextEdit,
-    QSpinBox, QMenu, QScrollArea, QApplication, QInputDialog
+    QSpinBox, QMenu, QScrollArea, QApplication, QInputDialog,
+    QRadioButton
 )
 
 from core.mail_engine import MailEngine
@@ -248,6 +249,175 @@ class SyncDataLoaderWorker(QThread):
             logger.debug("SyncDataLoaderWorker DB read exception: %s", e)
         finally:
             self.finished_signal.emit(results)
+
+
+# ---------------------------------------------------------------------------
+# Multi-Server Selection Dialog for Sync
+# ---------------------------------------------------------------------------
+
+class SelectSyncServerDialog(QDialog):
+    """Modal dialog prompting the user to choose which server profile to synchronize from."""
+    def __init__(self, account: Dict[str, Any], profiles: List[Dict[str, Any]], parent=None):
+        super().__init__(parent)
+        self.account = account
+        self.profiles = profiles
+        self.selected_profile_id: Optional[int] = None
+        self.make_default: bool = False
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self.setWindowTitle("Sunucu Seçimi — Çoklu Sunucu Profili")
+        self.resize(580, 360)
+        self.setMinimumWidth(520)
+        self.setModal(True)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8fafc;
+            }
+            QLabel {
+                color: #0f172a;
+            }
+            QGroupBox {
+                font-weight: 600;
+                color: #1e293b;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 16px;
+                background-color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #2563eb;
+            }
+            QRadioButton {
+                font-size: 12.5px;
+                font-weight: 500;
+                color: #1e293b;
+                padding: 8px 10px;
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 6px;
+            }
+            QRadioButton:hover {
+                background-color: #f1f5f9;
+                border-color: #93c5fd;
+            }
+            QRadioButton:checked {
+                background-color: #eff6ff;
+                border-color: #3b82f6;
+                font-weight: bold;
+                color: #1d4ed8;
+            }
+            QPushButton {
+                background-color: #2563eb;
+                color: #ffffff;
+                font-weight: 700;
+                font-size: 13px;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 20px;
+                min-width: 100px;
+                min-height: 32px;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+            QPushButton#btn_cancel {
+                background-color: #64748b;
+            }
+            QPushButton#btn_cancel:hover {
+                background-color: #475569;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        # Header Info
+        header_layout = QHBoxLayout()
+        icon_lbl = QLabel("🌐")
+        icon_lbl.setStyleSheet("font-size: 32px; padding-right: 4px;")
+        header_layout.addWidget(icon_lbl)
+
+        acc_label = self.account.get("label", "Hesap")
+        acc_email = self.account.get("email", "")
+        title_lbl = QLabel(
+            f"<b>{acc_label}</b> ({acc_email})<br>"
+            "<span style='color: #64748b; font-size: 12px; font-weight: normal;'>"
+            "Bu hesaba ait birden fazla sunucu profili bulunmaktadır. Hangi sunucudan senkronize olmak istiyorsunuz?</span>"
+        )
+        title_lbl.setStyleSheet("font-size: 13.5px; color: #0f172a;")
+        title_lbl.setWordWrap(True)
+        header_layout.addWidget(title_lbl, stretch=1)
+        layout.addLayout(header_layout)
+
+        # Profiles group
+        group = QGroupBox("Kullanılabilir Sunucu Profilleri")
+        group_layout = QVBoxLayout(group)
+        group_layout.setContentsMargins(12, 14, 12, 12)
+        group_layout.setSpacing(8)
+
+        self.radio_buttons = []
+        for i, p in enumerate(self.profiles):
+            is_default = bool(p.get("is_default"))
+            host = p.get("imap_host", "")
+            port = p.get("imap_port", 993)
+            ssl_str = "SSL/TLS" if p.get("use_ssl") else "Plain"
+            prof_name = p.get("profile_name", f"Sunucu #{p.get('id')}")
+
+            def_badge = " [★ Varsayılan / Aktif]" if is_default else ""
+            radio = QRadioButton()
+            radio.setText(f"{prof_name} ({host}:{port} — {ssl_str}){def_badge}")
+            radio.setProperty("profile_id", p.get("id"))
+
+            # Default selection
+            if is_default or (self.selected_profile_id is None and i == 0):
+                radio.setChecked(True)
+                self.selected_profile_id = p.get("id")
+
+            radio.toggled.connect(self._on_radio_toggled)
+            group_layout.addWidget(radio)
+            self.radio_buttons.append(radio)
+
+        layout.addWidget(group)
+
+        # Make default checkbox
+        self.chk_make_default = QCheckBox("⭐ Seçilen sunucuyu bu hesap için varsayılan (aktif) sunucu yap")
+        self.chk_make_default.setStyleSheet("font-size: 12px; font-weight: 600; color: #1e293b; margin-top: 4px;")
+        layout.addWidget(self.chk_make_default)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        self.btn_cancel = QPushButton("İptal")
+        self.btn_cancel.setObjectName("btn_cancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(self.btn_cancel)
+
+        self.btn_ok = QPushButton("⚡ Bu Sunucudan Senkronize Et")
+        self.btn_ok.clicked.connect(self._on_accept)
+        btn_layout.addWidget(self.btn_ok)
+
+        layout.addLayout(btn_layout)
+
+    def _on_radio_toggled(self, checked: bool):
+        if checked:
+            radio = self.sender()
+            if radio:
+                self.selected_profile_id = radio.property("profile_id")
+
+    def _on_accept(self):
+        for r in self.radio_buttons:
+            if r.isChecked():
+                self.selected_profile_id = r.property("profile_id")
+                break
+        self.make_default = self.chk_make_default.isChecked()
+        self.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -2998,7 +3168,32 @@ class SyncPanel(QWidget):
     # Sync Operations
     # ------------------------------------------------------------------
 
+    def _prompt_server_profile_if_needed(self, account_id: int) -> bool:
+        """If account has multiple server profiles, prompt user to select which one to sync from."""
+        try:
+            profiles = self.engine.db.get_server_profiles(account_id)
+        except Exception:
+            profiles = []
+
+        if len(profiles) > 1:
+            acc = self.engine.accounts.get(account_id) or {"id": account_id, "label": f"Hesap #{account_id}"}
+            dialog = SelectSyncServerDialog(account=acc, profiles=profiles, parent=self)
+            if dialog.exec() == QDialog.Accepted and dialog.selected_profile_id:
+                try:
+                    self.engine.set_default_server_profile(account_id, dialog.selected_profile_id)
+                    updated_acc = self.engine.db.get_account(account_id)
+                    if updated_acc:
+                        self.engine.accounts[account_id] = updated_acc
+                except Exception as e:
+                    logger.warning("Failed to set default server profile before sync: %s", e)
+                return True
+            else:
+                return False
+        return True
+
     def _trigger_individual_sync_direct(self, acc_id: int):
+        if not self._prompt_server_profile_if_needed(acc_id):
+            return
         self._start_individual_sync(acc_id)
 
     def _trigger_sync_for_accounts(self, ids: list):
@@ -3016,11 +3211,19 @@ class SyncPanel(QWidget):
             msg.exec()
             return
 
-        if not self._confirm_sync(ids):
+        valid_ids = []
+        for acc_id in ids:
+            if self._prompt_server_profile_if_needed(acc_id):
+                valid_ids.append(acc_id)
+
+        if not valid_ids:
+            return
+
+        if not self._confirm_sync(valid_ids):
             return
 
         self._reports.clear()
-        for acc_id in ids:
+        for acc_id in valid_ids:
             self._start_individual_sync(acc_id)
 
     @Slot()
@@ -3240,17 +3443,16 @@ class SyncPanel(QWidget):
                 """)
                 self.lbl_disk_status_icon.setText("🟠")
                 self.lbl_disk_status_text.setText(
-                    f"<b>⚠️ Yedekleme Diski ({disk_path_str}) Bağlı Değil — Çevrimdışı Mod</b> "
-                    f"({len(accounts)} Hesap Listelenmektedir)"
+                    f"<b>⚠️ Yedekleme Diski ({disk_path_str}) Bağlı Değil — Çevrimdışı Mod</b><br/>"
+                    f"<span style='font-size:11px; color:#92400e;'>{len(accounts)} adet hesap listelenmektedir. Hesap verilerine ve yeni senkronizasyona disk takılana kadar ulaşılamaz.</span>"
                 )
 
             if selected_group != "__ALL__":
                 filtered_accounts = []
                 for acc in accounts:
-                    g_val = acc.get("account_group", "").strip()
-                    if not g_val and "@" in acc.get("email", ""):
-                        g_val = acc["email"].split("@")[-1]
-                    if g_val == selected_group:
+                    email = acc.get("email", "").strip()
+                    dom = email.split("@")[-1].strip().lower() if "@" in email else (acc.get("account_group", "").strip() or "Diğer")
+                    if dom == selected_group.lower():
                         filtered_accounts.append(acc)
                 accounts = filtered_accounts
 
@@ -3272,20 +3474,36 @@ class SyncPanel(QWidget):
                 info_layout.setContentsMargins(8, 4, 8, 4)
                 info_layout.setSpacing(2)
                 
-                g_val = acc.get("account_group", "").strip()
-                if not g_val and "@" in acc.get("email", ""):
-                    g_val = acc["email"].split("@")[-1]
-                
-                group_badge = f"<span style='background-color:#e0e7ff; color:#2563eb; font-weight:bold; font-size:10px; padding:1px 5px; border-radius:4px;'>📁 {g_val}</span>" if g_val else ""
+                email = acc.get("email", "").strip()
+                dom = email.split("@")[-1].strip().lower() if "@" in email else (acc.get("account_group", "").strip() or "Diğer")
+                group_badge = f"<span style='background-color:#e0e7ff; color:#2563eb; font-weight:bold; font-size:10px; padding:1px 5px; border-radius:4px;'>🌐 {dom}</span>" if dom else ""
+
+                host = acc.get("imap_host", "")
+                port = acc.get("imap_port", 993)
+                try:
+                    p_list = self.engine.db.get_server_profiles(acc_id)
+                except Exception:
+                    p_list = []
+
+                if len(p_list) > 1:
+                    active_p = next((p for p in p_list if p.get("is_default")), None)
+                    p_name = active_p.get("profile_name", host) if active_p else host
+                    server_badge = f"<span style='background-color:#dcfce7; color:#15803d; font-weight:bold; font-size:10px; padding:1px 6px; border-radius:4px;'>🔌 Aktif Sunucu: {p_name} ({host}) [{len(p_list)} Sunucu Tanımlı]</span>"
+                else:
+                    server_badge = f"<span style='color:#64748b; font-size:10px;'>🖥️ {host}:{port}</span>"
 
                 lbl_label = QLabel(f"<b>{acc.get('label', 'Hesap')}</b>  {group_badge}")
                 lbl_label.setStyleSheet("color: #0f172a; font-size: 12.5px; font-weight: 700;")
                 
-                lbl_email = QLabel(f"✉️ {acc.get('email', '')}")
+                lbl_email = QLabel(f"✉️ {acc.get('email', '')} &nbsp;&nbsp; {server_badge}")
                 lbl_email.setStyleSheet("color: #334155; font-size: 11px; font-weight: 500;")
                 
-                lbl_stats = QLabel("📂 <i>İstatistikler yükleniyor...</i>")
-                lbl_stats.setStyleSheet("color: #64748b; font-size: 10.5px; font-weight: 500;")
+                if is_disk_online:
+                    lbl_stats = QLabel("📂 <i>İstatistikler yükleniyor...</i>")
+                    lbl_stats.setStyleSheet("color: #64748b; font-size: 10.5px; font-weight: 500;")
+                else:
+                    lbl_stats = QLabel("⚠️ <i>Yedekleme diski bekleniyor (Arşiv verileri çevrimdışı)</i>")
+                    lbl_stats.setStyleSheet("color: #d97706; font-size: 10.5px; font-weight: 500;")
                 self._stats_labels_map[acc_id] = lbl_stats
                 
                 info_layout.addWidget(lbl_label)
@@ -3382,6 +3600,9 @@ class SyncPanel(QWidget):
                 acc_ids = [a["id"] for a in accounts if "id" in a]
                 if self._data_loader and self._data_loader.isRunning():
                     self._data_loader.terminate()
+                parent_mw = self.parent() if hasattr(self, "parent") else None
+                if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+                    parent_mw.notify_disk_reading("💾 Disk Okunuyor", "Senkronizasyon veritabanı ve klasör istatistikleri diskten taranıyor...")
                 self._data_loader = SyncDataLoaderWorker(self.engine, acc_ids, parent=self)
                 self._data_loader.account_loaded_signal.connect(self._on_account_stat_loaded)
                 self._data_loader.finished_signal.connect(self._on_all_stats_loaded)
@@ -3410,23 +3631,27 @@ class SyncPanel(QWidget):
             f"({total_accounts} Hesap, Toplam {total_mails:,} E-Posta Arşivli)"
         )
         self.card_server.set_value(f"{total_mails:,} Mail")
+        parent_mw = self.parent() if hasattr(self, "parent") else None
+        if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+            parent_mw.notify_disk_ready("✅ Senkronizasyon Hazır", f"Toplam {total_mails:,} e-posta arşivi doğrulandı.", auto_dismiss_seconds=3)
 
     # ------------------------------------------------------------------
     # Group Sidebar Integration
     # ------------------------------------------------------------------
 
     def _refresh_groups_sidebar(self):
-        groups_status = {}
+        domains_status = {}
         all_accounts = self.settings.load_account_cache() or self.engine.list_accounts()
         for acc in all_accounts:
-            g_name = acc.get("account_group", "").strip()
-            if not g_name and "@" in acc.get("email", ""):
-                g_name = acc["email"].split("@")[-1].strip()
-            if g_name:
-                groups_status.setdefault(g_name, {"is_active": True, "count": 0})
-                groups_status[g_name]["count"] += 1
+            email = acc.get("email", "").strip()
+            dom = email.split("@")[-1].strip().lower() if "@" in email else (acc.get("account_group", "").strip() or "Diğer")
+            if not dom:
+                dom = "Diğer"
+            domains_status.setdefault(dom, {"is_active": True, "count": 0})
+            domains_status[dom]["count"] += 1
 
-        self.left_sidebar.populate_groups(groups_status, total_accounts_count=len(all_accounts))
+        selected_domain = self.left_sidebar.get_selected_domain()
+        self.left_sidebar.populate_domains(domains_status, total_accounts_count=len(all_accounts), preserve_selection=selected_domain)
 
     @Slot(str)
     def _on_group_filter_changed(self, group_name: str):

@@ -708,6 +708,37 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.top_banner.show_error("❌ Hata", f"Disk imzalanamadı: {e}")
 
+    def notify_disk_reading(self, title_or_msg: str = "💾 Disk Okunuyor", message: Optional[str] = None, is_indeterminate: bool = True):
+        """Display non-blocking disk read progress in top banner & status bar."""
+        if message is None:
+            title = "💾 Disk Okunuyor"
+            msg = title_or_msg
+        else:
+            title = title_or_msg
+            msg = message
+        if hasattr(self, "top_banner") and self.top_banner:
+            self.top_banner.show_progress(title, msg, is_indeterminate=is_indeterminate)
+        if hasattr(self, "status") and self.status:
+            self.status.showMessage(f"{title}: {msg}")
+
+    def notify_disk_ready(self, title_or_msg: str = "✅ Hazır", message: Optional[str] = None, auto_dismiss_seconds: int = 3):
+        """Display success / ready state in top banner & status bar with auto-dismiss."""
+        if message is None:
+            title = "✅ Hazır"
+            msg = title_or_msg
+        else:
+            title = title_or_msg
+            msg = message
+        if hasattr(self, "top_banner") and self.top_banner:
+            self.top_banner.show_success(title, msg, auto_dismiss_seconds=auto_dismiss_seconds)
+        if hasattr(self, "status") and self.status:
+            self.status.showMessage(f"{title}: {msg}", auto_dismiss_seconds * 1000)
+
+    def dismiss_disk_notification(self):
+        """Dismiss disk reading notification banner."""
+        if hasattr(self, "top_banner") and self.top_banner:
+            self.top_banner.dismiss()
+
     def _prompt_change_data_path(self):
         """Prompt the user to select a new data directory."""
         folder = QFileDialog.getExistingDirectory(
@@ -718,7 +749,7 @@ class MainWindow(QMainWindow):
 
     def _register_panels(self):
         self._panel_defs = {
-            "mail": (MailViewerPanel, {}),
+            "mail": (MailViewerPanel, {"settings": self.settings}),
             "accounts": (AccountPanel, {"settings": self.settings}),
             "sync": (SyncPanel, {"settings": self.settings}),
             "export": (ExportPanel, {}),

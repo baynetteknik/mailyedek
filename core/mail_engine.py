@@ -50,11 +50,14 @@ class MailEngine:
 
     def __init__(self, db_path: Optional[Path] = None,
                  key_file: Optional[Path] = None,
-                 use_keyring: bool = False):
+                 use_keyring: bool = False,
+                 settings: Optional[Any] = None):
         # Core infrastructure
         from core.reporter import ReportGenerator
-        self.crypto = CryptoManager(key_file=key_file, use_keyring=use_keyring)
-        self.db = DatabaseManager(db_path=db_path)
+        from core.settings import AppSettings
+        self.settings = settings or AppSettings()
+        self.crypto = CryptoManager(key_file=key_file or self.settings.key_file_path(), use_keyring=use_keyring)
+        self.db = DatabaseManager(db_path=db_path or self.settings.db_path())
         self.event_bus = get_event_bus()
         self.reporter = ReportGenerator()
         self.auth = AuthManager.get_instance(self.db)
@@ -162,18 +165,31 @@ class MailEngine:
         return account_id
 
     def list_accounts(self) -> List[Dict]:
-        """Return all accounts with masked credentials."""
-        accounts = self.accounts.get_all()
+        """Return all accounts with masked credentials, falling back to cache when offline."""
+        try:
+            accounts = self.accounts.get_all()
+        except Exception as e:
+            logger.debug("Error retrieving accounts from DB repo: %s", e)
+            accounts = []
+
+        if not accounts and hasattr(self, "settings") and self.settings:
+            accounts = self.settings.load_account_cache()
+        elif accounts and hasattr(self, "settings") and self.settings:
+            try:
+                self.settings.save_account_cache(accounts)
+            except Exception:
+                pass
+
         for acc in accounts:
             try:
                 if "username_enc" in acc and acc["username_enc"]:
                     acc["username"] = self.crypto.decrypt(acc["username_enc"])
-                del acc["username_enc"]
+                acc.pop("username_enc", None)
             except Exception:
                 acc["username"] = "(decryption error)"
                 acc.pop("username_enc", None)
             if "password_enc" in acc:
-                del acc["password_enc"]
+                acc.pop("password_enc", None)
         return accounts
 
     def update_account(self, account_id: int, **kwargs) -> None:
@@ -265,6 +281,61 @@ class MailEngine:
                 p["username"] = "(decryption error)"
             p.pop("password_enc", None)
         return profiles
+
+    def get_server_profile(self, account_id: int, profile_id: int) -> Optional[Dict[str, Any]]:
+        """Return a single server profile with decrypted username and password."""
+        raw_profiles = self.db.get_server_profiles(account_id)
+        prof = next((p for p in raw_profiles if p["id"] == profile_id), None)
+        if not prof:
+            return None
+        res = dict(prof)
+        try:
+            if "username_enc" in res and res["username_enc"]:
+                res["username"] = self.crypto.decrypt(res["username_enc"])
+        except Exception:
+            res["username"] = ""
+        try:
+            if "password_enc" in res and res["password_enc"]:
+                res["password"] = self.crypto.decrypt(res["password_enc"])
+        except Exception:
+            res["password"] = ""
+        return res
+
+    def test_server_profile_connection(self, account_id: int, profile_id: int) -> Tuple[bool, str]:
+        """Test IMAP connection for a specific server profile and return success flag + detail message."""
+        prof = self.get_server_profile(account_id, profile_id)
+        if not prof:
+            return False, "Sunucu profili bulunamadı."
+        host = prof.get("imap_host", "").strip()
+        port = prof.get("imap_port", 993)
+        use_ssl = bool(prof.get("use_ssl", True))
+        username = prof.get("username", "").strip()
+        password = prof.get("password", "")
+
+        if not host:
+            return False, "IMAP sunucu adresi (Host) boş olamaz."
+        if not username:
+            return False, "Kullanıcı adı boş veya çözülemedi."
+        if not password:
+            return False, "Parola boş veya çözülemedi."
+
+        from infrastructure.imap_client import ImapClient
+        client = ImapClient()
+        try:
+            ok, detail = client.connect_with_details(host, port, use_ssl, username, password, timeout=10)
+            if ok:
+                folders = []
+                try:
+                    folders = client.list_folders()
+                except Exception:
+                    pass
+                client.disconnect()
+                f_count = len(folders)
+                return True, f"Bağlantı Başarılı ({host}:{port}) — {f_count} klasör bulundu."
+            else:
+                return False, f"Bağlantı Başarısız ({host}:{port}) — {detail}"
+        except Exception as e:
+            return False, f"Bağlantı Hatası ({host}:{port}): {str(e)}"
 
     def set_default_server_profile(self, account_id: int, profile_id: int) -> None:
         """Set the active default server profile for an account."""
@@ -464,6 +535,21 @@ class MailEngine:
     ) -> Dict[str, Any]:
         report = self.vhdx_backup_usecase.execute_backup(job_params, progress_callback=progress_callback)
         return report.__dict__
+
+    def restore_vhdx_backup(
+        self,
+        source_backup_path: str,
+        target_dest_path: str,
+        mode: str = "custom",
+        progress_callback: Optional[Callable[[str, float, float], None]] = None
+    ) -> Dict[str, Any]:
+        """Restore a VHDX / Hyper-V backup with on-the-fly streaming decompression."""
+        return self.vhdx_backup_usecase.restore_backup(
+            source_backup_path=source_backup_path,
+            target_dest_path=target_dest_path,
+            mode=mode,
+            progress_callback=progress_callback
+        )
 
     # ------------------------------------------------------------------
     # Unified Backup History

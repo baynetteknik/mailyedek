@@ -90,6 +90,216 @@ class RestoreDataLoaderWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# VHDX Restore Background Worker & Interactive Dialog
+# ---------------------------------------------------------------------------
+
+class VhdxRestoreWorker(QThread):
+    progress_signal = Signal(str, float, float)
+    finished_signal = Signal(dict)
+    error_signal = Signal(str)
+
+    def __init__(self, engine: MailEngine, source_path: str, dest_path: str, mode: str, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.source_path = source_path
+        self.dest_path = dest_path
+        self.mode = mode
+
+    def run(self):
+        try:
+            def cb(msg, pct, speed):
+                self.progress_signal.emit(msg, pct, speed)
+            res = self.engine.restore_vhdx_backup(
+                source_backup_path=self.source_path,
+                target_dest_path=self.dest_path,
+                mode=self.mode,
+                progress_callback=cb
+            )
+            self.finished_signal.emit(res)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+class VhdxRestoreDialog(QDialog):
+    """Interactive Dialog for Restoring VHDX Disks with 3 Options and on-the-fly decompression."""
+    def __init__(self, source_path: str, engine: MailEngine, parent=None):
+        super().__init__(parent)
+        self.source_path = str(source_path)
+        self.engine = engine
+        self.worker: Optional[VhdxRestoreWorker] = None
+
+        self.setWindowTitle("💾 VHDX / Hyper-V Geri Yükleme Sihirbazı")
+        self.setMinimumWidth(560)
+        self.setStyleSheet("""
+            QDialog { background-color: #ffffff; color: #0f172a; }
+            QLabel { color: #0f172a; font-size: 12px; }
+            QRadioButton { color: #1e293b; font-weight: 600; font-size: 11.5px; spacing: 8px; }
+            QLineEdit { border: 1px solid #cbd5e1; border-radius: 5px; padding: 5px 8px; font-size: 11px; background: #f8fafc; color: #0f172a; }
+            QPushButton { background-color: #2563eb; color: #ffffff; font-weight: bold; border-radius: 6px; padding: 6px 14px; font-size: 11px; border: none; }
+            QPushButton:hover { background-color: #1d4ed8; }
+            QPushButton:disabled { background-color: #cbd5e1; color: #94a3b8; }
+        """)
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Header Info Card
+        src_name = Path(self.source_path).name
+        is_compressed = src_name.lower().endswith((".gz", ".zip"))
+        comp_info = "⚡ Sıkıştırılmış İmaj — Geri yükleme sırasında otomatik olarak saf .VHDX formatına açılacaktır." if is_compressed else "Saf VHDX Disk İmajı"
+
+        info_box = QFrame()
+        info_box.setStyleSheet("""
+            QFrame {
+                background-color: #eff6ff;
+                border: 1px solid #bfdbfe;
+                border-radius: 8px;
+                padding: 10px;
+            }
+        """)
+        info_layout = QVBoxLayout(info_box)
+        info_layout.setSpacing(4)
+        info_layout.addWidget(QLabel(f"<b>Kaynak Dosya:</b> {src_name}"))
+        info_layout.addWidget(QLabel(f"<span style='color:#1d4ed8; font-size:11px;'>{comp_info}</span>"))
+        layout.addWidget(info_box)
+
+        # Mode Selection
+        layout.addWidget(QLabel("<b>Geri Yükleme Davranışı ve Hedef Seçimi:</b>"))
+
+        self.btn_group = QButtonGroup(self)
+
+        # Option 1: Custom Folder (Recommended)
+        self.radio_custom = QRadioButton("📂 Farklı Bir Klasöre / Sürücüye Çıkart (Önerilen)")
+        self.radio_custom.setChecked(True)
+        self.btn_group.addButton(self.radio_custom, 1)
+        layout.addWidget(self.radio_custom)
+
+        custom_row = QHBoxLayout()
+        self.txt_dest_path = QLineEdit()
+        default_extract_dir = str(Path("data/restored_disks").resolve())
+        self.txt_dest_path.setText(default_extract_dir)
+        self.btn_browse = QPushButton("📁 Gözat...")
+        self.btn_browse.setStyleSheet("background-color: #475569; color: white; padding: 4px 10px;")
+        self.btn_browse.clicked.connect(self._on_browse_dest)
+        custom_row.addWidget(self.txt_dest_path, stretch=1)
+        custom_row.addWidget(self.btn_browse)
+        layout.addLayout(custom_row)
+
+        # Option 2: Original Location
+        self.radio_original = QRadioButton("🔄 Orijinal Konuma Geri Yükle (Mevcut Dosyanın Üzerine Yaz)")
+        self.btn_group.addButton(self.radio_original, 2)
+        layout.addWidget(self.radio_original)
+
+        # Option 3: Hyper-V Import
+        self.radio_hyperv = QRadioButton("⚡ Hyper-V Sanal Makinesi Olarak İçe Aktar (Import-VM)")
+        self.btn_group.addButton(self.radio_hyperv, 3)
+        layout.addWidget(self.radio_hyperv)
+
+        # Progress bar
+        self.pbar = QProgressBar()
+        self.pbar.setRange(0, 100)
+        self.pbar.setValue(0)
+        self.pbar.setTextVisible(True)
+        self.pbar.setFixedHeight(18)
+        self.pbar.setStyleSheet("""
+            QProgressBar {
+                background: #f1f5f9;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                text-align: center;
+                font-size: 10px;
+                font-weight: bold;
+                color: #1e293b;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 0, stop: 0 #2563eb, stop: 1 #10b981);
+                border-radius: 5px;
+            }
+        """)
+        layout.addWidget(self.pbar)
+
+        self.lbl_status = QLabel("Geri yüklemeyi başlatmak için aşağıdaki butona tıklayın.")
+        self.lbl_status.setStyleSheet("color: #64748b; font-size: 11px;")
+        layout.addWidget(self.lbl_status)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.btn_start = QPushButton("📥 Geri Yüklemeyi Başlat")
+        self.btn_start.clicked.connect(self._start_restore)
+        self.btn_cancel = QPushButton("Kapat")
+        self.btn_cancel.setStyleSheet("background-color: #f1f5f9; color: #475569; border: 1px solid #cbd5e1;")
+        self.btn_cancel.clicked.connect(self.reject)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.btn_cancel)
+        btn_layout.addWidget(self.btn_start)
+        layout.addLayout(btn_layout)
+
+    def _on_browse_dest(self):
+        folder = QFileDialog.getExistingDirectory(self, "Geri Yükleme Hedef Klasörünü Seç", self.txt_dest_path.text())
+        if folder:
+            self.txt_dest_path.setText(folder)
+
+    def _start_restore(self):
+        if self.radio_custom.isChecked():
+            dest = self.txt_dest_path.text().strip()
+            if not dest:
+                QMessageBox.warning(self, "Uyarı", "Lütfen bir hedef klasör belirtin.")
+                return
+            mode = "custom"
+        elif self.radio_original.isChecked():
+            dest = str(Path(self.source_path).parent)
+            mode = "original"
+        else:
+            dest = self.txt_dest_path.text().strip()
+            mode = "import_vm"
+
+        self.btn_start.setEnabled(False)
+        self.btn_browse.setEnabled(False)
+        self.txt_dest_path.setEnabled(False)
+        self.lbl_status.setText("İşlem başlatılıyor...")
+
+        self.worker = VhdxRestoreWorker(self.engine, self.source_path, dest, mode, self)
+        self.worker.progress_signal.connect(self._on_progress)
+        self.worker.finished_signal.connect(self._on_finished)
+        self.worker.error_signal.connect(self._on_error)
+        self.worker.start()
+
+    def _on_progress(self, msg: str, pct: float, speed: float):
+        self.pbar.setValue(int(pct))
+        self.lbl_status.setText(msg)
+
+    def _on_finished(self, res: dict):
+        self.pbar.setValue(100)
+        target = res.get("target_file", "")
+        self.lbl_status.setText(f"✅ Geri yükleme başarıyla tamamlandı: {target}")
+        self.btn_start.setText("✅ Tamamlandı")
+        
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Geri Yükleme Başarılı")
+        msg.setText(f"VHDX disk imajı başarıyla geri yüklendi:\n\n{target}")
+        msg.setStyleSheet(GLOBAL_MSG_STYLE)
+        msg.exec()
+
+    def _on_error(self, err: str):
+        self.btn_start.setEnabled(True)
+        self.btn_browse.setEnabled(True)
+        self.txt_dest_path.setEnabled(True)
+        self.lbl_status.setText(f"❌ Hata: {err}")
+        
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Critical)
+        msg.setWindowTitle("Geri Yükleme Hatası")
+        msg.setText(f"VHDX geri yüklenirken bir hata oluştu:\n\n{err}")
+        msg.setStyleSheet(GLOBAL_MSG_STYLE)
+        msg.exec()
+
+
+# ---------------------------------------------------------------------------
 # Main Restore Center Widget
 # ---------------------------------------------------------------------------
 
@@ -419,6 +629,9 @@ class RestorePanel(QWidget):
         if hasattr(self, "loader") and self.loader is not None and self.loader.isRunning():
             return  # Already running in background, do not overwrite active QThread!
         self._is_refreshing = True
+        parent_mw = self.parent() if hasattr(self, "parent") else None
+        if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+            parent_mw.notify_disk_reading("💾 Disk Okunuyor", "Yerel ve bulut yedek arşivleri diskten taranıyor...")
         self.loader = RestoreDataLoaderWorker(self.engine, parent=self)
         self.loader.data_loaded.connect(self._on_data_loaded)
         self.loader.start()
@@ -426,6 +639,9 @@ class RestorePanel(QWidget):
     @Slot(object)
     def _on_data_loaded(self, data: Dict[str, Any]):
         self._is_refreshing = False
+        parent_mw = self.parent() if hasattr(self, "parent") else None
+        if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+            parent_mw.notify_disk_ready("✅ Geri Yükleme Kaynakları Hazır", "Yedek arşiv listesi güncellendi.", auto_dismiss_seconds=3)
         local_backups = data.get("local_backups", [])
         cloud_accs = data.get("cloud_accounts", [])
 
@@ -763,6 +979,12 @@ class RestorePanel(QWidget):
                     self._append_log(f"❌ Drive Geri Yükleme Hatası: {e}")
 
             threading.Thread(target=task, daemon=True).start()
+
+        elif t == "vhdx":
+            source_file = item.get("path") or item.get("target") or item.get("name")
+            dlg = VhdxRestoreDialog(source_file, self.engine, self)
+            dlg.exec()
+            self._update_kpi_card(self.card_last_restore, datetime.now().strftime("%H:%M:%S"), "Tamamlandı")
 
         else:
             self._append_log(f"ℹ️ Yerel dosya geri yükleme simülasyonu başlatıldı: {item['name']}")

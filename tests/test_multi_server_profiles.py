@@ -129,7 +129,21 @@ class TestMultiServerProfiles(unittest.TestCase):
         all_mails = self.db.get_mails_for_account(acc_id, "INBOX", limit=10)
         self.assertEqual(len(all_mails), 3)
 
-        # 7. Verify Audit Log
+        # 7. Test identical UID on both servers without conflict (e.g. UID 1001 on both Yandex and NewCompany)
+        mail_dup_uid = self.db.upsert_mail_metadata(
+            account_id=acc_id,
+            folder="INBOX",
+            uid=1001,
+            subject="New Company Mail with same UID 1001",
+            sender="colleague@newcompany.com",
+            server_host="mail.newcompany.com",
+            sha256_hash="hash_new_1001",
+            is_duplicate=0
+        )
+        self.assertIsNotNone(mail_dup_uid)
+        self.assertNotEqual(mail1_id, mail_dup_uid)
+
+        # 8. Verify Audit Log
         audit_logs = self.db.get_audit_log(limit=50)
         actions = [log["action"] for log in audit_logs]
         self.assertIn("account.server_profile_added", actions)

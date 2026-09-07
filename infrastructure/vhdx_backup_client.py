@@ -367,6 +367,189 @@ class VhdxBackupClient:
         return "OK" in output
 
     # ------------------------------------------------------------------
+    # VHDX Restore Operations
+    # ------------------------------------------------------------------
+
+    def restore_vhdx_file(
+        self,
+        source_backup_path: str,
+        target_dest_path: str,
+        mode: str = "custom",  # "original", "custom", "import_vm"
+        progress_callback: Optional[Callable[[str, float, float], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Restores a VHDX/VHD backup.
+        Automatically decompresses on-the-fly if compressed (.gz or .zip), ensuring
+        Hyper-V and target folders always receive pure uncompressed .vhdx / .vhd disks.
+        """
+        import zipfile
+        start_time = time.time()
+        source_path = Path(source_backup_path)
+
+        if not source_path.exists():
+            raise FileNotFoundError(f"Kaynak yedek dosyası bulunamadı: {source_backup_path}")
+
+        target_path = Path(target_dest_path)
+
+        # 1. Hyper-V VM Export Directory Restore
+        if source_path.is_dir():
+            if progress_callback:
+                progress_callback(f"Hyper-V Dışa Aktarılmış VM klasörü işleniyor: {source_path.name}", 0.0, 0.0)
+
+            if mode == "import_vm":
+                ps_script = f"""
+                try {{
+                    $vm = Import-VM -Path "{str(source_path.resolve())}" -Copy -GenerateNewId -ErrorAction Stop
+                    Write-Output "RESULT|SUCCESS|$($vm.Name)"
+                }} catch {{
+                    Write-Output "ERR|$($_.Exception.Message)"
+                }}
+                """
+                output = self._run_powershell(ps_script)
+                if output.startswith("RESULT|SUCCESS"):
+                    parts = output.split("|")
+                    vm_name = parts[2] if len(parts) > 2 else "Imported_VM"
+                    duration = round(time.time() - start_time, 2)
+                    return {
+                        "status": "SUCCESS",
+                        "mode": "import_vm",
+                        "target_file": str(source_path),
+                        "vm_name": vm_name,
+                        "duration_seconds": duration,
+                        "speed_mbps": 0.0
+                    }
+                else:
+                    err = output.replace("ERR|", "").strip() or "Hyper-V VM içe aktarma başarısız oldu."
+                    raise RuntimeError(err)
+            else:
+                # Copy folder to destination
+                target_path.mkdir(parents=True, exist_ok=True)
+                dest_vm_dir = target_path / source_path.name
+                shutil.copytree(source_path, dest_vm_dir, dirs_exist_ok=True)
+                total_size = sum(f.stat().st_size for f in dest_vm_dir.rglob("*") if f.is_file())
+                duration = round(time.time() - start_time, 2)
+                speed_mbps = round((total_size / (1024 * 1024)) / max(duration, 0.001), 2)
+                return {
+                    "status": "SUCCESS",
+                    "mode": mode,
+                    "target_file": str(dest_vm_dir),
+                    "size_bytes": total_size,
+                    "duration_seconds": duration,
+                    "speed_mbps": speed_mbps
+                }
+
+        # 2. VHDX File Restore (with stream decompression if needed)
+        is_gz = source_path.name.lower().endswith(".gz")
+        is_zip = source_path.name.lower().endswith(".zip")
+
+        # Determine output clean filename (pure .vhdx or .vhd)
+        clean_name = source_path.name
+        if is_gz:
+            clean_name = clean_name[:-3]
+        elif is_zip:
+            clean_name = clean_name[:-4]
+
+        # Clean timestamp suffix if present (e.g. Disk1_20260907_120000.vhdx -> Disk1.vhdx)
+        # However, keep unique if necessary
+        if target_path.is_dir() or not target_path.suffix:
+            target_path.mkdir(parents=True, exist_ok=True)
+            target_file = target_path / clean_name
+        else:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_file = target_path
+
+        if progress_callback:
+            progress_callback(f"Geri yükleme başlatılıyor: {source_path.name} -> {target_file.name}", 0.0, 0.0)
+
+        sha256 = hashlib.sha256()
+        bytes_written = 0
+        source_size = source_path.stat().st_size
+        last_update = time.time()
+
+        if is_gz:
+            with gzip.open(source_path, "rb") as f_in, open(target_file, "wb") as f_out:
+                while True:
+                    chunk = f_in.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+                    bytes_written += len(chunk)
+                    sha256.update(chunk)
+                    now = time.time()
+                    if now - last_update >= 0.5:
+                        elapsed = now - start_time
+                        speed = (bytes_written / (1024 * 1024)) / max(elapsed, 0.001)
+                        pct = (bytes_written / max(source_size * 2, 1)) * 100.0  # Approx decompressed size
+                        pct = min(99.0, pct)
+                        if progress_callback:
+                            progress_callback(
+                                f"Açılıyor ve Geri Yükleniyor: {bytes_written / (1024*1024):.1f} MB - {speed:.1f} MB/s",
+                                pct, speed
+                            )
+                        last_update = now
+        elif is_zip:
+            with zipfile.ZipFile(source_path, "r") as zf:
+                vhdx_names = [n for n in zf.namelist() if n.lower().endswith((".vhdx", ".vhd"))]
+                target_member = vhdx_names[0] if vhdx_names else zf.namelist()[0]
+                with zf.open(target_member, "r") as f_in, open(target_file, "wb") as f_out:
+                    while True:
+                        chunk = f_in.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+                        bytes_written += len(chunk)
+                        sha256.update(chunk)
+                        now = time.time()
+                        if now - last_update >= 0.5:
+                            elapsed = now - start_time
+                            speed = (bytes_written / (1024 * 1024)) / max(elapsed, 0.001)
+                            if progress_callback:
+                                progress_callback(
+                                    f"ZIP Arşivinden Çıkartılıyor: {bytes_written / (1024*1024):.1f} MB - {speed:.1f} MB/s",
+                                    50.0, speed
+                                )
+                            last_update = now
+        else:
+            with open(source_path, "rb") as f_in, open(target_file, "wb") as f_out:
+                while True:
+                    chunk = f_in.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+                    bytes_written += len(chunk)
+                    sha256.update(chunk)
+                    now = time.time()
+                    if now - last_update >= 0.5:
+                        elapsed = now - start_time
+                        speed = (bytes_written / (1024 * 1024)) / max(elapsed, 0.001)
+                        pct = (bytes_written / max(source_size, 1)) * 100.0
+                        if progress_callback:
+                            progress_callback(
+                                f"Geri Yükleniyor: {bytes_written / (1024*1024):.1f} MB (%{pct:.1f}) - {speed:.1f} MB/s",
+                                pct, speed
+                            )
+                        last_update = now
+
+        duration = round(time.time() - start_time, 2)
+        speed_mbps = round((bytes_written / (1024 * 1024)) / max(duration, 0.001), 2)
+
+        if progress_callback:
+            progress_callback(
+                f"VHDX Geri Yükleme Tamamlandı! {bytes_written / (1024*1024):.2f} MB ({duration}s, {speed_mbps} MB/s)",
+                100.0, speed_mbps
+            )
+
+        return {
+            "status": "SUCCESS",
+            "mode": mode,
+            "target_file": str(target_file),
+            "size_bytes": bytes_written,
+            "sha256": sha256.hexdigest(),
+            "duration_seconds": duration,
+            "speed_mbps": speed_mbps
+        }
+
+    # ------------------------------------------------------------------
     # PowerShell Runner Utility
     # ------------------------------------------------------------------
 

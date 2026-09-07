@@ -34,6 +34,7 @@ from gui.widgets.numeric_stepper import NumericStepperWidget
 from gui.widgets.cloud_account_dialog import CloudAccountDialog
 from gui.dialogs.sql_job_dialog import SqlJobDialog
 from gui.dialogs.vhdx_job_dialog import VhdxJobDialog
+from gui.dialogs.delete_confirm_dialog import DeleteConfirmDialog
 from gui.widgets.backup_right_sidebar_widget import BackupRightSidebarWidget
 
 logger = logging.getLogger(__name__)
@@ -509,6 +510,9 @@ class BackupPanel(QWidget):
         if hasattr(self, "loader") and self.loader is not None and self.loader.isRunning():
             return  # Already running in background, do not overwrite active QThread!
         self._is_refreshing = True
+        parent_mw = self.parent() if hasattr(self, "parent") else None
+        if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+            parent_mw.notify_disk_reading("💾 Disk Okunuyor", "Yedekleme görevleri ve depolama alanları diskten taranıyor...")
         self.loader = BackupDataLoaderWorker(self.engine, parent=self)
         self.loader.data_loaded.connect(self._on_data_loaded)
         self.loader.start()
@@ -516,6 +520,9 @@ class BackupPanel(QWidget):
     @Slot(object)
     def _on_data_loaded(self, data: Dict[str, Any]):
         self._is_refreshing = False
+        parent_mw = self.parent() if hasattr(self, "parent") else None
+        if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+            parent_mw.notify_disk_ready("✅ Yedekleme Görevleri Hazır", "Görev ve bulut hesapları güncellendi.", auto_dismiss_seconds=3)
         sql_jobs = data.get("sql_jobs", [])
         vhdx_jobs = data.get("vhdx_jobs", [])
         cloud_accs = data.get("cloud_accounts", [])
@@ -1016,12 +1023,17 @@ class BackupPanel(QWidget):
 
     def _delete_item(self, item: Dict[str, Any]):
         t = item["type"]
-        ans = QMessageBox.question(
-            self, "Silme Onayı",
-            f"'{item['name']}' ({item['engine']}) kaydını silmek istediğinize emin misiniz?",
-            QMessageBox.Yes | QMessageBox.No
+        ans = DeleteConfirmDialog.confirm_deletion(
+            parent=self,
+            title="Yedekleme Görevini Sil",
+            item_name=item["name"],
+            item_type=item.get("engine", item["type"]),
+            target_info=item.get("target", ""),
+            warning_message="Bu işlem seçili yedekleme görevini veya bulut hesabı bağlantısını sistemden kaldıracaktır. Bu işlem geri alınamaz.",
+            banner_title="Yedekleme Görevini Sil",
+            banner_subtitle="Lütfen silmek istediğiniz yedekleme yapılandırmasını onaylayın"
         )
-        if ans != QMessageBox.Yes:
+        if not ans:
             return
 
         if t in ("s3", "gdrive"):

@@ -42,6 +42,57 @@ class AutodiscoverWorker(QThread):
             self.finished.emit({})
 
 
+class ServerProfileTestWorker(QThread):
+    """Background worker for testing a specific multi-server profile connection."""
+    finished = Signal(int, str, bool, str)  # prof_id, prof_name, is_ok, msg
+
+    def __init__(self, engine: MailEngine, account_id: int, profile_id: int, profile_name: str, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.account_id = account_id
+        self.profile_id = profile_id
+        self.profile_name = profile_name
+
+    def run(self):
+        try:
+            ok, msg = self.engine.test_server_profile_connection(self.account_id, self.profile_id)
+            self.finished.emit(self.profile_id, self.profile_name, ok, msg)
+        except Exception as e:
+            self.finished.emit(self.profile_id, self.profile_name, False, str(e))
+
+
+class AccountConnectionTestWorker(QThread):
+    """Background worker for testing main account connection form fields."""
+    finished = Signal(bool, str)
+
+    def __init__(self, host: str, port: int, use_ssl: bool, username: str, password: str, parent=None):
+        super().__init__(parent)
+        self.host = host
+        self.port = port
+        self.use_ssl = use_ssl
+        self.username = username
+        self.password = password
+
+    def run(self):
+        from infrastructure.imap_client import ImapClient
+        client = ImapClient()
+        try:
+            ok, detail = client.connect_with_details(self.host, self.port, self.use_ssl, self.username, self.password, timeout=10)
+            if ok:
+                folders = []
+                try:
+                    folders = client.list_folders()
+                except Exception:
+                    pass
+                client.disconnect()
+                f_count = len(folders)
+                self.finished.emit(True, f"Bağlantı Başarılı ({self.host}:{self.port}) — {f_count} klasör bulundu.")
+            else:
+                self.finished.emit(False, detail)
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
 class AccountDialog(QDialog):
     """Modal dialog for adding, editing, or duplicating an email account."""
 
@@ -431,15 +482,42 @@ class AccountDialog(QDialog):
             self.btn_set_default_profile.setStyleSheet("background-color: #2563eb !important; color: white !important; font-weight: bold; padding: 5px 10px;")
             self.btn_set_default_profile.clicked.connect(self._set_selected_profile_as_default)
 
+            self.btn_test_selected_profile = QPushButton("🔌 Seçili Sunucuyu Test Et")
+            self.btn_test_selected_profile.setStyleSheet("background-color: #6366f1 !important; color: white !important; font-weight: bold; padding: 5px 10px;")
+            self.btn_test_selected_profile.clicked.connect(self._test_selected_server_profile)
+
             self.btn_del_profile = QPushButton("🗑️ Profili Sil")
             self.btn_del_profile.setStyleSheet("background-color: #ef4444 !important; color: white !important; font-weight: bold; padding: 5px 10px;")
             self.btn_del_profile.clicked.connect(self._delete_selected_server_profile)
 
             p_btns.addWidget(self.btn_add_profile)
             p_btns.addWidget(self.btn_set_default_profile)
+            p_btns.addWidget(self.btn_test_selected_profile)
             p_btns.addWidget(self.btn_del_profile)
             p_btns.addStretch()
             p_layout.addLayout(p_btns)
+
+            self.profile_test_progress = QProgressBar()
+            self.profile_test_progress.setVisible(False)
+            self.profile_test_progress.setMaximumHeight(4)
+            self.profile_test_progress.setTextVisible(False)
+            self.profile_test_progress.setStyleSheet("""
+                QProgressBar {
+                    background-color: #e2e8f0;
+                    border: none;
+                    border-radius: 2px;
+                }
+                QProgressBar::chunk {
+                    background-color: #6366f1;
+                    border-radius: 2px;
+                }
+            """)
+            p_layout.addWidget(self.profile_test_progress)
+
+            self.lbl_profile_test_status = QLabel("")
+            self.lbl_profile_test_status.setStyleSheet("font-size: 12px; font-weight: 600; color: #64748b; margin-top: 4px;")
+            self.lbl_profile_test_status.setWordWrap(True)
+            p_layout.addWidget(self.lbl_profile_test_status)
 
             layout.addWidget(profiles_group)
 
@@ -966,6 +1044,56 @@ class AccountDialog(QDialog):
             except Exception as e:
                 self._show_styled_msg("Hata", f"Profil silinemedi: {e}", icon=QMessageBox.Critical)
 
+    @Slot()
+    def _test_selected_server_profile(self):
+        if not hasattr(self, "table_profiles") or not self.account:
+            return
+        curr_row = self.table_profiles.currentRow()
+        if curr_row < 0:
+            self._show_styled_msg("Seçim Yapılmadı", "Lütfen test etmek istediğiniz sunucu profilini listeden seçin.", icon=QMessageBox.Warning)
+            return
+
+        item = self.table_profiles.item(curr_row, 1)
+        prof_id = item.data(Qt.UserRole) if item else None
+        if prof_id is None:
+            return
+
+        prof_name = item.text()
+        if hasattr(self, "lbl_profile_test_status"):
+            self.lbl_profile_test_status.setText(f"⏳ '{prof_name}' sunucusuna bağlanılıyor, klasörler kontrol ediliyor...")
+            self.lbl_profile_test_status.setStyleSheet("color: #2563eb; font-size: 12px; font-weight: 600; margin-top: 4px;")
+
+        if hasattr(self, "profile_test_progress"):
+            self.profile_test_progress.setRange(0, 0)
+            self.profile_test_progress.setVisible(True)
+
+        self.btn_test_selected_profile.setEnabled(False)
+
+        worker = ServerProfileTestWorker(self.engine, self.account["id"], prof_id, prof_name, parent=self)
+        worker.finished.connect(self._on_server_profile_test_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._server_profile_test_worker = worker
+        worker.start()
+
+    @Slot(int, str, bool, str)
+    def _on_server_profile_test_finished(self, prof_id: int, prof_name: str, is_ok: bool, msg: str):
+        self.btn_test_selected_profile.setEnabled(True)
+        if hasattr(self, "profile_test_progress"):
+            self.profile_test_progress.setVisible(False)
+
+        if hasattr(self, "lbl_profile_test_status"):
+            if is_ok:
+                self.lbl_profile_test_status.setText(f"✅ '{prof_name}': {msg}")
+                self.lbl_profile_test_status.setStyleSheet("color: #10b981; font-size: 12px; font-weight: 600; margin-top: 4px;")
+            else:
+                self.lbl_profile_test_status.setText(f"❌ '{prof_name}': {msg}")
+                self.lbl_profile_test_status.setStyleSheet("color: #ef4444; font-size: 12px; font-weight: 600; margin-top: 4px;")
+
+        if is_ok:
+            self._show_styled_msg("Bağlantı Başarılı", f"'{prof_name}' sunucu profili bağlantı testi başarılı!\n\n{msg}", icon=QMessageBox.Information)
+        else:
+            self._show_styled_msg("Bağlantı Başarısız", f"'{prof_name}' sunucu profili bağlantı hatası:\n\n{msg}", icon=QMessageBox.Critical)
+
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
@@ -1100,12 +1228,12 @@ class AccountDialog(QDialog):
         password = self.input_password.text()
 
         if not host:
-            self.test_status.setText("⚠️ Enter host first")
-            self.test_status.setStyleSheet("color: #e67e22; font-size: 12px;")
+            self.test_status.setText("⚠️ Lütfen önce IMAP Host adresini girin.")
+            self.test_status.setStyleSheet("color: #e67e22; font-size: 12px; font-weight: 600;")
             return
         if not password and not self._is_edit:
-            self.test_status.setText("⚠️ Enter password first")
-            self.test_status.setStyleSheet("color: #e67e22; font-size: 12px;")
+            self.test_status.setText("⚠️ Lütfen şifre girin.")
+            self.test_status.setStyleSheet("color: #e67e22; font-size: 12px; font-weight: 600;")
             return
 
         # For edit mode with no password change, decrypt existing
@@ -1113,32 +1241,34 @@ class AccountDialog(QDialog):
             try:
                 password = self.engine.crypto.decrypt(self.account.get("password_enc", ""))
             except Exception:
-                self.test_status.setText("⚠️ Enter password to test")
-                self.test_status.setStyleSheet("color: #e67e22; font-size: 12px;")
+                self.test_status.setText("⚠️ Şifre çözülemedi, lütfen şifrenizi girin.")
+                self.test_status.setStyleSheet("color: #e67e22; font-size: 12px; font-weight: 600;")
                 return
 
         self.btn_test.setEnabled(False)
         self.test_progress.setVisible(True)
         self.test_progress.setRange(0, 0)
-        self.test_status.setText("⏳ Testing connection...")
-        self.test_status.setStyleSheet("color: #4361ee; font-size: 12px;")
+        self.test_status.setText("⏳ Sunucuya bağlanılıyor...")
+        self.test_status.setStyleSheet("color: #2563eb; font-size: 12px; font-weight: 600;")
 
-        def test():
-            from infrastructure.imap_client import ImapClient
-            client = ImapClient()
-            ok = client.connect(host, port, use_ssl, username, password)
-            if ok:
-                client.disconnect()
-            self.btn_test.setEnabled(True)
-            self.test_progress.setVisible(False)
-            if ok:
-                self.test_status.setText("✅ Connection successful")
-                self.test_status.setStyleSheet("color: #2d6a4f; font-size: 12px; font-weight: 600;")
-            else:
-                self.test_status.setText("❌ Connection failed — check settings")
-                self.test_status.setStyleSheet("color: #e63946; font-size: 12px; font-weight: 600;")
+        worker = AccountConnectionTestWorker(host, port, use_ssl, username, password, parent=self)
+        worker.finished.connect(self._on_main_test_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._account_test_worker = worker
+        worker.start()
 
-        threading.Thread(target=test, daemon=True).start()
+    @Slot(bool, str)
+    def _on_main_test_finished(self, is_ok: bool, msg: str):
+        self.btn_test.setEnabled(True)
+        self.test_progress.setVisible(False)
+        if is_ok:
+            self.test_status.setText(f"✅ {msg}")
+            self.test_status.setStyleSheet("color: #10b981; font-size: 12px; font-weight: 600;")
+            self._show_styled_msg("Bağlantı Başarılı", f"Sunucu bağlantı testi başarılı!\n\n{msg}", icon=QMessageBox.Information)
+        else:
+            self.test_status.setText(f"❌ {msg}")
+            self.test_status.setStyleSheet("color: #ef4444; font-size: 12px; font-weight: 600;")
+            self._show_styled_msg("Bağlantı Başarısız", f"Sunucu bağlantı hatası:\n\n{msg}", icon=QMessageBox.Critical)
 
     # ------------------------------------------------------------------
     # Group / Domain Management slots

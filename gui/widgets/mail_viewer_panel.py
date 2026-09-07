@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.mail_engine import MailEngine
+from core.settings import AppSettings
 from infrastructure.imap_client import format_folder_display_name
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,80 @@ class MailBodyLoaderThread(QThread):
         except Exception as e:
             logger.debug("Failed to load/parse raw mail bytes: %s", e)
             self.finished_signal.emit(e)
+
+
+class MailViewerDataLoaderWorker(QThread):
+    """Background worker for loading accounts, groups and folder tree from database."""
+    data_loaded = Signal(dict)
+
+    def __init__(self, engine: MailEngine, selected_group: str = "__ALL__", parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.selected_group = selected_group
+
+    def run(self):
+        result = {
+            "groups": set(),
+            "accounts_for_group": [],
+            "folder_tree_data": []
+        }
+        try:
+            all_accounts = self.engine.list_accounts()
+            for acc in all_accounts:
+                g_val = acc.get("account_group", "").strip()
+                if not g_val and "@" in acc.get("email", ""):
+                    g_val = acc["email"].split("@")[-1].strip()
+                if g_val:
+                    result["groups"].add(g_val)
+                if self.selected_group == "__ALL__" or g_val == self.selected_group:
+                    result["accounts_for_group"].append(acc)
+
+            accounts = result["accounts_for_group"]
+            if accounts:
+                acc_ids = tuple(acc["id"] for acc in accounts)
+                acc_id_clause = f"IN ({','.join('?' for _ in acc_ids)})" if len(acc_ids) > 1 else "= ?"
+
+                synced_dict = {}
+                counts_dict = {}
+                try:
+                    with self.engine.db.get_conn() as conn:
+                        state_rows = conn.execute(
+                            f"SELECT account_id, folder FROM sync_state WHERE account_id {acc_id_clause}",
+                            acc_ids
+                        ).fetchall()
+                        for r in state_rows:
+                            synced_dict.setdefault(r["account_id"], set()).add(r["folder"])
+
+                        count_rows = conn.execute(
+                            f"SELECT account_id, folder, COUNT(*) as cnt FROM mail_metadata WHERE is_deleted=0 AND account_id {acc_id_clause} GROUP BY account_id, folder",
+                            acc_ids
+                        ).fetchall()
+                        for r in count_rows:
+                            counts_dict[(r["account_id"], r["folder"])] = r["cnt"]
+                except Exception as dbe:
+                    logger.debug("Folder metadata read skipped/failed (offline mode): %s", dbe)
+
+                for acc in accounts:
+                    acc_id = acc["id"]
+                    synced_folders = synced_dict.get(acc_id, set())
+                    acc_counts = {f: cnt for (aid, f), cnt in counts_dict.items() if aid == acc_id}
+
+                    seen = {"INBOX"}
+                    folders_data = [("INBOX", acc_counts.get("INBOX", 0))]
+                    all_folders = sorted(list(synced_folders | set(acc_counts.keys())))
+                    for folder in all_folders:
+                        if folder not in seen:
+                            seen.add(folder)
+                            folders_data.append((folder, acc_counts.get(folder, 0)))
+
+                    result["folder_tree_data"].append({
+                        "account": acc,
+                        "folders": folders_data
+                    })
+        except Exception as e:
+            logger.debug("MailViewerDataLoaderWorker error: %s", e)
+        finally:
+            self.data_loaded.emit(result)
 
 
 class FolderTree(QTreeWidget):
@@ -98,6 +173,21 @@ class FolderTree(QTreeWidget):
         """)
         self.itemClicked.connect(self._on_item_clicked)
 
+    def populate_data(self, folder_tree_data: list):
+        self.clear()
+        for item in folder_tree_data:
+            acc = item["account"]
+            acc_id = acc["id"]
+            acc_item = QTreeWidgetItem([f"📁  {acc['label']}  ({acc['email']})"])
+            acc_item.setData(0, Qt.UserRole, ("account", acc_id))
+            acc_item.setFlags(acc_item.flags() & ~Qt.ItemIsSelectable)
+            self.addTopLevelItem(acc_item)
+
+            for folder, count in item.get("folders", []):
+                self._add_folder(acc_item, acc_id, folder, count)
+
+            acc_item.setExpanded(True)
+
     def refresh(self, selected_group: str = "__ALL__"):
         self.clear()
         try:
@@ -119,20 +209,23 @@ class FolderTree(QTreeWidget):
             # Bulk query sync states and folder counts in 2 fast queries
             synced_dict = {}
             counts_dict = {}
-            with self.engine.db.get_conn() as conn:
-                state_rows = conn.execute(
-                    f"SELECT account_id, folder FROM sync_state WHERE account_id {acc_id_clause}",
-                    acc_ids
-                ).fetchall()
-                for r in state_rows:
-                    synced_dict.setdefault(r["account_id"], set()).add(r["folder"])
+            try:
+                with self.engine.db.get_conn() as conn:
+                    state_rows = conn.execute(
+                        f"SELECT account_id, folder FROM sync_state WHERE account_id {acc_id_clause}",
+                        acc_ids
+                    ).fetchall()
+                    for r in state_rows:
+                        synced_dict.setdefault(r["account_id"], set()).add(r["folder"])
 
-                count_rows = conn.execute(
-                    f"SELECT account_id, folder, COUNT(*) as cnt FROM mail_metadata WHERE is_deleted=0 AND account_id {acc_id_clause} GROUP BY account_id, folder",
-                    acc_ids
-                ).fetchall()
-                for r in count_rows:
-                    counts_dict[(r["account_id"], r["folder"])] = r["cnt"]
+                    count_rows = conn.execute(
+                        f"SELECT account_id, folder, COUNT(*) as cnt FROM mail_metadata WHERE is_deleted=0 AND account_id {acc_id_clause} GROUP BY account_id, folder",
+                        acc_ids
+                    ).fetchall()
+                    for r in count_rows:
+                        counts_dict[(r["account_id"], r["folder"])] = r["cnt"]
+            except Exception as dbe:
+                logger.debug("FolderTree.refresh: DB query skipped/failed (offline mode): %s", dbe)
 
             for acc in accounts:
                 acc_id = acc["id"]
@@ -955,9 +1048,10 @@ class MailViewerPanel(QWidget):
     _on_page_loaded_signal = Signal(list, int)
     _on_page_load_error_signal = Signal(str)
 
-    def __init__(self, engine: MailEngine, parent=None):
+    def __init__(self, engine: MailEngine, parent=None, settings: Optional[AppSettings] = None):
         super().__init__(parent)
         self.engine = engine
+        self.settings = settings or getattr(engine, "settings", None) or AppSettings()
         self._current_account_id: Optional[int] = None
         self._current_folder: str = "INBOX"
         
@@ -1013,6 +1107,23 @@ class MailViewerPanel(QWidget):
         toolbar.addWidget(self.label_folder)
 
         layout.addLayout(toolbar)
+
+        # Disk status banner
+        self.disk_status_banner = QFrame()
+        self.disk_status_banner.setObjectName("mailViewerDiskStatusBanner")
+        self.disk_status_banner.setVisible(False)
+        banner_layout = QHBoxLayout(self.disk_status_banner)
+        banner_layout.setContentsMargins(10, 6, 10, 6)
+        banner_layout.setSpacing(8)
+
+        self.lbl_disk_status_icon = QLabel("⚠️")
+        self.lbl_disk_status_icon.setStyleSheet("font-size: 16px; background: transparent;")
+        banner_layout.addWidget(self.lbl_disk_status_icon)
+
+        self.lbl_disk_status_text = QLabel("Yedekleme diski takılı değil. Çevrimdışı modda çalışılıyor.")
+        self.lbl_disk_status_text.setStyleSheet("color: #b45309; font-size: 12px; font-weight: 600; background: transparent;")
+        banner_layout.addWidget(self.lbl_disk_status_text, stretch=1)
+        layout.addWidget(self.disk_status_banner)
 
         # Progress
         self.progress_bar = QProgressBar()
@@ -1111,6 +1222,12 @@ class MailViewerPanel(QWidget):
     def _load_next_page(self):
         if not self._current_account_id:
             return
+
+        is_online = self.settings.is_configured_data_path_available()
+        if not is_online:
+            self.status_bar.showMessage("⚠️ Çevrimdışı mod: Arşiv mesajlarını görüntülemek için diski takınız.", 5000)
+            self.mail_list._has_more = False
+            return
             
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
@@ -1186,6 +1303,14 @@ class MailViewerPanel(QWidget):
 
     @Slot()
     def _sync_current_folder(self):
+        if not self.settings.is_configured_data_path_available():
+            QMessageBox.warning(
+                self, "Yedekleme Diski Takılı Değil",
+                f"Yapılandırılmış arşiv diski ({self.settings.configured_data_path_str()}) takılı değil.\n\n"
+                "Senkronizasyon yapabilmek için lütfen harici diskinizi bilgisayara takınız."
+            )
+            return
+
         if not self._current_account_id:
             QMessageBox.warning(self, "No Folder", "Select a folder first.")
             return
@@ -1222,6 +1347,14 @@ class MailViewerPanel(QWidget):
 
     @Slot()
     def _sync_all_folders(self):
+        if not self.settings.is_configured_data_path_available():
+            QMessageBox.warning(
+                self, "Yedekleme Diski Takılı Değil",
+                f"Yapılandırılmış arşiv diski ({self.settings.configured_data_path_str()}) takılı değil.\n\n"
+                "Senkronizasyon yapabilmek için lütfen harici diskinizi bilgisayara takınız."
+            )
+            return
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.status_bar.showMessage("Syncing all accounts...")
@@ -1273,28 +1406,59 @@ class MailViewerPanel(QWidget):
                 self._current_account_id = acc_data.get("id")
 
     # ------------------------------------------------------------------
-    # Refresh
+    # Refresh & Async Lazy Load
     # ------------------------------------------------------------------
 
     def refresh(self):
+        if getattr(self, "_loader_worker", None) is not None and self._loader_worker.isRunning():
+            return
+        selected_group = self.combo_group.currentData() if hasattr(self, "combo_group") else "__ALL__"
+        parent_mw = self.parent() if hasattr(self, "parent") else None
+        if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+            parent_mw.notify_disk_reading("💾 Disk Okunuyor", "E-posta hesapları ve klasör arşivleri taranıyor...")
+
+        self._loader_worker = MailViewerDataLoaderWorker(self.engine, selected_group=selected_group or "__ALL__", parent=self)
+        self._loader_worker.data_loaded.connect(self._on_viewer_data_loaded)
+        self._loader_worker.start()
+
+    @Slot(dict)
+    def _on_viewer_data_loaded(self, data: dict):
+        is_disk_online = self.settings.is_configured_data_path_available()
+        parent_mw = self.parent() if hasattr(self, "parent") else None
+
+        if is_disk_online:
+            self.disk_status_banner.setVisible(False)
+            if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+                parent_mw.notify_disk_ready("✅ Mail İzleyici Hazır", "Klasör ve hesap listesi güncellendi.", auto_dismiss_seconds=3)
+        else:
+            disk_str = self.settings.configured_data_path_str()
+            self.disk_status_banner.setStyleSheet("""
+                QFrame#mailViewerDiskStatusBanner {
+                    background-color: #fffbeb;
+                    border: 1px solid #f59e0b;
+                    border-radius: 6px;
+                }
+            """)
+            self.lbl_disk_status_icon.setText("🟠")
+            total_acc = len(data.get("accounts_for_group", []))
+            self.lbl_disk_status_text.setText(
+                f"<b>⚠️ Yedekleme Diski ({disk_str}) Bağlı Değil — Çevrimdışı Bilgilendirme Modu</b><br/>"
+                f"<span style='font-size:11px; color:#92400e;'>{total_acc} adet e-posta hesabı yerel önbellekten listelenmektedir. E-posta gövdelerine, eklerine ve yeni senkronizasyona disk takılıncaya kadar ulaşılamaz.</span>"
+            )
+            self.disk_status_banner.setVisible(True)
+            if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+                parent_mw.notify_disk_ready(
+                    "⚠️ Çevrimdışı Bilgilendirme Modu",
+                    f"Yedekleme diski ({disk_str}) takılı değil. Hesaplar listelendi (Disk takılana kadar yeni arşivleme yapılamaz).",
+                    auto_dismiss_seconds=8
+                )
+
         current_grp = self.combo_group.currentData() if hasattr(self, "combo_group") else "__ALL__"
         self.combo_group.blockSignals(True)
         self.combo_group.clear()
         self.combo_group.addItem("🌐 Tüm Gruplar / Domainler", "__ALL__")
 
-        groups = set()
-        try:
-            all_accounts = self.engine.list_accounts()
-            for acc in all_accounts:
-                g_val = acc.get("account_group", "").strip()
-                if not g_val and "@" in acc.get("email", ""):
-                    g_val = acc["email"].split("@")[-1].strip()
-                if g_val:
-                    groups.add(g_val)
-        except Exception:
-            pass
-
-        for g in sorted(groups):
+        for g in sorted(data.get("groups", [])):
             self.combo_group.addItem(f"📁 {g}", g)
 
         idx = self.combo_group.findData(current_grp)
@@ -1304,6 +1468,12 @@ class MailViewerPanel(QWidget):
             self.combo_group.setCurrentIndex(0)
         self.combo_group.blockSignals(False)
 
-        selected_group = self.combo_group.currentData() or "__ALL__"
-        self._populate_accounts_for_group(selected_group)
-        self.folder_tree.refresh(selected_group)
+        # Accounts
+        self.combo_account.blockSignals(True)
+        self.combo_account.clear()
+        for acc in data.get("accounts_for_group", []):
+            self.combo_account.addItem(f"{acc['label']} ({acc['email']})", acc)
+        self.combo_account.blockSignals(False)
+
+        # Folder tree
+        self.folder_tree.populate_data(data.get("folder_tree_data", []))

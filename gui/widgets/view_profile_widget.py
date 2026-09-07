@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QDialog, QTableWidget, QHeaderView, QFrame,
     QListWidget, QListWidgetItem
 )
+from gui.dialogs.delete_confirm_dialog import DeleteConfirmDialog
 
 logger = logging.getLogger(__name__)
 
@@ -813,12 +814,14 @@ class ViewProfileWidget(QWidget):
             QMessageBox.warning(self, "Profil Silinemez", "Varsayılan profil silinemez.")
             return
 
-        res = QMessageBox.question(
-            self, "Profili Sil",
-            f"'{current_name}' profilini silmek istediğinize emin misiniz?",
-            QMessageBox.Yes | QMessageBox.No
+        confirmed = DeleteConfirmDialog.confirm_deletion(
+            parent=self,
+            item_name=current_name,
+            item_type="Görünüm Profili",
+            details=f"Profil Adı: {current_name}\nKayıtlı sütun genişlikleri, sıralamaları ve satır yükseklik ayarları silinecektir.",
+            warning_text="Bu işlem geri alınamaz!"
         )
-        if res == QMessageBox.Yes:
+        if confirmed:
             if self.manager.delete_profile(current_name):
                 self.reload_profiles()
                 self._on_profile_changed(self.combo_profiles.currentText())

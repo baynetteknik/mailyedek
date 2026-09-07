@@ -25,11 +25,44 @@ from core.mail_engine import MailEngine
 from core.settings import AppSettings
 from gui.dialogs.account_dialog import AccountDialog
 from gui.dialogs.bulk_import_dialog import BulkImportDialog
+from gui.dialogs.delete_confirm_dialog import DeleteConfirmDialog
 from gui.widgets.account_group_sidebar_widget import AccountGroupSidebarWidget
 from gui.widgets.account_right_sidebar_widget import AccountRightSidebarWidget
 from gui.widgets.view_profile_widget import SaveLayoutProfileDialog, ColumnManagerDialog
 
 logger = logging.getLogger(__name__)
+
+
+class AccountDataLoaderWorker(QThread):
+    """Background worker for loading accounts from database with offline cache fallback."""
+    data_loaded = Signal(object, object)  # accounts (list), stats_map (dict)
+
+    def __init__(self, engine: MailEngine, settings: Optional[AppSettings] = None, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.settings = settings or getattr(engine, "settings", None) or AppSettings()
+
+    def run(self):
+        try:
+            accounts = self.engine.list_accounts()
+            stats_map = {}
+            with self.engine.db.get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT account_id, COUNT(*) as mail_count, SUM(size_bytes) as total_size "
+                    "FROM mail_metadata WHERE is_deleted = 0 GROUP BY account_id"
+                ).fetchall()
+                for r in rows:
+                    stats_map[r["account_id"]] = {
+                        "mail_count": r["mail_count"],
+                        "total_size": r["total_size"] or 0
+                    }
+            if not accounts and self.settings:
+                accounts = self.settings.load_account_cache()
+            self.data_loaded.emit(accounts, stats_map)
+        except Exception as e:
+            logger.debug("AccountDataLoaderWorker error: %s", e)
+            cached = self.settings.load_account_cache() if self.settings else []
+            self.data_loaded.emit(cached, {})
 
 
 class EmlImportWorker(QThread):
@@ -172,7 +205,7 @@ class AccountPanel(QWidget):
     Account management with 3-column layout:
     - Left Sidebar: AccountGroupSidebarWidget
     - Middle Small Arrow Toggle Buttons
-    - Center Table: Toya ERP Context Menu DBGrid
+    - Center Table: Toya ERP Context Menu DBGrid with Checkbox Multi-Select Comparison & Stats
     - Right Sidebar: AccountRightSidebarWidget
     """
 
@@ -186,10 +219,33 @@ class AccountPanel(QWidget):
         self._current_row_height = 36
         self._current_role = "admin"
         self._cached_accounts = []
+        self._account_stats: Dict[int, Dict[str, Any]] = {}
 
         self._setup_ui()
         self._connect_signals()
         self.refresh()
+
+    def _card_style(self, bg="#ffffff", border="#cbd5e1", fg="#1e293b") -> str:
+        return f"""
+            QLabel {{
+                background-color: {bg};
+                color: {fg};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11.5px;
+                font-weight: 600;
+            }}
+        """
+
+    def _fmt_size(self, size_bytes: int) -> str:
+        if size_bytes >= 1024**3:
+            return f"{size_bytes / (1024**3):.2f} GB"
+        elif size_bytes >= 1024**2:
+            return f"{size_bytes / (1024**2):.1f} MB"
+        elif size_bytes >= 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        return f"{size_bytes} B"
 
     def _setup_ui(self):
         main_vbox = QVBoxLayout(self)
@@ -197,7 +253,7 @@ class AccountPanel(QWidget):
         main_vbox.setSpacing(6)
 
         # -------------------------------------------------------------
-        # TOP TOOLBAR: Minimalist & Ergonomic
+        # TOP TOOLBAR: Search & Quick Actions
         # -------------------------------------------------------------
         self.top_bar = QFrame()
         self.top_bar.setStyleSheet("""
@@ -213,8 +269,8 @@ class AccountPanel(QWidget):
         top_layout.setSpacing(8)
 
         # Left Sidebar Toggle
-        self.btn_toggle_left = QPushButton("◀ Grupları Gizle")
-        self.btn_toggle_left.setToolTip("Sol Grup/Domain filtre panelini gizler/gösterir")
+        self.btn_toggle_left = QPushButton("◀ Domainler")
+        self.btn_toggle_left.setToolTip("Sol Domain filtre panelini gizler/gösterir")
         self.btn_toggle_left.setCursor(Qt.PointingHandCursor)
         self.btn_toggle_left.setStyleSheet(self._toggle_btn_style())
         self.btn_toggle_left.clicked.connect(self._toggle_left_sidebar)
@@ -241,14 +297,42 @@ class AccountPanel(QWidget):
         self.txt_search_accounts.textChanged.connect(self._filter_table_rows)
         top_layout.addWidget(self.txt_search_accounts, stretch=1)
 
-        # Statistics Badges
-        self.lbl_stat_total = QLabel("📊 0 Hesap")
-        self.lbl_stat_total.setStyleSheet(self._badge_style(bg="#e0e7ff", fg="#1e3a8a"))
-        top_layout.addWidget(self.lbl_stat_total)
+        # Checkbox Selection Buttons
+        self.btn_select_all = QPushButton("☑️ Tümünü Seç")
+        self.btn_select_all.setToolTip("Görünen tüm hesapların seçim kutularını işaretler")
+        self.btn_select_all.setCursor(Qt.PointingHandCursor)
+        self.btn_select_all.setStyleSheet("""
+            QPushButton {
+                background-color: #f1f5f9;
+                color: #1e3a8a;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 5px 10px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background-color: #e2e8f0; border-color: #2563eb; }
+        """)
+        self.btn_select_all.clicked.connect(self._select_all_checkboxes)
+        top_layout.addWidget(self.btn_select_all)
 
-        self.lbl_stat_active = QLabel("🟢 0 Aktif")
-        self.lbl_stat_active.setStyleSheet(self._badge_style(bg="#dcfce7", fg="#15803d"))
-        top_layout.addWidget(self.lbl_stat_active)
+        self.btn_clear_sel = QPushButton("⬜ Temizle")
+        self.btn_clear_sel.setToolTip("Seçili kutucukların işaretlerini kaldırır")
+        self.btn_clear_sel.setCursor(Qt.PointingHandCursor)
+        self.btn_clear_sel.setStyleSheet("""
+            QPushButton {
+                background-color: #f1f5f9;
+                color: #475569;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 5px 10px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background-color: #e2e8f0; }
+        """)
+        self.btn_clear_sel.clicked.connect(self._clear_all_checkboxes)
+        top_layout.addWidget(self.btn_clear_sel)
 
         # Optimizer status button (dynamic)
         self.btn_active_opt_status = QPushButton("🔄 Optimizasyon Çalışıyor")
@@ -284,6 +368,55 @@ class AccountPanel(QWidget):
         top_layout.addWidget(self.btn_toggle_right)
 
         main_vbox.addWidget(self.top_bar)
+
+        # -------------------------------------------------------------
+        # SUMMARY DASHBOARD & COMPARISON CARDS
+        # -------------------------------------------------------------
+        self.stats_bar = QFrame()
+        self.stats_bar.setStyleSheet("""
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 4px;
+            }
+        """)
+        stats_layout = QHBoxLayout(self.stats_bar)
+        stats_layout.setContentsMargins(8, 4, 8, 4)
+        stats_layout.setSpacing(8)
+
+        self.lbl_card_accounts = QLabel("📊 Toplam: 0 Hesap")
+        self.lbl_card_accounts.setStyleSheet(self._card_style(bg="#eff6ff", border="#bfdbfe", fg="#1e3a8a"))
+        stats_layout.addWidget(self.lbl_card_accounts)
+
+        self.lbl_card_mails = QLabel("📧 Toplam: 0 Mail")
+        self.lbl_card_mails.setStyleSheet(self._card_style(bg="#f0fdf4", border="#bbf7d0", fg="#166534"))
+        stats_layout.addWidget(self.lbl_card_mails)
+
+        self.lbl_card_size = QLabel("💾 Toplam: 0 B")
+        self.lbl_card_size.setStyleSheet(self._card_style(bg="#faf5ff", border="#e9d5ff", fg="#6b21a8"))
+        stats_layout.addWidget(self.lbl_card_size)
+
+        self.lbl_card_status = QLabel("🟢 0 Aktif | 0 Pasif")
+        self.lbl_card_status.setStyleSheet(self._card_style(bg="#f8fafc", border="#e2e8f0", fg="#334155"))
+        stats_layout.addWidget(self.lbl_card_status)
+
+        stats_layout.addStretch()
+
+        self.lbl_card_compare = QLabel("☑️ Seçili: 0 Hesap (Karşılaştırma için kutuları işaretleyin)")
+        self.lbl_card_compare.setStyleSheet("""
+            QLabel {
+                background-color: #f8fafc;
+                color: #475569;
+                border: 1.5px dashed #cbd5e1;
+                border-radius: 6px;
+                padding: 4px 12px;
+                font-size: 11.5px;
+            }
+        """)
+        stats_layout.addWidget(self.lbl_card_compare)
+
+        main_vbox.addWidget(self.stats_bar)
 
         # Testing Progress & Status
         self.test_progress = QProgressBar()
@@ -367,13 +500,13 @@ class AccountPanel(QWidget):
         center_layout.setContentsMargins(6, 8, 6, 6)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(12)
+        self.table.setColumnCount(14)
         self.table.setHorizontalHeaderLabels([
-            "ID", "Hesap Adı (Label)", "E-Posta Adresi", "IMAP Sunucu", "Port", "SSL", "Durum", "Depolama", "Alt Klasör", "Domain Grubu", "Son Güncelleme", "Hızlı İşlemler"
+            "☑️", "ID", "Hesap Adı (Label)", "E-Posta Adresi", "IMAP Sunucu", "Port", "SSL", "Durum", "Toplam Mail", "Toplam Boyut", "Alt Klasör", "Domain Grubu", "Son Güncelleme", "Hızlı İşlemler"
         ])
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.setSortingEnabled(True)
@@ -581,11 +714,10 @@ class AccountPanel(QWidget):
 
         # 1. Row Specific Actions (if clicked on a row)
         server_actions = {}
-        acc_id_str = ""
+        acc_id = None
         if row >= 0 and not is_header:
-            id_item = self.table.item(row, 0)
-            if id_item:
-                acc_id_str = id_item.text()
+            acc_id = self._get_row_account_id(row)
+            if acc_id is not None:
                 act_edt = menu.addAction("✏️ Hesabı Düzenle")
                 act_edt.triggered.connect(self._edit_account)
 
@@ -595,16 +727,18 @@ class AccountPanel(QWidget):
                 act_tst = menu.addAction("🔌 Bağlantıyı Test Et")
                 act_tst.triggered.connect(self._test_selected)
 
-                if acc_id_str.isdigit():
-                    acc_id = int(acc_id_str)
-                    profiles = self.engine.list_server_profiles(acc_id)
-                    if profiles and len(profiles) > 1:
-                        menu_servers = menu.addMenu("🔌 Aktif Sunucuyu Seç")
-                        menu_servers.setStyleSheet(menu.styleSheet())
-                        for p in profiles:
-                            prefix = "★ " if p.get("is_default") else "  "
-                            act_p = menu_servers.addAction(f"{prefix}{p.get('profile_name')} ({p.get('imap_host')})")
-                            server_actions[act_p] = p["id"]
+                act_sync = menu.addAction("⚡ E-Postaları Senkronize Et (Eşitle)")
+                act_sync.triggered.connect(lambda chk=False, aid=acc_id: self._prompt_sync_account(aid))
+
+                profiles = self.engine.list_server_profiles(acc_id)
+                if profiles and len(profiles) > 1:
+                    menu_servers = menu.addMenu("🔌 Aktif Sunucuyu Seç")
+                    menu_servers.setStyleSheet(menu.styleSheet())
+                    for p in profiles:
+                        prefix = "★ " if p.get("is_default") else "  "
+                        pid = p["id"]
+                        act_p = menu_servers.addAction(f"{prefix}{p.get('profile_name')} ({p.get('imap_host')})")
+                        act_p.triggered.connect(lambda chk=False, aid=acc_id, prof_id=pid: self._set_account_active_server(aid, prof_id))
 
                 menu.addSeparator()
                 act_cp_email = menu.addAction("📋 E-Posta Adresini Kopyala")
@@ -669,14 +803,60 @@ class AccountPanel(QWidget):
         act_reset.triggered.connect(self._reset_grid_layout_to_default)
 
         # Exec menu
-        chosen = menu.exec(global_pos)
-        if chosen in server_actions and acc_id_str.isdigit():
-            prof_id = server_actions[chosen]
-            self.engine.set_default_server_profile(int(acc_id_str), prof_id)
+        menu.exec(global_pos)
+
+    def _set_account_active_server(self, account_id: int, profile_id: int):
+        try:
+            self.engine.set_default_server_profile(account_id, profile_id)
+            profs = self.engine.list_server_profiles(account_id)
+            active_p = next((p for p in profs if p["id"] == profile_id), None)
+            host = active_p.get("imap_host", "") if active_p else ""
+            p_name = active_p.get("profile_name", "") if active_p else ""
+            self.test_status.setVisible(True)
+            self.test_status.setText(f"⭐ Aktif sunucu '{p_name} ({host})' olarak ayarlandı.")
+            self.test_status.setStyleSheet("color: #10b981; font-weight: bold; font-size: 11.5px;")
             self.refresh()
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Aktif sunucu değiştirilemedi: {e}")
+
+    def _prompt_sync_account(self, account_id: int):
+        from gui.widgets.sync_panel import SelectSyncServerDialog
+        try:
+            profiles = self.engine.db.get_server_profiles(account_id)
+        except Exception:
+            profiles = []
+
+        if len(profiles) > 1:
+            acc = self.engine.accounts.get(account_id) or {"id": account_id, "label": f"Hesap #{account_id}"}
+            dialog = SelectSyncServerDialog(account=acc, profiles=profiles, parent=self)
+            if dialog.exec() == QDialog.Accepted and dialog.selected_profile_id:
+                try:
+                    self.engine.set_default_server_profile(account_id, dialog.selected_profile_id)
+                    self.refresh()
+                except Exception as e:
+                    logger.warning("Failed to set default server profile before sync: %s", e)
+            else:
+                return
+
+        win = self.window()
+        if hasattr(win, "stack") and hasattr(win, "panels"):
+            sync_panel = win.panels.get("sync")
+            if sync_panel:
+                win.stack.setCurrentWidget(sync_panel)
+                if hasattr(sync_panel, "_trigger_individual_sync_direct"):
+                    sync_panel._trigger_individual_sync_direct(account_id)
+
+    def _get_row_account_id(self, row: int) -> Optional[int]:
+        """Safely extracts the account ID from column 1 for a given row."""
+        if row < 0 or row >= self.table.rowCount():
+            return None
+        id_item = self.table.item(row, 1)
+        if id_item and id_item.text().strip().isdigit():
+            return int(id_item.text().strip())
+        return None
 
     def _copy_email_to_clipboard(self, row: int):
-        item = self.table.item(row, 2)
+        item = self.table.item(row, 3)
         if item:
             QApplication.clipboard().setText(item.text().strip())
             self.test_status.setVisible(True)
@@ -715,6 +895,96 @@ class AccountPanel(QWidget):
             for col in range(self.table.columnCount()):
                 self.table.setColumnHidden(col, col in new_hidden)
             self._auto_save_current_layout()
+
+    # -------------------------------------------------------------
+    # Checkbox Selection & Comparison Dashboard
+    # -------------------------------------------------------------
+
+    def _select_all_checkboxes(self):
+        self.table.blockSignals(True)
+        for r in range(self.table.rowCount()):
+            if not self.table.isRowHidden(r):
+                it = self.table.item(r, 0)
+                if it:
+                    it.setCheckState(Qt.Checked)
+        self.table.blockSignals(False)
+        self._update_dashboard_statistics()
+
+    def _clear_all_checkboxes(self):
+        self.table.blockSignals(True)
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0)
+            if it:
+                it.setCheckState(Qt.Unchecked)
+        self.table.blockSignals(False)
+        self._update_dashboard_statistics()
+
+    def _update_dashboard_statistics(self):
+        """Calculates visible totals and checked/compared account totals."""
+        total_all_accounts = len(self._cached_accounts)
+        visible_acc_ids = set()
+        checked_acc_ids = set()
+
+        for r in range(self.table.rowCount()):
+            if not self.table.isRowHidden(r):
+                aid = self._get_row_account_id(r)
+                if aid is not None:
+                    visible_acc_ids.add(aid)
+                    chk_item = self.table.item(r, 0)
+                    if chk_item and chk_item.checkState() == Qt.Checked:
+                        checked_acc_ids.add(aid)
+
+        visible_accounts = [a for a in self._cached_accounts if a["id"] in visible_acc_ids]
+        checked_accounts = [a for a in self._cached_accounts if a["id"] in checked_acc_ids]
+
+        visible_count = len(visible_accounts)
+        active_count = sum(1 for a in visible_accounts if bool(a.get("is_active", True)))
+        passive_count = visible_count - active_count
+
+        total_visible_mails = sum(self._account_stats.get(aid, {}).get("mail_count", 0) for aid in visible_acc_ids)
+        total_visible_size = sum(self._account_stats.get(aid, {}).get("total_size", 0) for aid in visible_acc_ids)
+
+        # Update Top Stat Badges
+        if visible_count == total_all_accounts:
+            self.lbl_card_accounts.setText(f"📊 Toplam: {total_all_accounts} Hesap")
+        else:
+            self.lbl_card_accounts.setText(f"📊 Hesap: {visible_count} / {total_all_accounts}")
+
+        self.lbl_card_mails.setText(f"📧 Toplam: {total_visible_mails:,} Mail")
+        self.lbl_card_size.setText(f"💾 Toplam: {self._fmt_size(total_visible_size)}")
+        self.lbl_card_status.setText(f"🟢 {active_count} Aktif | ⏸ {passive_count} Pasif")
+
+        # Update Comparison Card
+        chk_count = len(checked_accounts)
+        if chk_count == 0:
+            self.lbl_card_compare.setText("☑️ Seçili: 0 Hesap (Karşılaştırma için kutuları işaretleyin)")
+            self.lbl_card_compare.setStyleSheet("""
+                QLabel {
+                    background-color: #f8fafc;
+                    color: #475569;
+                    border: 1.5px dashed #cbd5e1;
+                    border-radius: 6px;
+                    padding: 4px 12px;
+                    font-size: 11.5px;
+                }
+            """)
+        else:
+            chk_mails = sum(self._account_stats.get(aid, {}).get("mail_count", 0) for aid in checked_acc_ids)
+            chk_size = sum(self._account_stats.get(aid, {}).get("total_size", 0) for aid in checked_acc_ids)
+            self.lbl_card_compare.setText(
+                f"⚖️ Seçilen {chk_count} Hesap: {chk_mails:,} Mail ({self._fmt_size(chk_size)})"
+            )
+            self.lbl_card_compare.setStyleSheet("""
+                QLabel {
+                    background-color: #ecfdf5;
+                    color: #065f46;
+                    border: 1.5px solid #6ee7b7;
+                    border-radius: 6px;
+                    padding: 4px 12px;
+                    font-size: 11.5px;
+                    font-weight: bold;
+                }
+            """)
 
     # -------------------------------------------------------------
     # Profile Persistence
@@ -797,127 +1067,214 @@ class AccountPanel(QWidget):
     # -------------------------------------------------------------
 
     def refresh(self):
+        if getattr(self, "_loader_worker", None) is not None and self._loader_worker.isRunning():
+            return
         self._is_refreshing = True
+        parent_mw = self.parent() if hasattr(self, "parent") else None
+        if parent_mw and hasattr(parent_mw, "notify_disk_reading"):
+            parent_mw.notify_disk_reading("💾 Disk Okunuyor", "E-posta hesapları ve domain grupları diskten taranıyor...")
+        self._loader_worker = AccountDataLoaderWorker(self.engine, settings=self.settings, parent=self)
+        self._loader_worker.data_loaded.connect(self._on_accounts_loaded)
+        self._loader_worker.start()
+
+    @Slot(list, dict)
+    def _on_accounts_loaded(self, all_accounts: list, stats_map: dict = None):
+        self._is_refreshing = False
+        is_disk_online = self.settings.is_configured_data_path_available()
+        parent_mw = self.parent() if hasattr(self, "parent") else None
+
+        if is_disk_online:
+            if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+                parent_mw.notify_disk_ready("✅ Hesap Listesi Hazır", f"Toplam {len(all_accounts)} adet hesap yüklendi.", auto_dismiss_seconds=3)
+        else:
+            disk_str = self.settings.configured_data_path_str()
+            if parent_mw and hasattr(parent_mw, "notify_disk_ready"):
+                parent_mw.notify_disk_ready(
+                    "⚠️ Çevrimdışı Bilgilendirme Modu",
+                    f"Yedekleme diski ({disk_str}) takılı değil. {len(all_accounts)} hesap listelendi (Disk takılana kadar yeni arşivleme yapılamaz).",
+                    auto_dismiss_seconds=8
+                )
+
         try:
-            # 1. Retrieve accounts from database
-            all_accounts = self.engine.list_accounts()
             self._cached_accounts = all_accounts
+            self._account_stats = stats_map or {}
 
             # 2. Extract and organize domain groups with count
-            groups_data = {}
+            domains_data = {}
             for acc in all_accounts:
-                g_val = acc.get("account_group", "").strip()
-                if not g_val and "@" in acc.get("email", ""):
-                    g_val = acc["email"].split("@")[-1].strip()
-                if not g_val:
-                    g_val = "Diğer"
+                email = acc.get("email", "").strip()
+                dom = email.split("@")[-1].strip().lower() if "@" in email else (acc.get("account_group", "").strip() or "Diğer")
+                if not dom:
+                    dom = "Diğer"
 
-                if g_val not in groups_data:
-                    groups_data[g_val] = {"is_active": True, "count": 0}
-                groups_data[g_val]["count"] += 1
+                if dom not in domains_data:
+                    domains_data[dom] = {"is_active": True, "count": 0}
+                domains_data[dom]["count"] += 1
 
-            # Populate Left Sidebar
-            self.left_sidebar.populate_groups(groups_data, total_accounts_count=len(all_accounts))
+            # Populate Left Sidebar (Preserve user selection)
+            selected_domain = self.left_sidebar.get_selected_domain()
+            self.left_sidebar.populate_domains(domains_data, total_accounts_count=len(all_accounts), preserve_selection=selected_domain)
 
-            # Update Header Statistics Badges
-            active_cnt = sum(1 for a in all_accounts if bool(a.get("is_active", True)))
-            self.lbl_stat_total.setText(f"📊 {len(all_accounts)} Hesap")
-            self.lbl_stat_active.setText(f"🟢 {active_cnt} Aktif")
+            # 3. Render accounts matching domain filter
+            self._render_accounts_table(all_accounts)
 
-            # 3. Filter accounts based on Left Sidebar selection
-            selected_group = self.left_sidebar.get_selected_group()
-            filtered_accounts = []
-            for acc in all_accounts:
-                g_val = acc.get("account_group", "").strip()
-                if not g_val and "@" in acc.get("email", ""):
-                    g_val = acc["email"].split("@")[-1].strip()
-                if not g_val:
-                    g_val = "Diğer"
-
-                if selected_group == "__ALL__" or g_val == selected_group:
-                    filtered_accounts.append(acc)
-
-            # 4. Fill Table
-            self.table.setRowCount(len(filtered_accounts))
-            for i, acc in enumerate(filtered_accounts):
-                self.table.setItem(i, 0, QTableWidgetItem(str(acc["id"])))
-                self.table.setItem(i, 1, QTableWidgetItem(acc.get("label", "")))
-                self.table.setItem(i, 2, QTableWidgetItem(acc.get("email", "")))
-                self.table.setItem(i, 3, QTableWidgetItem(acc.get("imap_host", "")))
-                self.table.setItem(i, 4, QTableWidgetItem(str(acc.get("imap_port", ""))))
-                self.table.setItem(i, 5, QTableWidgetItem("Yes" if acc.get("use_ssl") else "No"))
-
-                is_active = bool(acc.get("is_active", True))
-                status_text = "✅ Aktif" if is_active else "⏸ Pasif"
-                status_item = QTableWidgetItem(status_text)
-                status_item.setForeground(QColor("#16a34a") if is_active else QColor("#94a3b8"))
-                self.table.setItem(i, 6, status_item)
-
-                # Storage location
-                stor_name = self.settings.account_storage(acc["id"]) or "Default"
-                self.table.setItem(i, 7, QTableWidgetItem(stor_name))
-
-                # Export Subfolder
-                self.table.setItem(i, 8, QTableWidgetItem(acc.get("export_subfolder", "")))
-
-                # Group / Domain
-                self.table.setItem(i, 9, QTableWidgetItem(acc.get("account_group", "")))
-
-                updated = (acc.get("updated_at") or "")[:19]
-                self.table.setItem(i, 10, QTableWidgetItem(updated))
-
-                # Fast Action Row Buttons (Column 11)
-                action_widget = QWidget()
-                action_layout = QHBoxLayout(action_widget)
-                action_layout.setContentsMargins(2, 2, 2, 2)
-                action_layout.setSpacing(4)
-
-                btn_opt = QPushButton("⚙️ Optimize")
-                btn_opt.setStyleSheet("background-color: #f59e0b; color: #ffffff !important; border: none; border-radius: 4px; font-size: 10.5px; font-weight: bold; min-height: 22px; padding: 2px 6px;")
-                btn_opt.clicked.connect(lambda checked=False, aid=acc["id"]: self._optimize_single_account(aid))
-                action_layout.addWidget(btn_opt)
-
-                btn_sub = QPushButton("📂 Klasör")
-                btn_sub.setStyleSheet("background-color: #3b82f6; color: #ffffff !important; border: none; border-radius: 4px; font-size: 10.5px; font-weight: bold; min-height: 22px; padding: 2px 6px;")
-                btn_sub.clicked.connect(lambda checked=False, aid=acc["id"]: self._edit_single_subfolder(aid))
-                action_layout.addWidget(btn_sub)
-
-                btn_cpy = QPushButton("📋 Kopyala")
-                btn_cpy.setStyleSheet("background-color: #10b981; color: #ffffff !important; border: none; border-radius: 4px; font-size: 10.5px; font-weight: bold; min-height: 22px; padding: 2px 6px;")
-                btn_cpy.clicked.connect(lambda checked=False, aid=acc["id"]: self._copy_account(aid))
-                action_layout.addWidget(btn_cpy)
-
-                action_layout.addStretch()
-                self.table.setCellWidget(i, 11, action_widget)
-
-                # Set cell editability based on Excel mode
-                editable_cols = [1, 2, 3, 4, 5, 6, 8, 9]
-                for c_idx in editable_cols:
-                    it = self.table.item(i, c_idx)
-                    if it:
-                        if self._excel_editing_enabled:
-                            it.setFlags(it.flags() | Qt.ItemIsEditable)
-                        else:
-                            it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-
-            # Apply layout profile & row heights
-            self.set_row_height(self._current_row_height, auto_save=False)
-            active_profile = self.right_sidebar.view_profile_widget.get_current_profile_name()
-            state = self.right_sidebar.view_profile_widget.manager.get_profile(active_profile)
-            if state:
-                self._apply_grid_profile_state(active_profile, state)
-            else:
-                self.table.resizeColumnsToContents()
-
-            self._filter_table_rows(self.txt_search_accounts.text())
         except Exception as exc:
             logger.exception("AccountPanel refresh error: %s", exc)
         finally:
             self._is_refreshing = False
 
+    def _render_accounts_table(self, all_accounts: List[Dict[str, Any]]):
+        """Renders account rows filtered by currently selected domain."""
+        selected_domain = self.left_sidebar.get_selected_domain()
+        filtered_accounts = []
+        for acc in all_accounts:
+            email = acc.get("email", "").strip()
+            dom = email.split("@")[-1].strip().lower() if "@" in email else (acc.get("account_group", "").strip() or "Diğer")
+            if not dom:
+                dom = "Diğer"
+
+            if selected_domain == "__ALL__" or dom == selected_domain.lower():
+                filtered_accounts.append(acc)
+
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(filtered_accounts))
+
+        for i, acc in enumerate(filtered_accounts):
+            aid = acc["id"]
+            st = self._account_stats.get(aid, {})
+            mail_cnt = st.get("mail_count", 0)
+            size_bytes = st.get("total_size", 0)
+
+            # Col 0: Checkbox
+            chk_item = QTableWidgetItem()
+            chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            chk_item.setCheckState(Qt.Unchecked)
+            chk_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 0, chk_item)
+
+            # Col 1: ID
+            id_item = QTableWidgetItem(str(aid))
+            id_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 1, id_item)
+
+            # Col 2: Label
+            self.table.setItem(i, 2, QTableWidgetItem(acc.get("label", "")))
+
+            # Col 3: Email
+            self.table.setItem(i, 3, QTableWidgetItem(acc.get("email", "")))
+
+            # Col 4: IMAP Host
+            self.table.setItem(i, 4, QTableWidgetItem(acc.get("imap_host", "")))
+
+            # Col 5: IMAP Port
+            port_item = QTableWidgetItem(str(acc.get("imap_port", "")))
+            port_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 5, port_item)
+
+            # Col 6: SSL
+            ssl_item = QTableWidgetItem("Yes" if acc.get("use_ssl") else "No")
+            ssl_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 6, ssl_item)
+
+            # Col 7: Status
+            is_active = bool(acc.get("is_active", True))
+            status_text = "✅ Aktif" if is_active else "⏸ Pasif"
+            status_item = QTableWidgetItem(status_text)
+            status_item.setForeground(QColor("#16a34a") if is_active else QColor("#94a3b8"))
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(i, 7, status_item)
+
+            # Col 8: Toplam Mail
+            if mail_cnt > 0:
+                mail_item = QTableWidgetItem(f"{mail_cnt:,} Mail")
+                mail_item.setForeground(QColor("#166534"))
+                mail_item.setToolTip(f"Bu hesaba ait arşivlenmiş toplam {mail_cnt:,} adet e-posta.")
+            else:
+                mail_item = QTableWidgetItem("⚠️ 0 Mail (Senkronize Edilmedi)")
+                mail_item.setForeground(QColor("#b45309"))  # Amber warning color
+                mail_item.setToolTip("Bu hesap henüz senkronize edilmemiştir. Eşitlemek için '⚡ Eşitle' butonuna basın.")
+            mail_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.table.setItem(i, 8, mail_item)
+
+            # Col 9: Toplam Boyut
+            size_item = QTableWidgetItem(self._fmt_size(size_bytes))
+            size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            size_item.setForeground(QColor("#6b21a8") if size_bytes > 0 else QColor("#64748b"))
+            self.table.setItem(i, 9, size_item)
+
+            # Col 10: Subfolder
+            self.table.setItem(i, 10, QTableWidgetItem(acc.get("export_subfolder", "")))
+
+            # Col 11: Group / Domain
+            self.table.setItem(i, 11, QTableWidgetItem(acc.get("account_group", "")))
+
+            # Col 12: Son Güncelleme
+            updated = (acc.get("updated_at") or "")[:19]
+            self.table.setItem(i, 12, QTableWidgetItem(updated))
+
+            # Col 13: Fast Action Buttons
+            action_widget = QWidget()
+            action_layout = QHBoxLayout(action_widget)
+            action_layout.setContentsMargins(2, 2, 2, 2)
+            action_layout.setSpacing(4)
+
+            btn_sync = QPushButton("⚡ Eşitle")
+            btn_sync.setStyleSheet("background-color: #059669; color: #ffffff !important; border: none; border-radius: 4px; font-size: 10.5px; font-weight: bold; min-height: 22px; padding: 2px 6px;")
+            btn_sync.setToolTip("Bu hesaba ait mailleri sunucudan senkronize et / eşitle")
+            btn_sync.clicked.connect(lambda checked=False, aid=aid: self._prompt_sync_account(aid))
+            action_layout.addWidget(btn_sync)
+
+            btn_opt = QPushButton("⚙️ Optimize")
+            btn_opt.setStyleSheet("background-color: #f59e0b; color: #ffffff !important; border: none; border-radius: 4px; font-size: 10.5px; font-weight: bold; min-height: 22px; padding: 2px 6px;")
+            btn_opt.clicked.connect(lambda checked=False, aid=aid: self._optimize_single_account(aid))
+            action_layout.addWidget(btn_opt)
+
+            btn_sub = QPushButton("📂 Klasör")
+            btn_sub.setStyleSheet("background-color: #3b82f6; color: #ffffff !important; border: none; border-radius: 4px; font-size: 10.5px; font-weight: bold; min-height: 22px; padding: 2px 6px;")
+            btn_sub.clicked.connect(lambda checked=False, aid=aid: self._edit_single_subfolder(aid))
+            action_layout.addWidget(btn_sub)
+
+            btn_cpy = QPushButton("📋 Kopyala")
+            btn_cpy.setStyleSheet("background-color: #10b981; color: #ffffff !important; border: none; border-radius: 4px; font-size: 10.5px; font-weight: bold; min-height: 22px; padding: 2px 6px;")
+            btn_cpy.clicked.connect(lambda checked=False, aid=aid: self._copy_account(aid))
+            action_layout.addWidget(btn_cpy)
+
+            action_layout.addStretch()
+            self.table.setCellWidget(i, 13, action_widget)
+
+            # Set cell editability based on Excel mode
+            editable_cols = [2, 3, 4, 5, 6, 7, 10, 11]
+            for c_idx in editable_cols:
+                it = self.table.item(i, c_idx)
+                if it:
+                    if self._excel_editing_enabled:
+                        it.setFlags(it.flags() | Qt.ItemIsEditable)
+                    else:
+                        it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+
+        self.table.blockSignals(False)
+
+        # Set standard widths if first load
+        self.table.setColumnWidth(0, 42)  # Checkbox
+        self.table.setColumnWidth(1, 50)  # ID
+
+        # Apply layout profile & row heights
+        self.set_row_height(self._current_row_height, auto_save=False)
+        active_profile = self.right_sidebar.view_profile_widget.get_current_profile_name()
+        state = self.right_sidebar.view_profile_widget.manager.get_profile(active_profile)
+        if state:
+            self._apply_grid_profile_state(active_profile, state)
+        else:
+            self.table.resizeColumnsToContents()
+
+        self._filter_table_rows(self.txt_search_accounts.text())
+
     @Slot(str)
     def _on_group_filter_changed(self, group_name: str):
-        self.refresh()
+        if self._cached_accounts:
+            self._render_accounts_table(self._cached_accounts)
+        else:
+            self.refresh()
 
     def _filter_table_rows(self, query_text: str):
         query = query_text.strip().lower()
@@ -927,13 +1284,15 @@ class AccountPanel(QWidget):
                 continue
 
             row_match = False
-            for c in range(self.table.columnCount()):
+            for c in range(1, self.table.columnCount()):
                 item = self.table.item(r, c)
                 if item and query in item.text().lower():
                     row_match = True
                     break
 
             self.table.setRowHidden(r, not row_match)
+
+        self._update_dashboard_statistics()
 
     # -------------------------------------------------------------
     # Selection & Excel Inline Editing
@@ -946,9 +1305,9 @@ class AccountPanel(QWidget):
         is_active = True
 
         if has_sel:
-            id_item = self.table.item(row, 0)
-            if id_item and id_item.text().isdigit():
-                acc = self.engine.accounts.get(int(id_item.text()))
+            acc_id = self._get_row_account_id(row)
+            if acc_id is not None:
+                acc = self.engine.accounts.get(acc_id)
                 if acc:
                     is_active = bool(acc.get("is_active", True))
 
@@ -975,16 +1334,21 @@ class AccountPanel(QWidget):
 
     @Slot(QTableWidgetItem)
     def _on_table_item_changed(self, item: QTableWidgetItem):
+        col = item.column()
+        row = item.row()
+
+        # Handle Checkbox multi-select comparison
+        if col == 0:
+            self._update_dashboard_statistics()
+            return
+
         if not getattr(self, "_excel_editing_enabled", False) or getattr(self, "_is_refreshing", False):
             return
 
-        row = item.row()
-        col = item.column()
-        id_item = self.table.item(row, 0)
-        if not id_item or not id_item.text().isdigit():
+        acc_id = self._get_row_account_id(row)
+        if acc_id is None:
             return
 
-        acc_id = int(id_item.text())
         acc = self.engine.accounts.get(acc_id)
         if not acc:
             return
@@ -993,16 +1357,16 @@ class AccountPanel(QWidget):
         update_field = ""
 
         try:
-            if col == 1:  # Label
+            if col == 2:  # Label
                 self.engine.accounts.update(acc_id, label=val)
                 update_field = f"Hesap Adı: '{val}'"
-            elif col == 2:  # Email
+            elif col == 3:  # Email
                 self.engine.accounts.update(acc_id, email=val)
                 update_field = f"E-Posta: '{val}'"
-            elif col == 3:  # IMAP Host
+            elif col == 4:  # IMAP Host
                 self.engine.accounts.update(acc_id, imap_host=val)
                 update_field = f"IMAP Sunucu: '{val}'"
-            elif col == 4:  # IMAP Port
+            elif col == 5:  # IMAP Port
                 try:
                     port = int(val)
                     self.engine.accounts.update(acc_id, imap_port=port)
@@ -1011,18 +1375,18 @@ class AccountPanel(QWidget):
                     QMessageBox.warning(self, "Hatalı Değer", "Port numarası sayısal bir değer olmalıdır.")
                     self.refresh()
                     return
-            elif col == 5:  # SSL
+            elif col == 6:  # SSL
                 use_ssl = 1 if val.lower() in ("yes", "evet", "1", "true") else 0
                 self.engine.accounts.update(acc_id, use_ssl=use_ssl)
                 update_field = f"SSL Kullanımı: {'Evet' if use_ssl else 'Hayır'}"
-            elif col == 6:  # Status
+            elif col == 7:  # Status
                 is_active = 1 if "active" in val.lower() or "aktif" in val.lower() or val.lower() in ("1", "true") else 0
                 self.engine.accounts.update(acc_id, is_active=is_active)
                 update_field = f"Hesap Durumu: {'Aktif' if is_active else 'Pasif'}"
-            elif col == 8:  # Subfolder
+            elif col == 10:  # Subfolder
                 self.engine.accounts.update(acc_id, export_subfolder=val)
                 update_field = f"Alt Klasör: '{val}'"
-            elif col == 9:  # Group / Domain
+            elif col == 11:  # Group / Domain
                 self.engine.accounts.update(acc_id, account_group=val)
                 update_field = f"Domain Grubu: '{val}'"
 
@@ -1038,8 +1402,38 @@ class AccountPanel(QWidget):
             self.refresh()
 
     # -------------------------------------------------------------
-    # Account Operations (Add, Edit, Copy, Delete, Toggle, Test)
+    # Account Operations (Add, Edit, Copy, Delete, Toggle, Test, Sync)
     # -------------------------------------------------------------
+
+    def _prompt_sync_account(self, account_id: int):
+        acc = self.engine.accounts.get(account_id)
+        if not acc:
+            return
+        label = acc.get("label") or acc.get("email")
+        email_str = acc.get("email")
+        st = self._account_stats.get(account_id, {})
+        mail_cnt = st.get("mail_count", 0)
+
+        if mail_cnt == 0:
+            prompt_msg = (
+                f"'{label}' ({email_str}) hesabı ile ilgili mailler henüz senkronize edilmemiştir.\n\n"
+                "Şimdi bu hesabın e-postalarını sunucudan indirmek ve senkronizasyonu başlatmak ister misiniz?"
+            )
+        else:
+            prompt_msg = (
+                f"'{label}' ({email_str}) hesabı için yeni e-postaları senkronize etmek (eşitlemek) ister misiniz?"
+            )
+
+        reply = self._show_styled_message_box(
+            "E-Posta Senkronizasyonu",
+            prompt_msg,
+            QMessageBox.Question,
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            parent_mw = self.window()
+            if parent_mw and hasattr(parent_mw, "_navigate"):
+                parent_mw._navigate("sync")
 
     @Slot()
     def _open_group_management(self):
@@ -1063,12 +1457,9 @@ class AccountPanel(QWidget):
     @Slot()
     def _edit_account(self):
         row = self.table.currentRow()
-        if row < 0:
+        acc_id = self._get_row_account_id(row)
+        if acc_id is None:
             return
-        id_item = self.table.item(row, 0)
-        if not id_item or not id_item.text().isdigit():
-            return
-        acc_id = int(id_item.text())
         acc = self.engine.accounts.get(acc_id)
         if not acc:
             QMessageBox.warning(self, "Error", "Account not found.")
@@ -1082,12 +1473,9 @@ class AccountPanel(QWidget):
     def _copy_account(self, account_id: Optional[int] = None):
         if account_id is None:
             row = self.table.currentRow()
-            if row < 0:
+            account_id = self._get_row_account_id(row)
+            if account_id is None:
                 return
-            id_item = self.table.item(row, 0)
-            if not id_item or not id_item.text().isdigit():
-                return
-            account_id = int(id_item.text())
 
         acc = self.engine.accounts.get(account_id)
         if not acc:
@@ -1101,12 +1489,9 @@ class AccountPanel(QWidget):
     @Slot()
     def _toggle_active(self):
         row = self.table.currentRow()
-        if row < 0:
+        acc_id = self._get_row_account_id(row)
+        if acc_id is None:
             return
-        id_item = self.table.item(row, 0)
-        if not id_item or not id_item.text().isdigit():
-            return
-        acc_id = int(id_item.text())
         acc = self.engine.accounts.get(acc_id)
         if not acc:
             return
@@ -1136,12 +1521,9 @@ class AccountPanel(QWidget):
     @Slot()
     def _test_selected(self):
         row = self.table.currentRow()
-        if row < 0:
+        acc_id = self._get_row_account_id(row)
+        if acc_id is None:
             return
-        id_item = self.table.item(row, 0)
-        if not id_item or not id_item.text().isdigit():
-            return
-        acc_id = int(id_item.text())
         acc = self.engine.accounts.get(acc_id)
         if not acc:
             return
@@ -1181,12 +1563,9 @@ class AccountPanel(QWidget):
     @Slot()
     def _delete_account(self):
         row = self.table.currentRow()
-        if row < 0:
+        acc_id = self._get_row_account_id(row)
+        if acc_id is None:
             return
-        id_item = self.table.item(row, 0)
-        if not id_item or not id_item.text().isdigit():
-            return
-        acc_id = int(id_item.text())
         acc = self.engine.accounts.get(acc_id)
         if not acc:
             return
@@ -1201,15 +1580,17 @@ class AccountPanel(QWidget):
             return
 
         label = acc.get("label", "")
-        reply = self._show_styled_message_box(
-            "Silme Onayı",
-            f"'{label}' (ID: {acc_id}) hesabını kalıcı olarak silmek istiyor musunuz?\n\n"
-            "Bu hesaba ait tüm veriler ve eşitleme geçmişi silinecektir.\n"
-            "Bu işlem geri alınamaz.",
-            QMessageBox.Question,
-            QMessageBox.Yes | QMessageBox.No
+        reply = DeleteConfirmDialog.confirm_deletion(
+            parent=self,
+            title="Hesap Silme Onayı",
+            item_name=f"{label} ({acc.get('email', '')})",
+            item_type="E-Posta Hesabı",
+            target_info=f"IMAP Sunucu: {acc.get('imap_host', '')}:{acc.get('imap_port', 993)}",
+            warning_message="Bu hesaba ait tüm veriler ve eşitleme geçmişi silinecektir. Bu işlem geri alınamaz.",
+            banner_title="E-Posta Hesabını Sil",
+            banner_subtitle="Lütfen silmek istediğiniz e-posta hesabını ve verilerini onaylayın"
         )
-        if reply == QMessageBox.Yes:
+        if reply:
             try:
                 self.engine.remove_account(acc_id)
                 self.refresh()
@@ -1218,15 +1599,17 @@ class AccountPanel(QWidget):
 
     @Slot()
     def _clean_start(self):
-        reply = self._show_styled_message_box(
-            "Temiz Başlangıç (Clean Start)",
-            "Tüm arşivlenmiş e-postalar, ek dosyalar ve senkronizasyon geçmişi kalıcı olarak silinecektir.\n"
-            "Yapılandırılmış e-posta hesapları korunacaktır.\n"
-            "Bu işlem geri alınamaz. Devam etmek istiyor musunuz?",
-            QMessageBox.Question,
-            QMessageBox.Yes | QMessageBox.No
+        reply = DeleteConfirmDialog.confirm_deletion(
+            parent=self,
+            title="Temiz Başlangıç (Clean Start) Onayı",
+            item_name="Tüm Canlı E-Posta Arşiv Havuzu",
+            item_type="Veritabanı ve Ek Dosyalar",
+            target_info="Veri Deposu Arşivi (Hesap kayıtları korunacaktır)",
+            warning_message="Tüm arşivlenmiş e-postalar, ek dosyalar ve senkronizasyon geçmişi kalıcı olarak silinecektir. Bu işlem geri alınamaz.",
+            banner_title="Canlı Arşivi Sıfırla (Temiz Başlangıç)",
+            banner_subtitle="Yapılandırılmış hesaplar korunur, tüm geçmiş mailler silinir"
         )
-        if reply == QMessageBox.Yes:
+        if reply:
             try:
                 self.engine.clear_archive_data()
                 self._show_styled_message_box(
@@ -1241,11 +1624,11 @@ class AccountPanel(QWidget):
     @Slot()
     def _on_batch_change_group(self):
         row = self.table.currentRow()
-        if row < 0:
+        acc_id = self._get_row_account_id(row)
+        if acc_id is None:
             QMessageBox.information(self, "Seçim Yapılmadı", "Lütfen önce grubunu değiştirmek istediğiniz bir hesap seçin.")
             return
 
-        acc_id = int(self.table.item(row, 0).text())
         acc = self.engine.accounts.get(acc_id)
         current_group = acc.get("account_group", "") if acc else ""
 
@@ -1263,11 +1646,11 @@ class AccountPanel(QWidget):
     @Slot()
     def _on_batch_change_password(self):
         row = self.table.currentRow()
-        if row < 0:
+        acc_id = self._get_row_account_id(row)
+        if acc_id is None:
             QMessageBox.information(self, "Seçim Yapılmadı", "Lütfen önce şifresini değiştirmek istediğiniz bir hesap seçin.")
             return
 
-        acc_id = int(self.table.item(row, 0).text())
         acc = self.engine.accounts.get(acc_id)
 
         new_pwd, ok = QInputDialog.getText(
@@ -1390,12 +1773,13 @@ class AccountPanel(QWidget):
     @Slot()
     def _on_import_eml(self):
         row = self.table.currentRow()
-        if row < 0:
+        acc_id = self._get_row_account_id(row)
+        if acc_id is None:
             QMessageBox.warning(self, "Uyarı", "Lütfen önce EML dosyalarını eşleştirmek istediğiniz e-posta hesabını listeden seçin.")
             return
 
-        acc_id = int(self.table.item(row, 0).text())
-        email_addr = self.table.item(row, 2).text()
+        email_item = self.table.item(row, 3)
+        email_addr = email_item.text().strip() if email_item else ""
 
         reply = QMessageBox.question(
             self,

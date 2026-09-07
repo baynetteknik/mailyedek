@@ -166,9 +166,9 @@ class AccountGroupSidebarWidget(QWidget):
         c_layout.setSpacing(8)
 
         # -------------------------------------------------------------
-        # Section 1: 📁 GRUP / DOMAIN FİLTRESİ (Accordion - initially collapsed)
+        # Section 1: 🌐 DOMAİNLER (Accordion - open by default)
         # -------------------------------------------------------------
-        self.sec_filter = CollapsibleSection("📁 GRUP / DOMAIN FİLTRESİ", parent=self, is_collapsed=True)
+        self.sec_filter = CollapsibleSection("🌐 DOMAİNLER", parent=self, is_collapsed=False)
 
         # Top row inside filter section: count badge
         top_row = QHBoxLayout()
@@ -177,7 +177,7 @@ class AccountGroupSidebarWidget(QWidget):
         lbl_info.setStyleSheet("font-weight: 600; color: #475569; font-size: 10.5px;")
         top_row.addWidget(lbl_info, stretch=1)
 
-        self.lbl_count_badge = QLabel("0 Grup")
+        self.lbl_count_badge = QLabel("0 Domain")
         self.lbl_count_badge.setStyleSheet("""
             QLabel {
                 background-color: #e2e8f0;
@@ -191,9 +191,9 @@ class AccountGroupSidebarWidget(QWidget):
         top_row.addWidget(self.lbl_count_badge)
         self.sec_filter.content_layout.addLayout(top_row)
 
-        # Quick Search Box inside Groups
+        # Quick Search Box inside Domains
         self.txt_search_group = QLineEdit()
-        self.txt_search_group.setPlaceholderText("🔍 Domain / Grup ara...")
+        self.txt_search_group.setPlaceholderText("🔍 Domain ara...")
         self.txt_search_group.setClearButtonEnabled(True)
         self.txt_search_group.setStyleSheet("""
             QLineEdit {
@@ -212,7 +212,7 @@ class AccountGroupSidebarWidget(QWidget):
         self.txt_search_group.textChanged.connect(self._filter_group_list_items)
         self.sec_filter.content_layout.addWidget(self.txt_search_group)
 
-        # Group List
+        # Domain List
         self.group_list = QListWidget()
         self.group_list.setMinimumHeight(150)
         self.group_list.setStyleSheet("""
@@ -245,11 +245,11 @@ class AccountGroupSidebarWidget(QWidget):
         c_layout.addWidget(self.sec_filter)
 
         # -------------------------------------------------------------
-        # Section 2: ⚡ GRUP İŞLEMLERİ & YÖNETİM (Accordion - initially collapsed)
+        # Section 2: ⚡ DOMAIN & HESAP İŞLEMLERİ (Accordion - initially collapsed)
         # -------------------------------------------------------------
-        self.sec_bulk = CollapsibleSection("⚡ GRUP İŞLEMLERİ & YÖNETİM", parent=self, is_collapsed=True)
+        self.sec_bulk = CollapsibleSection("⚡ DOMAIN & HESAP İŞLEMLERİ", parent=self, is_collapsed=True)
 
-        self.btn_open_group_mgmt = QPushButton("🏷️ Grup & Domain Yönetimi")
+        self.btn_open_group_mgmt = QPushButton("🏷️ Domain & Grup Yönetimi")
         self.btn_open_group_mgmt.setToolTip("Grup / Domain ekleme, silme, düzenleme ve domain eşitleme penceresini açar")
         self.btn_open_group_mgmt.setStyleSheet("""
             QPushButton {
@@ -268,8 +268,8 @@ class AccountGroupSidebarWidget(QWidget):
         self.btn_open_group_mgmt.clicked.connect(self.group_mgmt_requested.emit)
         self.sec_bulk.content_layout.addWidget(self.btn_open_group_mgmt)
 
-        self.btn_bulk_optimize = QPushButton("⚙️ Grubu Optimize Et")
-        self.btn_bulk_optimize.setToolTip("Seçili gruptaki tüm hesapların EML ve ek dosyalarını optimize eder")
+        self.btn_bulk_optimize = QPushButton("⚙️ Domaini Optimize Et")
+        self.btn_bulk_optimize.setToolTip("Seçili domaindeki tüm hesapların EML ve ek dosyalarını optimize eder")
         self.btn_bulk_optimize.setStyleSheet("""
             QPushButton {
                 background-color: #f59e0b;
@@ -288,7 +288,7 @@ class AccountGroupSidebarWidget(QWidget):
         self.sec_bulk.content_layout.addWidget(self.btn_bulk_optimize)
 
         self.btn_bulk_subfolder = QPushButton("📂 Alt Klasör Tanımla")
-        self.btn_bulk_subfolder.setToolTip("Seçili gruptaki tüm hesaplar için ortak alt arşiv klasörü belirler")
+        self.btn_bulk_subfolder.setToolTip("Seçili domaindeki tüm hesaplar için ortak alt arşiv klasörü belirler")
         self.btn_bulk_subfolder.setStyleSheet("""
             QPushButton {
                 background-color: #3b82f6;
@@ -314,27 +314,27 @@ class AccountGroupSidebarWidget(QWidget):
         self.scroll_area.setWidget(container)
         layout.addWidget(self.scroll_area)
 
-    def populate_groups(self, groups_data: Dict[str, Dict], total_accounts_count: int = 0):
+    def populate_groups(self, groups_data: Dict[str, Dict], total_accounts_count: int = 0, preserve_selection: Optional[str] = None):
         """
-        Populates the group list widget.
+        Populates the domain/group list widget.
         groups_data: { "domain.com": {"is_active": True, "count": 12}, ... }
         """
         self._groups_data = groups_data
         self.group_list.blockSignals(True)
 
-        current_selected = self.get_selected_group()
+        current_selected = preserve_selection or self.get_selected_group()
         self.group_list.clear()
 
         # Update header badge
-        self.lbl_count_badge.setText(f"{len(groups_data)} Grup")
+        self.lbl_count_badge.setText(f"{len(groups_data)} Domain")
 
-        # 1. Tüm Gruplar Item
-        all_label = f"📁 Tüm Gruplar ({total_accounts_count})" if total_accounts_count > 0 else "📁 Tüm Gruplar"
+        # 1. Tüm Domainler Item
+        all_label = f"🌐 Tüm Domainler ({total_accounts_count})" if total_accounts_count > 0 else "🌐 Tüm Domainler"
         all_item = QListWidgetItem(all_label)
         all_item.setData(Qt.UserRole, "__ALL__")
         self.group_list.addItem(all_item)
 
-        # 2. Individual Groups
+        # 2. Individual Domains
         for g_name in sorted(groups_data.keys()):
             info = groups_data[g_name]
             is_active = info.get("is_active", True)
@@ -342,7 +342,7 @@ class AccountGroupSidebarWidget(QWidget):
 
             count_suffix = f" ({count})" if count > 0 else ""
             status_suffix = "" if is_active else " (Pasif)"
-            label = f"📁 {g_name}{count_suffix}{status_suffix}"
+            label = f"🌐 {g_name}{count_suffix}{status_suffix}"
 
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, g_name)
@@ -366,11 +366,18 @@ class AccountGroupSidebarWidget(QWidget):
         self._filter_group_list_items(self.txt_search_group.text())
         self.group_list.blockSignals(False)
 
+    def populate_domains(self, domains_data: Dict[str, Dict], total_accounts_count: int = 0, preserve_selection: Optional[str] = None):
+        """Alias for populate_groups for domain clarity."""
+        self.populate_groups(domains_data, total_accounts_count, preserve_selection)
+
     def get_selected_group(self) -> str:
         item = self.group_list.currentItem()
         if item:
             return item.data(Qt.UserRole) or "__ALL__"
         return "__ALL__"
+
+    def get_selected_domain(self) -> str:
+        return self.get_selected_group()
 
     def select_group(self, group_name: str):
         for i in range(self.group_list.count()):

@@ -6,12 +6,51 @@ Stores user preferences in a JSON file under the data directory.
 
 import json
 import logging
+import os
+import sys
+import ctypes
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SETTINGS_DIR = Path("data")
+
+_DISK_CHECK_CACHE: Dict[str, tuple[bool, float]] = {}
+
+
+def is_path_accessible_fast(path_str: str, max_cache_age_sec: float = 2.0) -> bool:
+    """
+    Ultra-fast, non-blocking check for Windows logical drives and directories.
+    Prevents multi-second OS hangs when querying unplugged or missing drives.
+    """
+    if not path_str:
+        return True
+
+    now = time.time()
+    cached = _DISK_CHECK_CACHE.get(path_str)
+    if cached and (now - cached[1]) < max_cache_age_sec:
+        return cached[0]
+
+    is_avail = False
+    try:
+        drive, tail = os.path.splitdrive(path_str)
+        if drive and sys.platform.startswith("win"):
+            drive_letter = drive.strip(":").upper()
+            if len(drive_letter) == 1 and 'A' <= drive_letter <= 'Z':
+                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+                drive_index = ord(drive_letter) - ord('A')
+                if not (bitmask & (1 << drive_index)):
+                    # Drive is physically disconnected, return False immediately (0.01ms)
+                    _DISK_CHECK_CACHE[path_str] = (False, now)
+                    return False
+        is_avail = os.path.exists(path_str)
+    except Exception:
+        is_avail = False
+
+    _DISK_CHECK_CACHE[path_str] = (is_avail, now)
+    return is_avail
 
 
 class StorageLocation:
@@ -69,19 +108,12 @@ class AppSettings:
         self._data[key] = value
 
     def data_path(self) -> Path:
-        """Return the configured data directory path."""
+        """Return the configured data directory path if reachable, otherwise DEFAULT_SETTINGS_DIR."""
         raw = self._data.get("data_path")
         if raw:
-            try:
-                p = Path(raw)
-                # Check if the path exists or is writable (missing drive letter will raise OSError here or on mkdir)
-                if p.exists():
-                    return p
-                else:
-                    p.mkdir(parents=True, exist_ok=True)
-                    return p
-            except OSError as exc:
-                logger.debug("Configured data_path '%s' is not accessible, falling back to default: %s", raw, exc)
+            if is_path_accessible_fast(raw):
+                return Path(raw)
+            logger.debug("Configured data_path '%s' is not accessible, falling back to default: %s", raw, DEFAULT_SETTINGS_DIR)
         return DEFAULT_SETTINGS_DIR
 
     def is_configured_data_path_available(self) -> bool:
@@ -89,25 +121,74 @@ class AppSettings:
         raw = self._data.get("data_path")
         if not raw:
             return True
-        try:
-            p = Path(raw)
-            return p.exists()
-        except OSError:
-            return False
+        return is_path_accessible_fast(raw)
 
     def configured_data_path_str(self) -> str:
         """Return the raw string of the configured data_path."""
         return self._data.get("data_path", "data")
 
     def save_account_cache(self, accounts: List[Dict[str, Any]]):
-        """Cache account list locally for offline / missing-disk display."""
+        """Cache account list locally in JSON and local SQLite DB for offline display."""
+        if not accounts:
+            return
         try:
             cache_file = Path("data/account_cache.json")
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump(accounts, f, indent=2, ensure_ascii=False)
         except Exception as exc:
-            logger.warning("Failed to save account cache: %s", exc)
+            logger.warning("Failed to save account cache JSON: %s", exc)
+
+        # Also sync to local SQLite fallback database
+        try:
+            local_db = Path("data/mail_archive.db")
+            if local_db.exists():
+                import sqlite3
+                with sqlite3.connect(str(local_db)) as conn:
+                    conn.executescript("""
+                        CREATE TABLE IF NOT EXISTS accounts (
+                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                            label           TEXT NOT NULL,
+                            email           TEXT NOT NULL,
+                            imap_host       TEXT NOT NULL,
+                            imap_port       INTEGER NOT NULL DEFAULT 993,
+                            use_ssl         INTEGER NOT NULL DEFAULT 1,
+                            username_enc    TEXT NOT NULL DEFAULT '',
+                            password_enc    TEXT NOT NULL DEFAULT '',
+                            is_active       INTEGER NOT NULL DEFAULT 1,
+                            export_subfolder TEXT DEFAULT '',
+                            account_group   TEXT DEFAULT '',
+                            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                        );
+                    """)
+                    for acc in accounts:
+                        conn.execute("""
+                            INSERT INTO accounts (id, label, email, imap_host, imap_port, use_ssl, export_subfolder, account_group, is_active, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                            ON CONFLICT(id) DO UPDATE SET
+                                label=excluded.label,
+                                email=excluded.email,
+                                imap_host=excluded.imap_host,
+                                imap_port=excluded.imap_port,
+                                use_ssl=excluded.use_ssl,
+                                export_subfolder=excluded.export_subfolder,
+                                account_group=excluded.account_group,
+                                is_active=excluded.is_active,
+                                updated_at=excluded.updated_at
+                        """, (
+                            acc.get("id"),
+                            acc.get("label", ""),
+                            acc.get("email", ""),
+                            acc.get("imap_host", ""),
+                            acc.get("imap_port", 993),
+                            1 if acc.get("use_ssl", True) else 0,
+                            acc.get("export_subfolder", ""),
+                            acc.get("account_group", ""),
+                            1 if acc.get("is_active", True) else 0,
+                        ))
+        except Exception as exc:
+            logger.debug("Failed to sync account cache to local db: %s", exc)
 
     def load_account_cache(self) -> List[Dict[str, Any]]:
         """Load locally cached accounts when main data disk is not connected."""
@@ -115,9 +196,24 @@ class AppSettings:
         if cache_file.exists():
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    if data:
+                        return data
             except Exception as exc:
                 logger.warning("Failed to load account cache: %s", exc)
+
+        # Fallback to local SQLite database
+        local_db = Path("data/mail_archive.db")
+        if local_db.exists():
+            try:
+                import sqlite3
+                with sqlite3.connect(str(local_db)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute("SELECT * FROM accounts").fetchall()
+                    if rows:
+                        return [dict(r) for r in rows]
+            except Exception as exc:
+                logger.debug("Failed to load accounts from local SQLite fallback: %s", exc)
         return []
 
     def set_data_path(self, path: Path):

@@ -52,8 +52,8 @@ class SqliteMailRepository(IMailRepository):
         return self._db.upsert_mail_metadata(account_id, folder, uid, **fields)
 
     def get_by_uid(self, account_id: int, folder: str,
-                   uid: int) -> Optional[Dict]:
-        return self._db.get_mail_by_uid(account_id, folder, uid)
+                   uid: int, server_host: str = "") -> Optional[Dict]:
+        return self._db.get_mail_by_uid(account_id, folder, uid, server_host=server_host)
 
     def get_for_account(self, account_id: int, folder: str = "INBOX",
                         limit: int = 1000, offset: int = 0) -> List[Dict]:
@@ -88,21 +88,21 @@ class SqliteSyncStateRepository(ISyncStateRepository):
     def __init__(self, db: DatabaseManager):
         self._db = db
 
-    def get(self, account_id: int, folder: str) -> Optional[Dict]:
-        return self._db.get_sync_state(account_id, folder)
+    def get(self, account_id: int, folder: str, server_host: str = "") -> Optional[Dict]:
+        return self._db.get_sync_state(account_id, folder, server_host=server_host)
 
     def update(self, account_id: int, folder: str,
-               last_uid: int, uid_validity: int = 0, mail_count: int = 0) -> None:
+               last_uid: int, uid_validity: int = 0, mail_count: int = 0, server_host: str = "") -> None:
         self._db.update_sync_state(account_id, folder, last_uid,
-                                   uid_validity, mail_count)
+                                   uid_validity, mail_count, server_host=server_host)
 
     def upsert(self, account_id: int, folder: str,
-               last_uid: int, uid_validity: int = 0, mail_count: int = 0) -> None:
+               last_uid: int, uid_validity: int = 0, mail_count: int = 0, server_host: str = "") -> None:
         self._db.update_sync_state(account_id, folder, last_uid,
-                                   uid_validity, mail_count)
+                                   uid_validity, mail_count, server_host=server_host)
 
-    def reset_sync_state(self, account_id: int, reason: str = "server_migration") -> int:
-        return self._db.reset_account_sync_state(account_id, reason=reason)
+    def reset_sync_state(self, account_id: int, reason: str = "server_migration", server_host: str = "") -> int:
+        return self._db.reset_account_sync_state(account_id, reason=reason, server_host=server_host)
 
 
 
